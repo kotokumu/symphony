@@ -6,7 +6,7 @@ struct ContentView: View {
 
   @State private var editor: NamespaceEditorContext?
   @State private var namespaceToDelete: DesktopNamespace?
-  @State private var errorMessage: String?
+  @State private var notice: NamespaceNotice?
 
   var body: some View {
     Group {
@@ -45,7 +45,7 @@ struct ContentView: View {
           await reportErrors {
             let outcome = try await controller.deleteNamespace(namespace.id)
             if case .cleanupPending(let message) = outcome {
-              errorMessage = message
+              notice = .cleanupPending(message)
             }
           }
         }
@@ -56,10 +56,12 @@ struct ContentView: View {
         "This permanently removes \(namespace.name.value) and all of its local data from this Mac. This action cannot be undone."
       )
     }
-    .alert("Namespace Change Failed", isPresented: errorIsPresented) {
-      Button("OK", role: .cancel) {}
-    } message: {
-      Text(errorMessage ?? "The namespace change could not be completed.")
+    .alert(item: $notice) { notice in
+      Alert(
+        title: Text(notice.title),
+        message: Text(notice.message),
+        dismissButton: .default(Text("OK"))
+      )
     }
   }
 
@@ -136,17 +138,6 @@ struct ContentView: View {
     )
   }
 
-  private var errorIsPresented: Binding<Bool> {
-    Binding(
-      get: { errorMessage != nil },
-      set: { isPresented in
-        if !isPresented {
-          errorMessage = nil
-        }
-      }
-    )
-  }
-
   private func loadFailure(_ message: String) -> some View {
     VStack(spacing: 16) {
       Image(systemName: "exclamationmark.triangle")
@@ -172,7 +163,32 @@ struct ContentView: View {
     do {
       try await operation()
     } catch {
-      errorMessage = error.localizedDescription
+      notice = .changeFailed(error.localizedDescription)
+    }
+  }
+}
+
+private enum NamespaceNotice: Identifiable {
+  case changeFailed(String)
+  case cleanupPending(String)
+
+  var id: String {
+    "\(title)-\(message)"
+  }
+
+  var title: String {
+    switch self {
+    case .changeFailed:
+      "Namespace Change Failed"
+    case .cleanupPending:
+      "Namespace Deleted; Cleanup Pending"
+    }
+  }
+
+  var message: String {
+    switch self {
+    case .changeFailed(let message), .cleanupPending(let message):
+      message
     }
   }
 }

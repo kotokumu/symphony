@@ -160,7 +160,7 @@ public actor FileNamespaceRepository: NamespaceRepository {
 
     do {
       try fileManager.removeItem(at: pendingDirectory)
-      try removePendingDirectoryWhenEmpty()
+      removePendingDirectoryWhenEmpty()
       return .complete
     } catch {
       return .cleanupPending(
@@ -238,21 +238,20 @@ public actor FileNamespaceRepository: NamespaceRepository {
       }
     }
 
-    do {
-      try fileManager.removeItem(at: pendingDeletionsDirectory)
-    } catch {
-      throw NamespaceStorageError.pendingDeletionCleanupFailed(pendingDeletionsDirectory)
-    }
+    removePendingDirectoryWhenEmpty()
   }
 
-  private func removePendingDirectoryWhenEmpty() throws {
-    let contents = try fileManager.contentsOfDirectory(
-      at: pendingDeletionsDirectory,
-      includingPropertiesForKeys: nil
-    )
-    if contents.isEmpty {
-      try fileManager.removeItem(at: pendingDeletionsDirectory)
+  private func removePendingDirectoryWhenEmpty() {
+    guard
+      let contents = try? fileManager.contentsOfDirectory(
+        at: pendingDeletionsDirectory,
+        includingPropertiesForKeys: nil
+      ),
+      contents.isEmpty
+    else {
+      return
     }
+    try? fileManager.removeItem(at: pendingDeletionsDirectory)
   }
 }
 

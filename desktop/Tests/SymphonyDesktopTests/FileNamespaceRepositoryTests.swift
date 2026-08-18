@@ -237,6 +237,24 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     )
   }
 
+  func testEmptyPendingContainerCleanupDoesNotBlockDeletionOrLoading() async throws {
+    let fileManager = FailingPendingContainerRemovalFileManager()
+    let repository = FileNamespaceRepository(
+      storageDirectory: storageDirectory,
+      fileManager: fileManager
+    )
+    var catalog = NamespaceCatalog()
+    let namespace = try catalog.create(named: "Research")
+    try await repository.create(namespace, saving: catalog)
+    _ = try catalog.delete(namespace.id)
+
+    let outcome = try await repository.delete(namespace, saving: catalog)
+    let reloaded = try await repository.load()
+
+    XCTAssertEqual(outcome, .complete)
+    XCTAssertTrue(reloaded.namespaces.isEmpty)
+  }
+
   func testLoadPreservesPendingDataWhenDeletionWasNotCommitted() async throws {
     let repository = FileNamespaceRepository(storageDirectory: storageDirectory)
     var catalog = NamespaceCatalog()
@@ -346,6 +364,15 @@ private final class FailingPendingRemovalFileManager: FileManager, @unchecked Se
 private final class FailingNamespaceRemovalFileManager: FileManager, @unchecked Sendable {
   override func removeItem(at URL: URL) throws {
     if URL.path.contains("Namespaces") && URL.lastPathComponent != "Namespaces" {
+      throw CocoaError(.fileWriteNoPermission)
+    }
+    try super.removeItem(at: URL)
+  }
+}
+
+private final class FailingPendingContainerRemovalFileManager: FileManager, @unchecked Sendable {
+  override func removeItem(at URL: URL) throws {
+    if URL.lastPathComponent == "PendingDeletions" {
       throw CocoaError(.fileWriteNoPermission)
     }
     try super.removeItem(at: URL)
