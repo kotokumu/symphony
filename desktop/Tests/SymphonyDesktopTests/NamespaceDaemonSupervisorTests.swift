@@ -202,6 +202,84 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
     XCTAssertEqual(secondState, .stopped)
   }
 
+  func testApplicationShutdownRejectsAStartThatArrivesWhileStopping() async throws {
+    let executable = try makeExecutable(
+      named: "slow-stop",
+      body: "trap '' TERM\nwhile :; do sleep 1; done"
+    )
+    let ports = PortSequence([42221, 42222])
+    let supervisor = NamespaceDaemonSupervisor(
+      executableURL: executable,
+      readinessTimeout: 1,
+      readinessProbe: { _ in true },
+      portAllocator: { try ports.next() },
+      gracefulStopTimeout: 0.2,
+      forcedStopTimeout: 1
+    )
+    let runningID = UUID()
+    let rejectedID = UUID()
+    await supervisor.start(
+      namespaceID: runningID,
+      namespaceDirectory: try makeNamespaceDirectory(runningID)
+    )
+
+    let shutdown = Task {
+      try await supervisor.shutdownForApplicationTermination()
+    }
+    try await Task.sleep(for: .milliseconds(50))
+    await supervisor.start(
+      namespaceID: rejectedID,
+      namespaceDirectory: try makeNamespaceDirectory(rejectedID)
+    )
+    try await shutdown.value
+
+    let runningState = await supervisor.state(for: runningID)
+    let rejectedState = await supervisor.state(for: rejectedID)
+    XCTAssertEqual(runningState, .stopped)
+    XCTAssertEqual(rejectedState, .stopped)
+    XCTAssertEqual(ports.requestCount, 1)
+  }
+
+  func testCancellingConcurrentStopDoesNotBlockTheOriginalStop() async throws {
+    let executable = try makeExecutable(
+      named: "concurrent-stop",
+      body: "trap '' TERM\nwhile :; do sleep 1; done"
+    )
+    let supervisor = NamespaceDaemonSupervisor(
+      executableURL: executable,
+      readinessTimeout: 1,
+      readinessProbe: { _ in true },
+      portAllocator: { 42231 },
+      gracefulStopTimeout: 0.2,
+      forcedStopTimeout: 1
+    )
+    let namespaceID = UUID()
+    await supervisor.start(
+      namespaceID: namespaceID,
+      namespaceDirectory: try makeNamespaceDirectory(namespaceID)
+    )
+
+    let originalStop = Task {
+      try await supervisor.stop(namespaceID: namespaceID)
+    }
+    try await Task.sleep(for: .milliseconds(50))
+    let waitingStop = Task {
+      try await supervisor.stop(namespaceID: namespaceID)
+    }
+    waitingStop.cancel()
+
+    do {
+      try await waitingStop.value
+      XCTFail("Expected the waiting stop to be cancelled")
+    } catch is CancellationError {
+      // Cancellation is the expected contract for a waiting caller.
+    }
+    try await originalStop.value
+
+    let state = await supervisor.state(for: namespaceID)
+    XCTAssertEqual(state, .stopped)
+  }
+
   func testMissingExecutableReportsAnActionableFailure() async throws {
     let supervisor = NamespaceDaemonSupervisor(
       executableURL: nil,

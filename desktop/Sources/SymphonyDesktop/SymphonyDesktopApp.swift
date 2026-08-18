@@ -50,7 +50,7 @@ struct SymphonyDesktopApp: App {
     }
 
     applicationDelegate.configure {
-      try await supervisor.stopAll()
+      try await supervisor.shutdownForApplicationTermination()
     }
   }
 

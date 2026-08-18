@@ -35,6 +35,8 @@ public actor NamespaceDaemonSupervisor {
   private var runtimes: [Namespace.ID: Runtime] = [:]
   private var portReservations: [Namespace.ID: (generation: UUID, port: UInt16)] = [:]
   private var intentionalTerminations: Set<UUID> = []
+  private var startSuspensionCount = 0
+  private var applicationTerminationRequested = false
   private var states: [Namespace.ID: NamespaceDaemonState] = [:]
   private var eventContinuations: [UUID: AsyncStream<NamespaceDaemonEvent>.Continuation] = [:]
 
@@ -81,7 +83,12 @@ public actor NamespaceDaemonSupervisor {
   }
 
   public func start(namespaceID: Namespace.ID, namespaceDirectory: URL) async {
-    guard !isActive(namespaceID), runtimes[namespaceID] == nil else {
+    guard
+      startSuspensionCount == 0,
+      !applicationTerminationRequested,
+      !isActive(namespaceID),
+      runtimes[namespaceID] == nil
+    else {
       return
     }
 
@@ -127,7 +134,7 @@ public actor NamespaceDaemonSupervisor {
 
     if intentionalTerminations.contains(runtime.generation) {
       while intentionalTerminations.contains(runtime.generation) {
-        try? await Task.sleep(for: .milliseconds(25))
+        try await Task.sleep(for: .milliseconds(25))
       }
       guard runtimes[namespaceID]?.generation == runtime.generation else {
         return
@@ -153,6 +160,22 @@ public actor NamespaceDaemonSupervisor {
   }
 
   public func stopAll() async throws {
+    startSuspensionCount += 1
+    defer { startSuspensionCount -= 1 }
+    try await stopOwnedDaemons()
+  }
+
+  public func shutdownForApplicationTermination() async throws {
+    applicationTerminationRequested = true
+    do {
+      try await stopOwnedDaemons()
+    } catch {
+      applicationTerminationRequested = false
+      throw error
+    }
+  }
+
+  private func stopOwnedDaemons() async throws {
     var failures: [Namespace.ID: String] = [:]
     for namespaceID in Set(generations.keys).union(runtimes.keys) {
       do {
@@ -347,7 +370,11 @@ public actor NamespaceDaemonSupervisor {
       if await readinessProbe(runtime.endpoint) {
         return true
       }
-      try? await Task.sleep(for: .milliseconds(100))
+      do {
+        try await Task.sleep(for: .milliseconds(100))
+      } catch {
+        return false
+      }
     }
     return false
   }
@@ -416,21 +443,21 @@ public actor NamespaceDaemonSupervisor {
       return
     }
     process.terminate()
-    if await waitForExit(process, timeout: gracefulStopTimeout) {
+    if try await waitForExit(process, timeout: gracefulStopTimeout) {
       return
     }
     guard forceKill(process.processIdentifier) == 0 else {
       throw NamespaceDaemonError.stopFailed
     }
-    guard await waitForExit(process, timeout: forcedStopTimeout) else {
+    guard try await waitForExit(process, timeout: forcedStopTimeout) else {
       throw NamespaceDaemonError.stopFailed
     }
   }
 
-  private func waitForExit(_ process: Process, timeout: TimeInterval) async -> Bool {
+  private func waitForExit(_ process: Process, timeout: TimeInterval) async throws -> Bool {
     let deadline = Date().addingTimeInterval(timeout)
     while process.isRunning, Date() < deadline {
-      try? await Task.sleep(for: .milliseconds(50))
+      try await Task.sleep(for: .milliseconds(50))
     }
     return !process.isRunning
   }
