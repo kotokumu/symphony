@@ -3,8 +3,8 @@ import XCTest
 @testable import SymphonyDesktop
 
 final class EmptyStateContentTests: XCTestCase {
-  func testInitialShellExplainsThatNoNamespacesExist() {
-    let content = EmptyStateContent.namespaces
+  func testNoNamespaceCopyExplainsHowToStart() {
+    let content = EmptyStateContent.noNamespaces
 
     XCTAssertEqual(content.title, "No Namespaces")
     XCTAssertEqual(

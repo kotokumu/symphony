@@ -6,7 +6,9 @@ initial project provides an application shell and does not manage namespaces yet
 ## Requirements
 
 - macOS 13 or later
-- A Swift 6 toolchain with a macOS SDK, provided by Xcode or Xcode Command Line Tools
+- Xcode 16.4 with its Swift 6 toolchain and macOS SDK
+
+Xcode Command Line Tools alone are insufficient because the test suite uses XCTest.
 
 ## Commands
 
@@ -19,3 +21,8 @@ make -C desktop run
 ```
 
 `make -C desktop all` runs the build and test checks used by continuous integration.
+
+## Launch Check
+
+Run `make -C desktop run`, then verify that a window titled `Symphony` displays `No Namespaces`
+and `Create a namespace to start orchestrating work with Symphony.` Quit the app with Command-Q.

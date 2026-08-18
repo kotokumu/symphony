@@ -10,5 +10,5 @@ Symphony Desktop runs as a native macOS application and opens a main window titl
 
 ## 2. Empty State
 
-When no namespaces are available, the main window communicates that no namespaces exist and that
-the user must create one before Symphony can orchestrate work.
+The initial application shell communicates that no namespaces exist and that the user must create
+one before Symphony can orchestrate work.

@@ -3,7 +3,7 @@ import SwiftUI
 struct ContentView: View {
   private let content: EmptyStateContent
 
-  init(content: EmptyStateContent = .namespaces) {
+  init(content: EmptyStateContent = .noNamespaces) {
     self.content = content
   }
 

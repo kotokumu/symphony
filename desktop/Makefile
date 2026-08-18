@@ -1,12 +1,18 @@
-.PHONY: all build test run
+.PHONY: all check-xcode build test run
 
 all: build test
 
-build:
+check-xcode:
+	@test -x "$$(xcode-select -p)/usr/bin/xcodebuild" || { \
+		echo "error: full Xcode is required; Xcode Command Line Tools alone are unsupported" >&2; \
+		exit 1; \
+	}
+
+build: check-xcode
 	swift build
 
-test:
+test: check-xcode
 	swift test
 
-run:
+run: check-xcode
 	swift run SymphonyDesktop
