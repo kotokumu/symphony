@@ -24,6 +24,7 @@ public actor NamespaceDaemonSupervisor {
 
   private var generations: [Namespace.ID: UUID] = [:]
   private var runtimes: [Namespace.ID: Runtime] = [:]
+  private var portReservations: [Namespace.ID: (generation: UUID, port: UInt16)] = [:]
   private var states: [Namespace.ID: NamespaceDaemonState] = [:]
   private var eventContinuations: [UUID: AsyncStream<NamespaceDaemonEvent>.Continuation] = [:]
 
@@ -58,7 +59,7 @@ public actor NamespaceDaemonSupervisor {
   }
 
   public func start(namespaceID: Namespace.ID, namespaceDirectory: URL) async {
-    guard !isActive(namespaceID) else {
+    guard !isActive(namespaceID), runtimes[namespaceID] == nil else {
       return
     }
 
@@ -69,7 +70,7 @@ public actor NamespaceDaemonSupervisor {
     do {
       let executableURL = try requireExecutable()
       let layout = try prepareRuntime(in: namespaceDirectory)
-      let port = try portAllocator()
+      let port = try reservePort(for: namespaceID, generation: generation)
       let endpoint = URL(string: "http://127.0.0.1:\(port)")!
       let runtime = try launch(
         executableURL: executableURL,
@@ -96,12 +97,22 @@ public actor NamespaceDaemonSupervisor {
 
   public func stop(namespaceID: Namespace.ID) async throws {
     generations.removeValue(forKey: namespaceID)
-    guard let runtime = runtimes.removeValue(forKey: namespaceID) else {
+    guard let runtime = runtimes[namespaceID] else {
+      releasePort(for: namespaceID)
       publish(.stopped, for: namespaceID)
       return
     }
 
-    try await terminate(runtime.process)
+    do {
+      try await terminate(runtime.process)
+    } catch {
+      publish(.failed(message: error.localizedDescription), for: namespaceID)
+      throw error
+    }
+    if runtimes[namespaceID]?.generation == runtime.generation {
+      runtimes.removeValue(forKey: namespaceID)
+    }
+    releasePort(for: namespaceID, generation: runtime.generation)
     close(runtime)
     publish(.stopped, for: namespaceID)
   }
@@ -133,6 +144,27 @@ public actor NamespaceDaemonSupervisor {
       throw NamespaceDaemonError.executableNotExecutable(executableURL)
     }
     return executableURL
+  }
+
+  private func reservePort(for namespaceID: Namespace.ID, generation: UUID) throws -> UInt16 {
+    for _ in 0..<100 {
+      let port = try portAllocator()
+      guard !portReservations.values.contains(where: { $0.port == port }) else {
+        continue
+      }
+      portReservations[namespaceID] = (generation, port)
+      return port
+    }
+    throw NamespaceDaemonError.endpointUnavailable
+  }
+
+  private func releasePort(for namespaceID: Namespace.ID, generation: UUID? = nil) {
+    guard
+      generation == nil || portReservations[namespaceID]?.generation == generation
+    else {
+      return
+    }
+    portReservations.removeValue(forKey: namespaceID)
   }
 
   private func prepareRuntime(in namespaceDirectory: URL) throws -> RuntimeLayout {
@@ -268,6 +300,7 @@ public actor NamespaceDaemonSupervisor {
       return
     }
     generations.removeValue(forKey: namespaceID)
+    releasePort(for: namespaceID, generation: generation)
     if let runtime = runtimes.removeValue(forKey: namespaceID), runtime.generation == generation {
       try? await terminate(runtime.process)
       close(runtime)
@@ -289,6 +322,7 @@ public actor NamespaceDaemonSupervisor {
     }
     runtimes.removeValue(forKey: namespaceID)
     generations.removeValue(forKey: namespaceID)
+    releasePort(for: namespaceID, generation: generation)
     close(runtime)
     publish(
       .failed(

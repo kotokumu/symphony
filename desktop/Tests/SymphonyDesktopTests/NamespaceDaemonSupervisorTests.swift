@@ -24,7 +24,7 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
 
   func testRunsTwoNamespacesWithIsolatedRuntimeResources() async throws {
     let executable = try makeLongRunningExecutable()
-    let ports = PortSequence([42001, 42002])
+    let ports = PortSequence([42001, 42001, 42002])
     let supervisor = NamespaceDaemonSupervisor(
       executableURL: executable,
       readinessTimeout: 1,
