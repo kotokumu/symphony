@@ -61,6 +61,25 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     XCTAssertEqual(try Data(contentsOf: metadataURL), corruptData)
   }
 
+  func testDoesNotCleanPendingDataWhenMetadataIsUnreadable() async throws {
+    let metadataURL = storageDirectory.appendingPathComponent("namespaces.json")
+    try Data("{not-json".utf8).write(to: metadataURL)
+    let pendingDirectory =
+      storageDirectory
+      .appendingPathComponent("PendingDeletions")
+      .appendingPathComponent(UUID().uuidString.lowercased())
+    try FileManager.default.createDirectory(at: pendingDirectory, withIntermediateDirectories: true)
+    let repository = FileNamespaceRepository(storageDirectory: storageDirectory)
+
+    await assertThrowsErrorAsync(try await repository.load()) { error in
+      XCTAssertEqual(
+        error.localizedDescription,
+        "Namespace data could not be read. The file was not changed."
+      )
+    }
+    XCTAssertTrue(FileManager.default.fileExists(atPath: pendingDirectory.path))
+  }
+
   func testRejectsUnsupportedMetadataWithoutOverwritingIt() async throws {
     let metadataURL = storageDirectory.appendingPathComponent("namespaces.json")
     let unsupportedData = Data("{\"version\":2,\"namespaces\":[],\"selectedID\":null}".utf8)
@@ -218,6 +237,70 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     )
   }
 
+  func testLoadPreservesPendingDataWhenDeletionWasNotCommitted() async throws {
+    let repository = FileNamespaceRepository(storageDirectory: storageDirectory)
+    var catalog = NamespaceCatalog()
+    let namespace = try catalog.create(named: "Research")
+    try await repository.create(namespace, saving: catalog)
+    let directory = await repository.directoryURL(for: namespace.id)
+    let pendingDirectory =
+      storageDirectory
+      .appendingPathComponent("PendingDeletions")
+      .appendingPathComponent(namespace.id.uuidString.lowercased())
+    try FileManager.default.createDirectory(
+      at: pendingDirectory.deletingLastPathComponent(),
+      withIntermediateDirectories: true
+    )
+    try FileManager.default.moveItem(at: directory, to: pendingDirectory)
+
+    await assertThrowsErrorAsync(try await repository.load()) { error in
+      XCTAssertEqual(
+        error.localizedDescription,
+        "Namespace deletion was not saved. Restore \(pendingDirectory.path) to \(directory.path) before retrying."
+      )
+    }
+    XCTAssertTrue(FileManager.default.fileExists(atPath: pendingDirectory.path))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+  }
+
+  func testLoadPreservesDataAfterDeleteSaveAndRollbackBothFail() async throws {
+    let repository = FileNamespaceRepository(storageDirectory: storageDirectory)
+    var catalog = NamespaceCatalog()
+    let namespace = try catalog.create(named: "Research")
+    try await repository.create(namespace, saving: catalog)
+    let directory = await repository.directoryURL(for: namespace.id)
+    let pendingDirectory =
+      storageDirectory
+      .appendingPathComponent("PendingDeletions")
+      .appendingPathComponent(namespace.id.uuidString.lowercased())
+    _ = try catalog.delete(namespace.id)
+    let failingRepository = FileNamespaceRepository(
+      storageDirectory: storageDirectory,
+      fileManager: FailingDeleteSaveAndRollbackFileManager(storageDirectory: storageDirectory)
+    )
+
+    await assertThrowsErrorAsync(
+      try await failingRepository.delete(namespace, saving: catalog)
+    ) { error in
+      XCTAssertEqual(
+        error.localizedDescription,
+        "Namespace deletion was not saved, and its local directory must be restored from \(pendingDirectory.path)."
+      )
+    }
+    XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+    XCTAssertTrue(FileManager.default.fileExists(atPath: pendingDirectory.path))
+
+    await assertThrowsErrorAsync(
+      try await FileNamespaceRepository(storageDirectory: storageDirectory).load()
+    ) { error in
+      XCTAssertEqual(
+        error.localizedDescription,
+        "Namespace deletion was not saved. Restore \(pendingDirectory.path) to \(directory.path) before retrying."
+      )
+    }
+    XCTAssertTrue(FileManager.default.fileExists(atPath: pendingDirectory.path))
+  }
+
   @MainActor
   func testControllerOperationsSurviveRepositoryAndControllerRecreation() async throws {
     let firstRepository = FileNamespaceRepository(storageDirectory: storageDirectory)
@@ -266,6 +349,39 @@ private final class FailingNamespaceRemovalFileManager: FileManager, @unchecked 
       throw CocoaError(.fileWriteNoPermission)
     }
     try super.removeItem(at: URL)
+  }
+}
+
+private final class FailingDeleteSaveAndRollbackFileManager: FileManager, @unchecked Sendable {
+  private let storageDirectory: URL
+
+  init(storageDirectory: URL) {
+    self.storageDirectory = storageDirectory
+    super.init()
+  }
+
+  override func createDirectory(
+    at url: URL,
+    withIntermediateDirectories createIntermediates: Bool,
+    attributes: [FileAttributeKey: Any]? = nil
+  ) throws {
+    if url.standardizedFileURL == storageDirectory.standardizedFileURL {
+      throw CocoaError(.fileWriteNoPermission)
+    }
+    try super.createDirectory(
+      at: url,
+      withIntermediateDirectories: createIntermediates,
+      attributes: attributes
+    )
+  }
+
+  override func moveItem(at srcURL: URL, to dstURL: URL) throws {
+    if srcURL.path.contains("PendingDeletions")
+      && dstURL.path.contains("Namespaces")
+    {
+      throw CocoaError(.fileWriteNoPermission)
+    }
+    try super.moveItem(at: srcURL, to: dstURL)
   }
 }
 

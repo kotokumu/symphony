@@ -30,10 +30,10 @@ public actor FileNamespaceRepository: NamespaceRepository {
   }
 
   public func load() throws -> NamespaceCatalog {
-    try cleanPendingDeletions()
-
     guard fileManager.fileExists(atPath: metadataURL.path) else {
-      return NamespaceCatalog()
+      let catalog = NamespaceCatalog()
+      try reconcilePendingDeletions(with: catalog)
+      return catalog
     }
 
     let data: Data
@@ -67,6 +67,7 @@ public actor FileNamespaceRepository: NamespaceRepository {
       throw NamespaceStorageError.unreadableData
     }
 
+    try reconcilePendingDeletions(with: catalog)
     try validateDirectories(for: catalog)
     return catalog
   }
@@ -204,7 +205,7 @@ public actor FileNamespaceRepository: NamespaceRepository {
     }
   }
 
-  private func cleanPendingDeletions() throws {
+  private func reconcilePendingDeletions(with catalog: NamespaceCatalog) throws {
     guard fileManager.fileExists(atPath: pendingDeletionsDirectory.path) else {
       return
     }
@@ -220,6 +221,16 @@ public actor FileNamespaceRepository: NamespaceRepository {
     }
 
     for directory in pendingDirectories {
+      guard let id = Namespace.ID(uuidString: directory.lastPathComponent) else {
+        throw NamespaceStorageError.unrecognizedPendingDeletion(directory)
+      }
+      if catalog.namespaces.contains(where: { $0.id == id }) {
+        throw NamespaceStorageError.pendingDeletionRequiresRestore(
+          directory,
+          directoryURL(for: id)
+        )
+      }
+
       do {
         try fileManager.removeItem(at: directory)
       } catch {
@@ -257,6 +268,8 @@ public enum NamespaceStorageError: LocalizedError, Sendable {
   case deleteStagingFailed(URL)
   case deleteRollbackFailed(URL)
   case pendingDeletionConflict(URL)
+  case unrecognizedPendingDeletion(URL)
+  case pendingDeletionRequiresRestore(URL, URL)
   case cleanupPending(URL)
   case pendingDeletionCleanupFailed(URL)
 
@@ -284,6 +297,10 @@ public enum NamespaceStorageError: LocalizedError, Sendable {
       "Namespace deletion was not saved, and its local directory must be restored from \(directory.path)."
     case .pendingDeletionConflict(let directory):
       "Namespace deletion cannot continue while pending data remains at \(directory.path)."
+    case .unrecognizedPendingDeletion(let directory):
+      "Unrecognized pending namespace data remains at \(directory.path). Move it before retrying."
+    case .pendingDeletionRequiresRestore(let pending, let destination):
+      "Namespace deletion was not saved. Restore \(pending.path) to \(destination.path) before retrying."
     case .cleanupPending(let directory):
       "The namespace was deleted, but its local directory remains at \(directory.path). Symphony will retry cleanup the next time it starts."
     case .pendingDeletionCleanupFailed(let directory):
