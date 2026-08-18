@@ -125,6 +125,7 @@ public actor NamespaceDaemonSupervisor {
   }
 
   public func stop(namespaceID: Namespace.ID) async throws {
+    try Task.checkCancellation()
     guard let runtime = runtimes[namespaceID] else {
       generations.removeValue(forKey: namespaceID)
       releasePort(for: namespaceID)

@@ -203,9 +203,10 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
   }
 
   func testApplicationShutdownRejectsAStartThatArrivesWhileStopping() async throws {
+    let stopSignal = temporaryDirectory.appendingPathComponent("shutdown-started")
     let executable = try makeExecutable(
       named: "slow-stop",
-      body: "trap '' TERM\nwhile :; do sleep 1; done"
+      body: "trap 'touch \"\(stopSignal.path)\"' TERM\nwhile :; do sleep 0.02; done"
     )
     let ports = PortSequence([42221, 42222])
     let supervisor = NamespaceDaemonSupervisor(
@@ -213,7 +214,7 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
       readinessTimeout: 1,
       readinessProbe: { _ in true },
       portAllocator: { try ports.next() },
-      gracefulStopTimeout: 0.2,
+      gracefulStopTimeout: 1,
       forcedStopTimeout: 1
     )
     let runningID = UUID()
@@ -226,7 +227,7 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
     let shutdown = Task {
       try await supervisor.shutdownForApplicationTermination()
     }
-    try await Task.sleep(for: .milliseconds(50))
+    try await waitForFile(stopSignal)
     await supervisor.start(
       namespaceID: rejectedID,
       namespaceDirectory: try makeNamespaceDirectory(rejectedID)
@@ -241,16 +242,17 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
   }
 
   func testCancellingConcurrentStopDoesNotBlockTheOriginalStop() async throws {
+    let stopSignal = temporaryDirectory.appendingPathComponent("stop-started")
     let executable = try makeExecutable(
       named: "concurrent-stop",
-      body: "trap '' TERM\nwhile :; do sleep 1; done"
+      body: "trap 'touch \"\(stopSignal.path)\"' TERM\nwhile :; do sleep 0.02; done"
     )
     let supervisor = NamespaceDaemonSupervisor(
       executableURL: executable,
       readinessTimeout: 1,
       readinessProbe: { _ in true },
       portAllocator: { 42231 },
-      gracefulStopTimeout: 0.2,
+      gracefulStopTimeout: 1,
       forcedStopTimeout: 1
     )
     let namespaceID = UUID()
@@ -262,10 +264,11 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
     let originalStop = Task {
       try await supervisor.stop(namespaceID: namespaceID)
     }
-    try await Task.sleep(for: .milliseconds(50))
+    try await waitForFile(stopSignal)
     let waitingStop = Task {
       try await supervisor.stop(namespaceID: namespaceID)
     }
+    await Task.yield()
     waitingStop.cancel()
 
     do {
@@ -384,6 +387,17 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
     FileManager.default.fileExists(atPath: url.path)
   }
 
+  private func waitForFile(_ url: URL) async throws {
+    let deadline = Date().addingTimeInterval(2)
+    while Date() < deadline {
+      if fileExists(url) {
+        return
+      }
+      try await Task.sleep(for: .milliseconds(10))
+    }
+    throw TestFailure.fileDidNotAppear(url)
+  }
+
   private func runningEndpoint(_ state: NamespaceDaemonState) throws -> URL {
     guard case .running(let endpoint) = state else {
       throw TestFailure.expectedRunning(state)
@@ -394,6 +408,7 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
 
 private enum TestFailure: Error {
   case expectedRunning(NamespaceDaemonState)
+  case fileDidNotAppear(URL)
   case terminationWasNotDeferred
 }
 
