@@ -1,6 +1,6 @@
 import Foundation
 
-public struct Namespace: Codable, Hashable, Identifiable, Sendable {
+public struct Namespace: Hashable, Identifiable, Sendable {
   public let id: UUID
   public private(set) var name: NamespaceName
 

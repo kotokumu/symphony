@@ -37,19 +37,8 @@ final class NamespaceController: ObservableObject {
 
     var updatedCatalog = catalog
     let namespace = try updatedCatalog.create(named: name)
-    var reservedDirectory = false
-
-    do {
-      _ = try await repository.reserveDirectory(for: namespace.id)
-      reservedDirectory = true
-      try await repository.save(updatedCatalog)
-      catalog = updatedCatalog
-    } catch {
-      if reservedDirectory {
-        try? await repository.removeDirectory(for: namespace.id)
-      }
-      throw error
-    }
+    try await repository.create(namespace, saving: updatedCatalog)
+    catalog = updatedCatalog
   }
 
   func renameNamespace(_ id: Namespace.ID, to name: String) async throws {
@@ -72,15 +61,15 @@ final class NamespaceController: ObservableObject {
     catalog = updatedCatalog
   }
 
-  func deleteNamespace(_ id: Namespace.ID) async throws {
+  func deleteNamespace(_ id: Namespace.ID) async throws -> NamespaceDeletionOutcome {
     try beginChange()
     defer { finishChange() }
 
     var updatedCatalog = catalog
-    _ = try updatedCatalog.delete(id)
-    try await repository.save(updatedCatalog)
+    let namespace = try updatedCatalog.delete(id)
+    let outcome = try await repository.delete(namespace, saving: updatedCatalog)
     catalog = updatedCatalog
-    try await repository.removeDirectory(for: id)
+    return outcome
   }
 
   private func beginChange() throws {

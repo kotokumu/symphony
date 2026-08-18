@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import SymphonyDesktopCore
+import SymphonyDesktopInfrastructure
 
 @main
 struct SymphonyDesktopApp: App {
@@ -35,18 +36,20 @@ private actor UnavailableNamespaceRepository: NamespaceRepository {
     throw UnavailableNamespaceRepositoryError(message: message)
   }
 
+  func create(_ namespace: SymphonyDesktopCore.Namespace, saving catalog: NamespaceCatalog) throws {
+    throw UnavailableNamespaceRepositoryError(message: message)
+  }
+
   func save(_ catalog: NamespaceCatalog) throws {
     throw UnavailableNamespaceRepositoryError(message: message)
   }
 
-  func reserveDirectory(for id: UUID) throws -> URL {
+  func delete(
+    _ namespace: SymphonyDesktopCore.Namespace,
+    saving catalog: NamespaceCatalog
+  ) throws -> NamespaceDeletionOutcome {
     throw UnavailableNamespaceRepositoryError(message: message)
   }
-
-  func removeDirectory(for id: UUID) throws {
-    throw UnavailableNamespaceRepositoryError(message: message)
-  }
-
 }
 
 private struct UnavailableNamespaceRepositoryError: LocalizedError {

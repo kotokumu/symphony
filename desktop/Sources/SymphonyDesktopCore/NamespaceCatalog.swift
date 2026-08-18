@@ -11,8 +11,12 @@ public struct NamespaceCatalog: Equatable, Sendable {
 
   public init(validating namespaces: [Namespace], selectedID: Namespace.ID?) throws {
     var names: Set<String> = []
+    var identities: Set<Namespace.ID> = []
 
     for namespace in namespaces {
+      guard identities.insert(namespace.id).inserted else {
+        throw NamespaceCatalogError.duplicateIdentity
+      }
       guard names.insert(namespace.name.comparisonKey).inserted else {
         throw NamespaceCatalogError.duplicateName(namespace.name.value)
       }
@@ -36,6 +40,9 @@ public struct NamespaceCatalog: Equatable, Sendable {
   public mutating func create(named value: String, id: Namespace.ID = UUID()) throws -> Namespace {
     let name = try NamespaceName(validating: value)
     try ensureUnique(name)
+    guard !namespaces.contains(where: { $0.id == id }) else {
+      throw NamespaceCatalogError.duplicateIdentity
+    }
 
     let namespace = Namespace(id: id, name: name)
     namespaces.append(namespace)
@@ -97,6 +104,7 @@ public struct NamespaceCatalog: Equatable, Sendable {
 
 public enum NamespaceCatalogError: LocalizedError, Equatable, Sendable {
   case duplicateName(String)
+  case duplicateIdentity
   case namespaceNotFound
   case invalidSelection
 
@@ -104,6 +112,8 @@ public enum NamespaceCatalogError: LocalizedError, Equatable, Sendable {
     switch self {
     case .duplicateName(let name):
       "A namespace named “\(name)” already exists."
+    case .duplicateIdentity:
+      "A namespace with this identity already exists."
     case .namespaceNotFound:
       "The namespace no longer exists."
     case .invalidSelection:

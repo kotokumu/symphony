@@ -1,6 +1,6 @@
 import Foundation
 
-public struct NamespaceName: Codable, Hashable, Sendable {
+public struct NamespaceName: Hashable, Sendable {
   public let value: String
 
   public init(validating value: String) throws {
@@ -26,17 +26,9 @@ public struct NamespaceName: Codable, Hashable, Sendable {
   }
 
   var comparisonKey: String {
-    value.precomposedStringWithCanonicalMapping.lowercased()
-  }
-
-  public init(from decoder: Decoder) throws {
-    let container = try decoder.singleValueContainer()
-    try self.init(validating: container.decode(String.self))
-  }
-
-  public func encode(to encoder: Encoder) throws {
-    var container = encoder.singleValueContainer()
-    try container.encode(value)
+    value
+      .folding(options: .caseInsensitive, locale: Locale(identifier: "en_US_POSIX"))
+      .precomposedStringWithCanonicalMapping
   }
 }
 

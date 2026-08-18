@@ -12,13 +12,21 @@ let package = Package(
   ],
   targets: [
     .target(name: "SymphonyDesktopCore"),
+    .target(
+      name: "SymphonyDesktopInfrastructure",
+      dependencies: ["SymphonyDesktopCore"]
+    ),
     .executableTarget(
       name: "SymphonyDesktop",
-      dependencies: ["SymphonyDesktopCore"]
+      dependencies: ["SymphonyDesktopCore", "SymphonyDesktopInfrastructure"]
     ),
     .testTarget(
       name: "SymphonyDesktopTests",
-      dependencies: ["SymphonyDesktop", "SymphonyDesktopCore"]
+      dependencies: [
+        "SymphonyDesktop",
+        "SymphonyDesktopCore",
+        "SymphonyDesktopInfrastructure",
+      ]
     ),
   ]
 )

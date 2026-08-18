@@ -1,7 +1,9 @@
 import Foundation
 import XCTest
 
+@testable import SymphonyDesktop
 @testable import SymphonyDesktopCore
+@testable import SymphonyDesktopInfrastructure
 
 final class FileNamespaceRepositoryTests: XCTestCase {
   private var storageDirectory: URL!
@@ -33,9 +35,9 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     let repository = FileNamespaceRepository(storageDirectory: storageDirectory)
     var catalog = NamespaceCatalog()
     let namespace = try catalog.create(named: "Research")
-    let directory = try await repository.reserveDirectory(for: namespace.id)
+    let directory = await repository.directoryURL(for: namespace.id)
 
-    try await repository.save(catalog)
+    try await repository.create(namespace, saving: catalog)
     let reloaded = try await FileNamespaceRepository(storageDirectory: storageDirectory).load()
 
     XCTAssertEqual(reloaded, catalog)
@@ -101,9 +103,9 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     let repository = FileNamespaceRepository(storageDirectory: storageDirectory)
     var catalog = NamespaceCatalog()
     let namespace = try catalog.create(named: "Research")
-    _ = try await repository.reserveDirectory(for: namespace.id)
-    try await repository.save(catalog)
-    try await repository.removeDirectory(for: namespace.id)
+    try await repository.create(namespace, saving: catalog)
+    let directory = await repository.directoryURL(for: namespace.id)
+    try FileManager.default.removeItem(at: directory)
 
     await assertThrowsErrorAsync(try await repository.load()) { error in
       XCTAssertEqual(
@@ -120,6 +122,91 @@ final class FileNamespaceRepositoryTests: XCTestCase {
           .path
       )
     )
+  }
+
+  func testCreationRemovesItsDirectoryWhenMetadataCannotBeSaved() async throws {
+    let metadataURL = storageDirectory.appendingPathComponent("namespaces.json")
+    try FileManager.default.createDirectory(at: metadataURL, withIntermediateDirectories: true)
+    let repository = FileNamespaceRepository(storageDirectory: storageDirectory)
+    var catalog = NamespaceCatalog()
+    let namespace = try catalog.create(named: "Research")
+    let directory = await repository.directoryURL(for: namespace.id)
+
+    await assertThrowsErrorAsync(try await repository.create(namespace, saving: catalog)) { error in
+      XCTAssertEqual(
+        error.localizedDescription,
+        "Namespace changes could not be saved. Check disk space and permissions, then try again."
+      )
+    }
+    XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
+  }
+
+  func testDeletionCanFinishPendingCleanupOnTheNextLoad() async throws {
+    let fileManager = FailingPendingRemovalFileManager()
+    let repository = FileNamespaceRepository(
+      storageDirectory: storageDirectory,
+      fileManager: fileManager
+    )
+    var catalog = NamespaceCatalog()
+    let namespace = try catalog.create(named: "Research")
+    try await repository.create(namespace, saving: catalog)
+    _ = try catalog.delete(namespace.id)
+
+    let outcome = try await repository.delete(namespace, saving: catalog)
+
+    guard case .cleanupPending(let message) = outcome else {
+      return XCTFail("Expected cleanup to remain pending")
+    }
+    XCTAssertTrue(message.contains("Symphony will retry cleanup"))
+
+    let reloaded = try await FileNamespaceRepository(storageDirectory: storageDirectory).load()
+    XCTAssertTrue(reloaded.namespaces.isEmpty)
+    XCTAssertFalse(
+      FileManager.default.fileExists(
+        atPath: storageDirectory.appendingPathComponent("PendingDeletions").path
+      )
+    )
+  }
+
+  @MainActor
+  func testControllerOperationsSurviveRepositoryAndControllerRecreation() async throws {
+    let firstRepository = FileNamespaceRepository(storageDirectory: storageDirectory)
+    let firstController = NamespaceController(repository: firstRepository)
+    await firstController.load()
+    try await firstController.createNamespace(named: "Research")
+    let researchID = try XCTUnwrap(firstController.catalog.selectedID)
+    try await firstController.createNamespace(named: "Operations")
+    let operationsID = try XCTUnwrap(firstController.catalog.selectedID)
+    try await firstController.renameNamespace(researchID, to: "Market Research")
+    try await firstController.selectNamespace(researchID)
+
+    let restoredController = NamespaceController(
+      repository: FileNamespaceRepository(storageDirectory: storageDirectory)
+    )
+    await restoredController.load()
+
+    let restoredCatalog = restoredController.catalog
+    XCTAssertEqual(restoredCatalog.namespaces.map(\.name.value), ["Market Research", "Operations"])
+    XCTAssertEqual(restoredCatalog.selectedID, researchID)
+
+    _ = try await restoredController.deleteNamespace(operationsID)
+    let finalController = NamespaceController(
+      repository: FileNamespaceRepository(storageDirectory: storageDirectory)
+    )
+    await finalController.load()
+
+    let finalCatalog = finalController.catalog
+    XCTAssertEqual(finalCatalog.namespaces.map(\.name.value), ["Market Research"])
+    XCTAssertEqual(finalCatalog.selectedID, researchID)
+  }
+}
+
+private final class FailingPendingRemovalFileManager: FileManager, @unchecked Sendable {
+  override func removeItem(at URL: URL) throws {
+    if URL.path.contains("PendingDeletions") && URL.lastPathComponent != "PendingDeletions" {
+      throw CocoaError(.fileWriteNoPermission)
+    }
+    try super.removeItem(at: URL)
   }
 }
 

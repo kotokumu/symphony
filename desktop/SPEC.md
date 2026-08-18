@@ -48,4 +48,6 @@ local data.
 
 The application does not replace unreadable or unsupported namespace data. It reports the problem
 and allows the user to retry after correcting it. A missing namespace directory is also reported
-without recreating or deleting data automatically.
+without recreating or deleting data automatically. If local data cleanup is interrupted after a
+confirmed deletion, the application reports the remaining data and retries cleanup on its next
+start.

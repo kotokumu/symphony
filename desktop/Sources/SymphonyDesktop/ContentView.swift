@@ -43,7 +43,10 @@ struct ContentView: View {
       Button("Delete \(namespace.name.value)", role: .destructive) {
         Task {
           await reportErrors {
-            try await controller.deleteNamespace(namespace.id)
+            let outcome = try await controller.deleteNamespace(namespace.id)
+            if case .cleanupPending(let message) = outcome {
+              errorMessage = message
+            }
           }
         }
       }
