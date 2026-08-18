@@ -9,8 +9,11 @@ struct SymphonyDesktopApp: App {
   @StateObject private var daemonController: NamespaceDaemonController
 
   init() {
+    let command = SymphonyExecutableLocator().locate()
     let supervisor = NamespaceDaemonSupervisor(
-      executableURL: SymphonyExecutableLocator().locate()
+      executableURL: command?.executableURL,
+      argumentPrefix: command?.argumentPrefix ?? [],
+      workingDirectoryURL: command?.workingDirectoryURL
     )
 
     do {

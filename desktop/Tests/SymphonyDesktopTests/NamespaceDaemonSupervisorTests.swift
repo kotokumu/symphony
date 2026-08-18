@@ -65,8 +65,10 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
 
     try await supervisor.stop(namespaceID: firstID)
 
-    XCTAssertEqual(await supervisor.state(for: firstID), .stopped)
-    XCTAssertEqual(try runningEndpoint(await supervisor.state(for: secondID)), secondEndpoint)
+    let stoppedState = await supervisor.state(for: firstID)
+    let stillRunningEndpoint = try runningEndpoint(await supervisor.state(for: secondID))
+    XCTAssertEqual(stoppedState, .stopped)
+    XCTAssertEqual(stillRunningEndpoint, secondEndpoint)
     await supervisor.stopAll()
   }
 
@@ -87,10 +89,8 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
     await supervisor.start(namespaceID: namespaceID, namespaceDirectory: directory)
     try? await Task.sleep(for: .milliseconds(100))
 
-    XCTAssertEqual(
-      await supervisor.state(for: namespaceID),
-      .running(endpoint: URL(string: "http://127.0.0.1:42102")!)
-    )
+    let restartedState = await supervisor.state(for: namespaceID)
+    XCTAssertEqual(restartedState, .running(endpoint: URL(string: "http://127.0.0.1:42102")!))
     await supervisor.stopAll()
   }
 
@@ -125,10 +125,8 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
       return XCTFail("Expected a failed daemon, got \(failure)")
     }
     XCTAssertTrue(message.contains("status 7") || message.contains("ready"))
-    XCTAssertEqual(
-      await supervisor.state(for: stableID),
-      .running(endpoint: URL(string: "http://127.0.0.1:42201")!)
-    )
+    let stableState = await supervisor.state(for: stableID)
+    XCTAssertEqual(stableState, .running(endpoint: URL(string: "http://127.0.0.1:42201")!))
     await supervisor.stopAll()
   }
 
@@ -146,8 +144,9 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
       namespaceDirectory: try makeNamespaceDirectory(namespaceID)
     )
 
+    let failedState = await supervisor.state(for: namespaceID)
     XCTAssertEqual(
-      await supervisor.state(for: namespaceID),
+      failedState,
       .failed(
         message: """
           The Symphony daemon executable could not be found. \

@@ -15,6 +15,8 @@ public actor NamespaceDaemonSupervisor {
   }
 
   private let executableURL: URL?
+  private let argumentPrefix: [String]
+  private let workingDirectoryURL: URL?
   private let readinessTimeout: TimeInterval
   private let readinessProbe: ReadinessProbe
   private let portAllocator: PortAllocator
@@ -27,12 +29,16 @@ public actor NamespaceDaemonSupervisor {
 
   public init(
     executableURL: URL?,
+    argumentPrefix: [String] = [],
+    workingDirectoryURL: URL? = nil,
     readinessTimeout: TimeInterval = 15,
     readinessProbe: @escaping ReadinessProbe = NamespaceDaemonSupervisor.probe,
     portAllocator: @escaping PortAllocator = NamespaceDaemonSupervisor.availableLoopbackPort,
     fileManager: FileManager = .default
   ) {
     self.executableURL = executableURL
+    self.argumentPrefix = argumentPrefix
+    self.workingDirectoryURL = workingDirectoryURL
     self.readinessTimeout = readinessTimeout
     self.readinessProbe = readinessProbe
     self.portAllocator = portAllocator
@@ -197,12 +203,14 @@ public actor NamespaceDaemonSupervisor {
 
     let process = Process()
     process.executableURL = executableURL
-    process.arguments = [
-      "--i-understand-that-this-will-be-running-without-the-usual-guardrails",
-      "--logs-root", layout.logsDirectory.path,
-      "--port", String(port),
-      layout.workflowURL.path,
-    ]
+    process.arguments =
+      argumentPrefix + [
+        "--i-understand-that-this-will-be-running-without-the-usual-guardrails",
+        "--logs-root", layout.logsDirectory.path,
+        "--port", String(port),
+        layout.workflowURL.path,
+      ]
+    process.currentDirectoryURL = workingDirectoryURL
     process.standardOutput = output
     process.standardError = errorOutput
     process.terminationHandler = { [weak self] process in
@@ -283,7 +291,12 @@ public actor NamespaceDaemonSupervisor {
     generations.removeValue(forKey: namespaceID)
     close(runtime)
     publish(
-      .failed(message: "Symphony exited unexpectedly with status \(status)."),
+      .failed(
+        message: """
+          Symphony exited unexpectedly with status \(status). \
+          Check Logs/daemon.stderr.log for this namespace, then restart it.
+          """
+      ),
       for: namespaceID
     )
   }
