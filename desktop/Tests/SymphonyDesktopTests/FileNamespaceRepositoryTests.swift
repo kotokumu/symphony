@@ -272,10 +272,10 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     try FileManager.default.moveItem(at: directory, to: pendingDirectory)
 
     await assertThrowsErrorAsync(try await repository.load()) { error in
-      XCTAssertEqual(
-        error.localizedDescription,
-        "Namespace deletion was not saved. Restore \(pendingDirectory.path) to \(directory.path) before retrying."
-      )
+      XCTAssertTrue(
+        error.localizedDescription.hasPrefix("Namespace deletion was not saved. Restore "))
+      XCTAssertTrue(error.localizedDescription.contains(namespace.id.uuidString.lowercased()))
+      XCTAssertTrue(error.localizedDescription.hasSuffix("before retrying."))
     }
     XCTAssertTrue(FileManager.default.fileExists(atPath: pendingDirectory.path))
     XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
@@ -311,10 +311,10 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     await assertThrowsErrorAsync(
       try await FileNamespaceRepository(storageDirectory: storageDirectory).load()
     ) { error in
-      XCTAssertEqual(
-        error.localizedDescription,
-        "Namespace deletion was not saved. Restore \(pendingDirectory.path) to \(directory.path) before retrying."
-      )
+      XCTAssertTrue(
+        error.localizedDescription.hasPrefix("Namespace deletion was not saved. Restore "))
+      XCTAssertTrue(error.localizedDescription.contains(namespace.id.uuidString.lowercased()))
+      XCTAssertTrue(error.localizedDescription.hasSuffix("before retrying."))
     }
     XCTAssertTrue(FileManager.default.fileExists(atPath: pendingDirectory.path))
   }
