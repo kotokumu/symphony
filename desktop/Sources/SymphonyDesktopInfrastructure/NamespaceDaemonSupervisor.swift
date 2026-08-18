@@ -1,0 +1,411 @@
+import Darwin
+import Foundation
+import SymphonyDesktopCore
+
+public actor NamespaceDaemonSupervisor {
+  public typealias ReadinessProbe = @Sendable (URL) async -> Bool
+  public typealias PortAllocator = @Sendable () throws -> UInt16
+
+  private struct Runtime {
+    let generation: UUID
+    let process: Process
+    let endpoint: URL
+    let output: FileHandle
+    let errorOutput: FileHandle
+  }
+
+  private let executableURL: URL?
+  private let readinessTimeout: TimeInterval
+  private let readinessProbe: ReadinessProbe
+  private let portAllocator: PortAllocator
+  private let fileManager: FileManager
+
+  private var generations: [Namespace.ID: UUID] = [:]
+  private var runtimes: [Namespace.ID: Runtime] = [:]
+  private var states: [Namespace.ID: NamespaceDaemonState] = [:]
+  private var eventContinuations: [UUID: AsyncStream<NamespaceDaemonEvent>.Continuation] = [:]
+
+  public init(
+    executableURL: URL?,
+    readinessTimeout: TimeInterval = 15,
+    readinessProbe: @escaping ReadinessProbe = NamespaceDaemonSupervisor.probe,
+    portAllocator: @escaping PortAllocator = NamespaceDaemonSupervisor.availableLoopbackPort,
+    fileManager: FileManager = .default
+  ) {
+    self.executableURL = executableURL
+    self.readinessTimeout = readinessTimeout
+    self.readinessProbe = readinessProbe
+    self.portAllocator = portAllocator
+    self.fileManager = fileManager
+  }
+
+  public func events() -> AsyncStream<NamespaceDaemonEvent> {
+    let subscriberID = UUID()
+    return AsyncStream { continuation in
+      eventContinuations[subscriberID] = continuation
+      continuation.onTermination = { [weak self] _ in
+        Task {
+          await self?.removeEventContinuation(subscriberID)
+        }
+      }
+    }
+  }
+
+  public func start(namespaceID: Namespace.ID, namespaceDirectory: URL) async {
+    guard !isActive(namespaceID) else {
+      return
+    }
+
+    let generation = UUID()
+    generations[namespaceID] = generation
+    publish(.starting, for: namespaceID)
+
+    do {
+      let executableURL = try requireExecutable()
+      let layout = try prepareRuntime(in: namespaceDirectory)
+      let port = try portAllocator()
+      let endpoint = URL(string: "http://127.0.0.1:\(port)")!
+      let runtime = try launch(
+        executableURL: executableURL,
+        layout: layout,
+        endpoint: endpoint,
+        port: port,
+        namespaceID: namespaceID,
+        generation: generation
+      )
+      runtimes[namespaceID] = runtime
+
+      guard await waitUntilReady(runtime, namespaceID: namespaceID) else {
+        throw NamespaceDaemonError.readinessTimedOut
+      }
+      guard generations[namespaceID] == generation, runtime.process.isRunning else {
+        return
+      }
+
+      publish(.running(endpoint: endpoint), for: namespaceID)
+    } catch {
+      await failCurrentAttempt(namespaceID, generation: generation, error: error)
+    }
+  }
+
+  public func stop(namespaceID: Namespace.ID) async throws {
+    generations.removeValue(forKey: namespaceID)
+    guard let runtime = runtimes.removeValue(forKey: namespaceID) else {
+      publish(.stopped, for: namespaceID)
+      return
+    }
+
+    try await terminate(runtime.process)
+    close(runtime)
+    publish(.stopped, for: namespaceID)
+  }
+
+  public func stopAll() async {
+    for namespaceID in Set(generations.keys).union(runtimes.keys) {
+      try? await stop(namespaceID: namespaceID)
+    }
+  }
+
+  public func state(for namespaceID: Namespace.ID) -> NamespaceDaemonState {
+    states[namespaceID] ?? .stopped
+  }
+
+  private func isActive(_ namespaceID: Namespace.ID) -> Bool {
+    switch states[namespaceID] ?? .stopped {
+    case .starting, .running:
+      true
+    case .stopped, .failed:
+      false
+    }
+  }
+
+  private func requireExecutable() throws -> URL {
+    guard let executableURL else {
+      throw NamespaceDaemonError.executableNotFound
+    }
+    guard fileManager.isExecutableFile(atPath: executableURL.path) else {
+      throw NamespaceDaemonError.executableNotExecutable(executableURL)
+    }
+    return executableURL
+  }
+
+  private func prepareRuntime(in namespaceDirectory: URL) throws -> RuntimeLayout {
+    let runtimeDirectory = namespaceDirectory.appendingPathComponent("Runtime", isDirectory: true)
+    let workspaceDirectory = namespaceDirectory.appendingPathComponent(
+      "Workspaces",
+      isDirectory: true
+    )
+    let logsDirectory = namespaceDirectory.appendingPathComponent("Logs", isDirectory: true)
+
+    do {
+      for directory in [runtimeDirectory, workspaceDirectory, logsDirectory] {
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+      }
+      let workflowURL = runtimeDirectory.appendingPathComponent("WORKFLOW.md")
+      try workflow(workspaceDirectory: workspaceDirectory).write(
+        to: workflowURL,
+        atomically: true,
+        encoding: .utf8
+      )
+      return RuntimeLayout(
+        workflowURL: workflowURL,
+        logsDirectory: logsDirectory,
+        standardOutputURL: logsDirectory.appendingPathComponent("daemon.stdout.log"),
+        standardErrorURL: logsDirectory.appendingPathComponent("daemon.stderr.log")
+      )
+    } catch {
+      throw NamespaceDaemonError.runtimePreparationFailed
+    }
+  }
+
+  private func workflow(workspaceDirectory: URL) -> String {
+    let escapedPath = workspaceDirectory.path.replacingOccurrences(of: "'", with: "''")
+    return """
+      ---
+      tracker:
+        kind: memory
+      workspace:
+        root: '\(escapedPath)'
+      codex:
+        command: codex app-server
+      ---
+
+      This namespace is waiting for a platform connection.
+      """
+  }
+
+  private func launch(
+    executableURL: URL,
+    layout: RuntimeLayout,
+    endpoint: URL,
+    port: UInt16,
+    namespaceID: Namespace.ID,
+    generation: UUID
+  ) throws -> Runtime {
+    for logURL in [layout.standardOutputURL, layout.standardErrorURL] {
+      if !fileManager.fileExists(atPath: logURL.path) {
+        guard fileManager.createFile(atPath: logURL.path, contents: nil) else {
+          throw NamespaceDaemonError.runtimePreparationFailed
+        }
+      }
+    }
+
+    let output = try FileHandle(forWritingTo: layout.standardOutputURL)
+    let errorOutput = try FileHandle(forWritingTo: layout.standardErrorURL)
+    try output.seekToEnd()
+    try errorOutput.seekToEnd()
+
+    let process = Process()
+    process.executableURL = executableURL
+    process.arguments = [
+      "--i-understand-that-this-will-be-running-without-the-usual-guardrails",
+      "--logs-root", layout.logsDirectory.path,
+      "--port", String(port),
+      layout.workflowURL.path,
+    ]
+    process.standardOutput = output
+    process.standardError = errorOutput
+    process.terminationHandler = { [weak self] process in
+      let status = process.terminationStatus
+      Task {
+        await self?.processDidTerminate(
+          namespaceID: namespaceID,
+          generation: generation,
+          status: status
+        )
+      }
+    }
+
+    do {
+      try process.run()
+    } catch {
+      try? output.close()
+      try? errorOutput.close()
+      throw NamespaceDaemonError.launchFailed
+    }
+
+    return Runtime(
+      generation: generation,
+      process: process,
+      endpoint: endpoint,
+      output: output,
+      errorOutput: errorOutput
+    )
+  }
+
+  private func waitUntilReady(_ runtime: Runtime, namespaceID: Namespace.ID) async -> Bool {
+    let deadline = Date().addingTimeInterval(readinessTimeout)
+    while Date() < deadline {
+      guard
+        generations[namespaceID] == runtime.generation,
+        runtimes[namespaceID]?.generation == runtime.generation,
+        runtime.process.isRunning
+      else {
+        return false
+      }
+      if await readinessProbe(runtime.endpoint) {
+        return true
+      }
+      try? await Task.sleep(for: .milliseconds(100))
+    }
+    return false
+  }
+
+  private func failCurrentAttempt(
+    _ namespaceID: Namespace.ID,
+    generation: UUID,
+    error: Error
+  ) async {
+    guard generations[namespaceID] == generation else {
+      return
+    }
+    generations.removeValue(forKey: namespaceID)
+    if let runtime = runtimes.removeValue(forKey: namespaceID), runtime.generation == generation {
+      try? await terminate(runtime.process)
+      close(runtime)
+    }
+    publish(.failed(message: error.localizedDescription), for: namespaceID)
+  }
+
+  private func processDidTerminate(
+    namespaceID: Namespace.ID,
+    generation: UUID,
+    status: Int32
+  ) {
+    guard
+      let runtime = runtimes[namespaceID],
+      runtime.generation == generation,
+      generations[namespaceID] == generation
+    else {
+      return
+    }
+    runtimes.removeValue(forKey: namespaceID)
+    generations.removeValue(forKey: namespaceID)
+    close(runtime)
+    publish(
+      .failed(message: "Symphony exited unexpectedly with status \(status)."),
+      for: namespaceID
+    )
+  }
+
+  private func terminate(_ process: Process) async throws {
+    guard process.isRunning else {
+      return
+    }
+    process.terminate()
+    if await waitForExit(process, timeout: 3) {
+      return
+    }
+    Darwin.kill(process.processIdentifier, SIGKILL)
+    guard await waitForExit(process, timeout: 2) else {
+      throw NamespaceDaemonError.stopFailed
+    }
+  }
+
+  private func waitForExit(_ process: Process, timeout: TimeInterval) async -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while process.isRunning, Date() < deadline {
+      try? await Task.sleep(for: .milliseconds(50))
+    }
+    return !process.isRunning
+  }
+
+  private func close(_ runtime: Runtime) {
+    try? runtime.output.close()
+    try? runtime.errorOutput.close()
+  }
+
+  private func publish(_ state: NamespaceDaemonState, for namespaceID: Namespace.ID) {
+    states[namespaceID] = state
+    let event = NamespaceDaemonEvent(namespaceID: namespaceID, state: state)
+    for continuation in eventContinuations.values {
+      continuation.yield(event)
+    }
+  }
+
+  private func removeEventContinuation(_ id: UUID) {
+    eventContinuations.removeValue(forKey: id)
+  }
+
+  public static func probe(_ endpoint: URL) async -> Bool {
+    var request = URLRequest(url: endpoint.appendingPathComponent("api/v1/state"))
+    request.timeoutInterval = 0.5
+    do {
+      let (_, response) = try await URLSession.shared.data(for: request)
+      return (response as? HTTPURLResponse)?.statusCode == 200
+    } catch {
+      return false
+    }
+  }
+
+  public static func availableLoopbackPort() throws -> UInt16 {
+    let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+    guard descriptor >= 0 else {
+      throw NamespaceDaemonError.endpointUnavailable
+    }
+    defer { Darwin.close(descriptor) }
+
+    var address = sockaddr_in()
+    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_port = in_port_t(0)
+    address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+
+    let bindResult = withUnsafePointer(to: &address) { pointer in
+      pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+      }
+    }
+    guard bindResult == 0 else {
+      throw NamespaceDaemonError.endpointUnavailable
+    }
+
+    var boundAddress = sockaddr_in()
+    var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+    let nameResult = withUnsafeMutablePointer(to: &boundAddress) { pointer in
+      pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        getsockname(descriptor, $0, &length)
+      }
+    }
+    guard nameResult == 0 else {
+      throw NamespaceDaemonError.endpointUnavailable
+    }
+    return UInt16(bigEndian: boundAddress.sin_port)
+  }
+}
+
+public enum NamespaceDaemonError: LocalizedError, Sendable {
+  case executableNotFound
+  case executableNotExecutable(URL)
+  case runtimePreparationFailed
+  case endpointUnavailable
+  case launchFailed
+  case readinessTimedOut
+  case stopFailed
+
+  public var errorDescription: String? {
+    switch self {
+    case .executableNotFound:
+      "The Symphony daemon executable could not be found. Reinstall the application and try again."
+    case .executableNotExecutable(let url):
+      "The Symphony daemon at \(url.path) is not executable. Reinstall the application and try again."
+    case .runtimePreparationFailed:
+      "The namespace runtime could not be prepared. Check disk space and permissions, then try again."
+    case .endpointUnavailable:
+      "A local communication endpoint could not be reserved. Try again."
+    case .launchFailed:
+      "The Symphony daemon could not be launched. Check the namespace daemon log and try again."
+    case .readinessTimedOut:
+      "The Symphony daemon did not become ready in time. Check the namespace daemon log and try again."
+    case .stopFailed:
+      "The Symphony daemon could not be stopped safely. Try again before deleting or locking the namespace."
+    }
+  }
+}
+
+private struct RuntimeLayout {
+  let workflowURL: URL
+  let logsDirectory: URL
+  let standardOutputURL: URL
+  let standardErrorURL: URL
+}

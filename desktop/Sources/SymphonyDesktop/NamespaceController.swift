@@ -15,9 +15,14 @@ final class NamespaceController: ObservableObject {
   @Published private(set) var isChanging = false
 
   private let repository: any NamespaceRepository
+  private let beforeDelete: (Namespace.ID) async throws -> Void
 
-  init(repository: any NamespaceRepository) {
+  init(
+    repository: any NamespaceRepository,
+    beforeDelete: @escaping (Namespace.ID) async throws -> Void = { _ in }
+  ) {
     self.repository = repository
+    self.beforeDelete = beforeDelete
   }
 
   func load() async {
@@ -67,6 +72,7 @@ final class NamespaceController: ObservableObject {
 
     var updatedCatalog = catalog
     let namespace = try updatedCatalog.delete(id)
+    try await beforeDelete(id)
     let outcome = try await repository.delete(namespace, saving: updatedCatalog)
     catalog = updatedCatalog
     return outcome

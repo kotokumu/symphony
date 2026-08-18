@@ -14,7 +14,7 @@ final class NamespaceDaemonControllerTests: XCTestCase {
       supervisor: supervisor,
       directoryURL: { _ in directory }
     )
-    controller.startObserving()
+    await controller.startObserving()
 
     await controller.start(namespace)
     await supervisor.emit(
@@ -40,7 +40,7 @@ final class NamespaceDaemonControllerTests: XCTestCase {
       supervisor: supervisor,
       directoryURL: { id in URL(fileURLWithPath: "/namespaces/\(id.uuidString)") }
     )
-    controller.startObserving()
+    await controller.startObserving()
 
     await supervisor.emit(.init(namespaceID: first.id, state: .running(endpoint: endpoint(41001))))
     await supervisor.emit(.init(namespaceID: second.id, state: .running(endpoint: endpoint(41002))))

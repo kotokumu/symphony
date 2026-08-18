@@ -6,24 +6,54 @@ import SymphonyDesktopInfrastructure
 @main
 struct SymphonyDesktopApp: App {
   @StateObject private var controller: NamespaceController
+  @StateObject private var daemonController: NamespaceDaemonController
 
   init() {
-    let repository: any NamespaceRepository
+    let supervisor = NamespaceDaemonSupervisor(
+      executableURL: SymphonyExecutableLocator().locate()
+    )
+
     do {
-      repository = try FileNamespaceRepository()
+      let repository = try FileNamespaceRepository()
+      _daemonController = StateObject(
+        wrappedValue: NamespaceDaemonController(
+          supervisor: supervisor,
+          directoryURL: { id in
+            repository.directoryURL(for: id)
+          }
+        )
+      )
+      _controller = StateObject(
+        wrappedValue: NamespaceController(
+          repository: repository,
+          beforeDelete: { id in
+            try await supervisor.stop(namespaceID: id)
+          }
+        )
+      )
     } catch {
-      repository = UnavailableNamespaceRepository(message: error.localizedDescription)
+      let repository = UnavailableNamespaceRepository(message: error.localizedDescription)
+      _daemonController = StateObject(
+        wrappedValue: NamespaceDaemonController(
+          supervisor: supervisor,
+          directoryURL: { id in
+            FileManager.default.temporaryDirectory.appendingPathComponent(id.uuidString)
+          }
+        )
+      )
+      _controller = StateObject(wrappedValue: NamespaceController(repository: repository))
     }
-    _controller = StateObject(wrappedValue: NamespaceController(repository: repository))
   }
 
   var body: some Scene {
     WindowGroup("Symphony") {
-      ContentView(controller: controller)
+      ContentView(controller: controller, daemonController: daemonController)
     }
     .defaultSize(width: 760, height: 520)
   }
 }
+
+extension NamespaceDaemonSupervisor: NamespaceDaemonSupervising {}
 
 private actor UnavailableNamespaceRepository: NamespaceRepository {
   let message: String

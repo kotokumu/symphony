@@ -168,7 +168,7 @@ public actor FileNamespaceRepository: NamespaceRepository {
     }
   }
 
-  public func directoryURL(for id: Namespace.ID) -> URL {
+  public nonisolated func directoryURL(for id: Namespace.ID) -> URL {
     storageDirectory
       .appendingPathComponent(Self.namespacesDirectoryName, isDirectory: true)
       .appendingPathComponent(id.uuidString.lowercased(), isDirectory: true)
