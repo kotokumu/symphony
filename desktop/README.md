@@ -3,12 +3,16 @@
 Symphony Desktop is the native macOS application for operating local Symphony namespaces. The
 initial project provides an application shell and does not manage namespaces yet.
 
-## Requirements
+## Development Requirements
 
-- macOS 13 or later
+- macOS 15.3 or later
 - Xcode 16.4 with its Swift 6 toolchain and macOS SDK
 
 Xcode Command Line Tools alone are insufficient because the test suite uses XCTest.
+
+## Deployment Target
+
+The application package targets macOS 13 or later.
 
 ## Commands
 
