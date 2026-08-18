@@ -92,13 +92,14 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
 
     try await supervisor.stop(namespaceID: namespaceID)
     await supervisor.start(namespaceID: namespaceID, namespaceDirectory: directory)
-    await terminations.waitForDeferredOperation()
-    await terminations.deliverAll()
+    try await terminations.waitForDeferredOperation()
+    let deliveredCount = await terminations.deliverAll()
 
     let restartedState = await supervisor.state(for: namespaceID)
+    XCTAssertGreaterThanOrEqual(deliveredCount, 1)
     XCTAssertEqual(restartedState, .running(endpoint: URL(string: "http://127.0.0.1:42102")!))
     try await supervisor.stopAll()
-    await terminations.deliverAll()
+    _ = await terminations.deliverAll()
   }
 
   func testFailedDaemonCanRestartAndReachRunning() async throws {
@@ -315,6 +316,7 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
 
 private enum TestFailure: Error {
   case expectedRunning(NamespaceDaemonState)
+  case terminationWasNotDeferred
 }
 
 private final class PortSequence: @unchecked Sendable {
@@ -353,7 +355,7 @@ private final class DeferredTerminationDelivery: @unchecked Sendable {
     }
   }
 
-  func waitForDeferredOperation() async {
+  func waitForDeferredOperation() async throws {
     let deadline = Date().addingTimeInterval(1)
     while Date() < deadline {
       if lock.withLock({ !operations.isEmpty }) {
@@ -361,9 +363,10 @@ private final class DeferredTerminationDelivery: @unchecked Sendable {
       }
       try? await Task.sleep(for: .milliseconds(10))
     }
+    throw TestFailure.terminationWasNotDeferred
   }
 
-  func deliverAll() async {
+  func deliverAll() async -> Int {
     let deferred = lock.withLock {
       let deferred = operations
       operations.removeAll()
@@ -372,5 +375,6 @@ private final class DeferredTerminationDelivery: @unchecked Sendable {
     for operation in deferred {
       await operation()
     }
+    return deferred.count
   }
 }

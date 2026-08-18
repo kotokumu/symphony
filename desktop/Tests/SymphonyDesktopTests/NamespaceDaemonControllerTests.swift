@@ -81,14 +81,17 @@ final class NamespaceDaemonControllerTests: XCTestCase {
     )
 
     let first = Task { await controller.startObserving() }
-    while await supervisor.eventSubscriptionCount == 0 {
-      await Task.yield()
+    let deadline = Date().addingTimeInterval(1)
+    while await supervisor.eventSubscriptionCount == 0, Date() < deadline {
+      try? await Task.sleep(for: .milliseconds(10))
     }
+    let initialRequestCount = await supervisor.eventSubscriptionCount
+    XCTAssertEqual(initialRequestCount, 1)
     let second = Task { await controller.startObserving() }
     await Task.yield()
 
-    let requestCount = await supervisor.eventSubscriptionCount
-    XCTAssertEqual(requestCount, 1)
+    let finalRequestCount = await supervisor.eventSubscriptionCount
+    XCTAssertEqual(finalRequestCount, 1)
 
     await supervisor.resumeEventSubscription()
     await first.value
