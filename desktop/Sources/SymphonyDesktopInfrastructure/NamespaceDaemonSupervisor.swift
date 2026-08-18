@@ -125,6 +125,15 @@ public actor NamespaceDaemonSupervisor {
       return
     }
 
+    if intentionalTerminations.contains(runtime.generation) {
+      while intentionalTerminations.contains(runtime.generation) {
+        try? await Task.sleep(for: .milliseconds(25))
+      }
+      guard runtimes[namespaceID]?.generation == runtime.generation else {
+        return
+      }
+    }
+
     intentionalTerminations.insert(runtime.generation)
     do {
       try await terminate(runtime.process)

@@ -142,7 +142,7 @@ private actor TestDaemonSupervisor: NamespaceDaemonSupervising {
         eventSubscriptionContinuation = continuation
       }
     }
-    AsyncStream { continuation in
+    return AsyncStream { continuation in
       self.continuation = continuation
     }
   }
