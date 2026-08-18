@@ -274,7 +274,16 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     await assertThrowsErrorAsync(try await repository.load()) { error in
       XCTAssertTrue(
         error.localizedDescription.hasPrefix("Namespace deletion was not saved. Restore "))
-      XCTAssertTrue(error.localizedDescription.contains(namespace.id.uuidString.lowercased()))
+      XCTAssertTrue(
+        error.localizedDescription.contains(
+          "PendingDeletions/\(namespace.id.uuidString.lowercased()) to "
+        )
+      )
+      XCTAssertTrue(
+        error.localizedDescription.contains(
+          "Namespaces/\(namespace.id.uuidString.lowercased()) before retrying."
+        )
+      )
       XCTAssertTrue(error.localizedDescription.hasSuffix("before retrying."))
     }
     XCTAssertTrue(FileManager.default.fileExists(atPath: pendingDirectory.path))
@@ -313,7 +322,16 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     ) { error in
       XCTAssertTrue(
         error.localizedDescription.hasPrefix("Namespace deletion was not saved. Restore "))
-      XCTAssertTrue(error.localizedDescription.contains(namespace.id.uuidString.lowercased()))
+      XCTAssertTrue(
+        error.localizedDescription.contains(
+          "PendingDeletions/\(namespace.id.uuidString.lowercased()) to "
+        )
+      )
+      XCTAssertTrue(
+        error.localizedDescription.contains(
+          "Namespaces/\(namespace.id.uuidString.lowercased()) before retrying."
+        )
+      )
       XCTAssertTrue(error.localizedDescription.hasSuffix("before retrying."))
     }
     XCTAssertTrue(FileManager.default.fileExists(atPath: pendingDirectory.path))
