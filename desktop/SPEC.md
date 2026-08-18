@@ -11,4 +11,41 @@ Symphony Desktop runs as a native macOS application and opens a main window titl
 ## 2. Empty State
 
 The initial application shell communicates that no namespaces exist and that the user must create
-one before Symphony can orchestrate work.
+one before Symphony can orchestrate work. The user can begin namespace creation from this state.
+
+---
+
+## 3. Namespace Management
+
+The application supports multiple local namespaces. A user can create, rename, select, and delete
+namespaces from the main window.
+
+Each namespace has a stable identity that does not change when the namespace is renamed. Creating a
+namespace selects it. Selecting a namespace displays its detail view. Deleting the selected
+namespace selects an adjacent namespace when one remains, or returns the application to the empty
+state when none remain.
+
+Namespace names must:
+
+- contain at least one character;
+- contain no leading or trailing whitespace;
+- contain no control characters;
+- contain no more than 64 characters; and
+- be unique without regard to case or canonically equivalent Unicode composition.
+
+Validation failures are displayed without dismissing the create or rename form.
+
+Deletion requires explicit destructive confirmation that the namespace and all of its local data
+will be permanently removed from the Mac.
+
+---
+
+## 4. Persistence and Recovery
+
+Namespaces and the current selection persist across application restarts. Namespace directories
+remain associated with stable namespace identities, so renaming a namespace does not relocate its
+local data.
+
+The application does not replace unreadable or unsupported namespace data. It reports the problem
+and allows the user to retry after correcting it. A missing namespace directory is also reported
+without recreating or deleting data automatically.

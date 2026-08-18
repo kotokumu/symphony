@@ -56,6 +56,7 @@ final class NamespaceControllerTests: XCTestCase {
 
     let snapshot = await repository.snapshot()
     XCTAssertTrue(controller.catalog.namespaces.isEmpty)
+    XCTAssertFalse(controller.isChanging)
     XCTAssertEqual(snapshot.removedIDs, snapshot.reservedIDs)
   }
 
@@ -143,10 +144,6 @@ private actor TestNamespaceRepository: NamespaceRepository {
     removedIDs.append(id)
   }
 
-  func directoryURL(for id: Namespace.ID) -> URL {
-    URL(fileURLWithPath: "/tmp/\(id.uuidString)", isDirectory: true)
-  }
-
   func failNextLoad() {
     shouldFailLoad = true
   }
@@ -173,6 +170,7 @@ private enum TestRepositoryError: LocalizedError {
   }
 }
 
+@MainActor
 private func assertThrowsErrorAsync<T>(
   _ expression: @autoclosure () async throws -> T,
   file: StaticString = #filePath,
