@@ -221,6 +221,5 @@ private struct NamespaceDetailView: View {
       }
     }
     .padding(48)
-    .navigationTitle(namespace.name.value)
   }
 }

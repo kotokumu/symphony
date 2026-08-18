@@ -52,7 +52,12 @@ final class NamespaceControllerTests: XCTestCase {
     await controller.load()
     await repository.failNextSave()
 
-    await assertThrowsErrorAsync(try await controller.createNamespace(named: "Research"))
+    do {
+      try await controller.createNamespace(named: "Research")
+      XCTFail("Expected an error to be thrown")
+    } catch {
+      // The throwing behavior is the assertion.
+    }
 
     let snapshot = await repository.snapshot()
     XCTAssertTrue(controller.catalog.namespaces.isEmpty)
@@ -167,19 +172,5 @@ private enum TestRepositoryError: LocalizedError {
 
   var errorDescription: String? {
     "Test repository failure."
-  }
-}
-
-@MainActor
-private func assertThrowsErrorAsync<T>(
-  _ expression: @autoclosure () async throws -> T,
-  file: StaticString = #filePath,
-  line: UInt = #line
-) async {
-  do {
-    _ = try await expression()
-    XCTFail("Expected an error to be thrown", file: file, line: line)
-  } catch {
-    // The throwing behavior is the assertion.
   }
 }
