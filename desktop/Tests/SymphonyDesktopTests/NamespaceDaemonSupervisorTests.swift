@@ -203,16 +203,21 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
   }
 
   func testApplicationShutdownRejectsAStartThatArrivesWhileStopping() async throws {
+    let readySignal = temporaryDirectory.appendingPathComponent("shutdown-ready")
     let stopSignal = temporaryDirectory.appendingPathComponent("shutdown-started")
     let executable = try makeExecutable(
       named: "slow-stop",
-      body: "trap 'touch \"\(stopSignal.path)\"' TERM\nwhile :; do sleep 0.02; done"
+      body: """
+        trap 'touch "\(stopSignal.path)"' TERM
+        touch "\(readySignal.path)"
+        while :; do sleep 0.02; done
+        """
     )
     let ports = PortSequence([42221, 42222])
     let supervisor = NamespaceDaemonSupervisor(
       executableURL: executable,
       readinessTimeout: 1,
-      readinessProbe: { _ in true },
+      readinessProbe: { _ in FileManager.default.fileExists(atPath: readySignal.path) },
       portAllocator: { try ports.next() },
       gracefulStopTimeout: 1,
       forcedStopTimeout: 1
@@ -242,15 +247,20 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
   }
 
   func testCancellingConcurrentStopDoesNotBlockTheOriginalStop() async throws {
+    let readySignal = temporaryDirectory.appendingPathComponent("concurrent-stop-ready")
     let stopSignal = temporaryDirectory.appendingPathComponent("stop-started")
     let executable = try makeExecutable(
       named: "concurrent-stop",
-      body: "trap 'touch \"\(stopSignal.path)\"' TERM\nwhile :; do sleep 0.02; done"
+      body: """
+        trap 'touch "\(stopSignal.path)"' TERM
+        touch "\(readySignal.path)"
+        while :; do sleep 0.02; done
+        """
     )
     let supervisor = NamespaceDaemonSupervisor(
       executableURL: executable,
       readinessTimeout: 1,
-      readinessProbe: { _ in true },
+      readinessProbe: { _ in FileManager.default.fileExists(atPath: readySignal.path) },
       portAllocator: { 42231 },
       gracefulStopTimeout: 1,
       forcedStopTimeout: 1
