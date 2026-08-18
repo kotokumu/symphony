@@ -141,6 +141,56 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     XCTAssertFalse(FileManager.default.fileExists(atPath: directory.path))
   }
 
+  func testCreationReportsTheDirectoryWhenSaveAndRollbackBothFail() async throws {
+    let metadataURL = storageDirectory.appendingPathComponent("namespaces.json")
+    try FileManager.default.createDirectory(at: metadataURL, withIntermediateDirectories: true)
+    let fileManager = FailingNamespaceRemovalFileManager()
+    let repository = FileNamespaceRepository(
+      storageDirectory: storageDirectory,
+      fileManager: fileManager
+    )
+    var catalog = NamespaceCatalog()
+    let namespace = try catalog.create(named: "Research")
+    let directory = await repository.directoryURL(for: namespace.id)
+
+    await assertThrowsErrorAsync(try await repository.create(namespace, saving: catalog)) { error in
+      XCTAssertEqual(
+        error.localizedDescription,
+        "The namespace was not saved, and its local directory remains at \(directory.path)."
+      )
+    }
+    XCTAssertTrue(FileManager.default.fileExists(atPath: directory.path))
+  }
+
+  func testDeletionRestoresItsDirectoryWhenMetadataCannotBeSaved() async throws {
+    let repository = FileNamespaceRepository(storageDirectory: storageDirectory)
+    var catalog = NamespaceCatalog()
+    let namespace = try catalog.create(named: "Research")
+    try await repository.create(namespace, saving: catalog)
+    let directory = await repository.directoryURL(for: namespace.id)
+    let metadataURL = storageDirectory.appendingPathComponent("namespaces.json")
+    try FileManager.default.removeItem(at: metadataURL)
+    try FileManager.default.createDirectory(at: metadataURL, withIntermediateDirectories: true)
+    _ = try catalog.delete(namespace.id)
+
+    await assertThrowsErrorAsync(try await repository.delete(namespace, saving: catalog)) { error in
+      XCTAssertEqual(
+        error.localizedDescription,
+        "Namespace changes could not be saved. Check disk space and permissions, then try again."
+      )
+    }
+    XCTAssertTrue(FileManager.default.fileExists(atPath: directory.path))
+    XCTAssertFalse(
+      FileManager.default.fileExists(
+        atPath:
+          storageDirectory
+          .appendingPathComponent("PendingDeletions")
+          .appendingPathComponent(namespace.id.uuidString.lowercased())
+          .path
+      )
+    )
+  }
+
   func testDeletionCanFinishPendingCleanupOnTheNextLoad() async throws {
     let fileManager = FailingPendingRemovalFileManager()
     let repository = FileNamespaceRepository(
@@ -204,6 +254,15 @@ final class FileNamespaceRepositoryTests: XCTestCase {
 private final class FailingPendingRemovalFileManager: FileManager, @unchecked Sendable {
   override func removeItem(at URL: URL) throws {
     if URL.path.contains("PendingDeletions") && URL.lastPathComponent != "PendingDeletions" {
+      throw CocoaError(.fileWriteNoPermission)
+    }
+    try super.removeItem(at: URL)
+  }
+}
+
+private final class FailingNamespaceRemovalFileManager: FileManager, @unchecked Sendable {
+  override func removeItem(at URL: URL) throws {
+    if URL.path.contains("Namespaces") && URL.lastPathComponent != "Namespaces" {
       throw CocoaError(.fileWriteNoPermission)
     }
     try super.removeItem(at: URL)
