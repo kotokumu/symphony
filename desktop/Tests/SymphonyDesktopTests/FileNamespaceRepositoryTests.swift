@@ -74,6 +74,29 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     XCTAssertEqual(try Data(contentsOf: metadataURL), unsupportedData)
   }
 
+  func testRejectsDuplicatePersistedIdentitiesWithoutOverwritingThem() async throws {
+    let metadataURL = storageDirectory.appendingPathComponent("namespaces.json")
+    let id = UUID()
+    let duplicateData = Data(
+      """
+      {"version":1,"namespaces":[
+        {"id":"\(id.uuidString)","name":"Research"},
+        {"id":"\(id.uuidString)","name":"Operations"}
+      ],"selectedID":"\(id.uuidString)"}
+      """.utf8
+    )
+    try duplicateData.write(to: metadataURL)
+    let repository = FileNamespaceRepository(storageDirectory: storageDirectory)
+
+    await assertThrowsErrorAsync(try await repository.load()) { error in
+      XCTAssertEqual(
+        error.localizedDescription,
+        "Namespace data could not be read. The file was not changed."
+      )
+    }
+    XCTAssertEqual(try Data(contentsOf: metadataURL), duplicateData)
+  }
+
   func testReportsMissingNamespaceDirectoryWithoutRepairingIt() async throws {
     let repository = FileNamespaceRepository(storageDirectory: storageDirectory)
     var catalog = NamespaceCatalog()

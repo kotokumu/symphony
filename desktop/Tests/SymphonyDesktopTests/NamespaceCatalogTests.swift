@@ -26,6 +26,36 @@ final class NamespaceCatalogTests: XCTestCase {
     }
   }
 
+  func testRejectsUnicodeCaseFoldedAndCanonicallyEquivalentNames() throws {
+    var catalog = NamespaceCatalog()
+    try catalog.create(named: "Straße")
+
+    XCTAssertThrowsError(try catalog.create(named: "STRASSE"))
+
+    var unicodeCatalog = NamespaceCatalog()
+    try unicodeCatalog.create(named: "Café")
+
+    XCTAssertThrowsError(try unicodeCatalog.create(named: "Cafe\u{301}"))
+  }
+
+  func testRejectsDuplicateStableIdentities() throws {
+    let id = UUID()
+    var catalog = NamespaceCatalog()
+    try catalog.create(named: "Research", id: id)
+
+    XCTAssertThrowsError(try catalog.create(named: "Operations", id: id)) { error in
+      XCTAssertEqual(error.localizedDescription, "A namespace with this identity already exists.")
+    }
+
+    let namespaces = [
+      Namespace(id: id, name: try NamespaceName(validating: "Research")),
+      Namespace(id: id, name: try NamespaceName(validating: "Operations")),
+    ]
+    XCTAssertThrowsError(try NamespaceCatalog(validating: namespaces, selectedID: id)) { error in
+      XCTAssertEqual(error.localizedDescription, "A namespace with this identity already exists.")
+    }
+  }
+
   func testRenamePreservesIdentityAndSelection() throws {
     var catalog = NamespaceCatalog()
     let namespace = try catalog.create(named: "Research")
@@ -59,6 +89,29 @@ final class NamespaceCatalogTests: XCTestCase {
 
     XCTAssertTrue(catalog.namespaces.isEmpty)
     XCTAssertNil(catalog.selectedID)
+  }
+
+  func testDeletionSelectionBehaviorAtCatalogBoundaries() throws {
+    var catalog = NamespaceCatalog()
+    let first = try catalog.create(named: "First")
+    let second = try catalog.create(named: "Second")
+    let third = try catalog.create(named: "Third")
+
+    try catalog.select(first.id)
+    try catalog.delete(first.id)
+    XCTAssertEqual(catalog.selectedID, second.id)
+
+    try catalog.delete(third.id)
+    XCTAssertEqual(catalog.selectedID, second.id)
+  }
+
+  func testRenamingToAConflictingNamePreservesTheNamespace() throws {
+    var catalog = NamespaceCatalog()
+    let first = try catalog.create(named: "Research")
+    try catalog.create(named: "Operations")
+
+    XCTAssertThrowsError(try catalog.rename(first.id, to: "operations"))
+    XCTAssertEqual(catalog.namespaces.first?.name.value, "Research")
   }
 
   func testRejectsPersistedSelectionThatDoesNotExist() throws {
