@@ -41,4 +41,5 @@ Run `make -C desktop run`, then verify the following behavior:
    local endpoints.
 7. Stop one daemon and confirm the other remains running, then restart the running daemon and confirm
    it returns to `Daemon running`.
-8. Close the desktop window and confirm its namespace daemons stop.
+8. Close the desktop window and confirm its namespace daemons stop. Relaunch a daemon, quit the
+   application, and confirm termination waits for the daemon to stop.

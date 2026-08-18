@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 
@@ -69,17 +70,21 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
     let stillRunningEndpoint = try runningEndpoint(await supervisor.state(for: secondID))
     XCTAssertEqual(stoppedState, .stopped)
     XCTAssertEqual(stillRunningEndpoint, secondEndpoint)
-    await supervisor.stopAll()
+    try await supervisor.stopAll()
   }
 
   func testRestartDoesNotAcceptTheOldProcessesDelayedTermination() async throws {
     let executable = try makeLongRunningExecutable()
     let ports = PortSequence([42101, 42102])
+    let terminations = DeferredTerminationDelivery()
     let supervisor = NamespaceDaemonSupervisor(
       executableURL: executable,
       readinessTimeout: 1,
       readinessProbe: { _ in true },
-      portAllocator: { try ports.next() }
+      portAllocator: { try ports.next() },
+      terminationDelivery: { operation in
+        terminations.defer(operation)
+      }
     )
     let namespaceID = UUID()
     let directory = try makeNamespaceDirectory(namespaceID)
@@ -87,11 +92,49 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
 
     try await supervisor.stop(namespaceID: namespaceID)
     await supervisor.start(namespaceID: namespaceID, namespaceDirectory: directory)
-    try? await Task.sleep(for: .milliseconds(100))
+    await terminations.waitForDeferredOperation()
+    await terminations.deliverAll()
 
     let restartedState = await supervisor.state(for: namespaceID)
     XCTAssertEqual(restartedState, .running(endpoint: URL(string: "http://127.0.0.1:42102")!))
-    await supervisor.stopAll()
+    try await supervisor.stopAll()
+    await terminations.deliverAll()
+  }
+
+  func testFailedDaemonCanRestartAndReachRunning() async throws {
+    let namespaceID = UUID()
+    let marker = temporaryDirectory.appendingPathComponent("first-launch")
+    let executable = try makeExecutable(
+      named: "fail-once",
+      body: """
+        if [ ! -e '\(marker.path)' ]; then
+          touch '\(marker.path)'
+          exit 7
+        fi
+        trap 'exit 0' TERM INT
+        while :; do sleep 1; done
+        """
+    )
+    let ports = PortSequence([42111, 42112])
+    let supervisor = NamespaceDaemonSupervisor(
+      executableURL: executable,
+      readinessTimeout: 1,
+      readinessProbe: { endpoint in endpoint.port == 42112 },
+      portAllocator: { try ports.next() }
+    )
+    let directory = try makeNamespaceDirectory(namespaceID)
+
+    await supervisor.start(namespaceID: namespaceID, namespaceDirectory: directory)
+    guard case .failed = await supervisor.state(for: namespaceID) else {
+      return XCTFail("Expected the first start to fail")
+    }
+
+    try await supervisor.stop(namespaceID: namespaceID)
+    await supervisor.start(namespaceID: namespaceID, namespaceDirectory: directory)
+
+    let restartedState = await supervisor.state(for: namespaceID)
+    XCTAssertEqual(restartedState, .running(endpoint: URL(string: "http://127.0.0.1:42112")!))
+    try await supervisor.stopAll()
   }
 
   func testUnexpectedExitReportsFailureWithoutChangingAnotherNamespace() async throws {
@@ -127,7 +170,35 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
     XCTAssertTrue(message.contains("status 7") || message.contains("ready"))
     let stableState = await supervisor.state(for: stableID)
     XCTAssertEqual(stableState, .running(endpoint: URL(string: "http://127.0.0.1:42201")!))
-    await supervisor.stopAll()
+    try await supervisor.stopAll()
+  }
+
+  func testStopAllStopsEveryNamespace() async throws {
+    let executable = try makeLongRunningExecutable()
+    let ports = PortSequence([42211, 42212])
+    let supervisor = NamespaceDaemonSupervisor(
+      executableURL: executable,
+      readinessTimeout: 1,
+      readinessProbe: { _ in true },
+      portAllocator: { try ports.next() }
+    )
+    let firstID = UUID()
+    let secondID = UUID()
+    await supervisor.start(
+      namespaceID: firstID,
+      namespaceDirectory: try makeNamespaceDirectory(firstID)
+    )
+    await supervisor.start(
+      namespaceID: secondID,
+      namespaceDirectory: try makeNamespaceDirectory(secondID)
+    )
+
+    try await supervisor.stopAll()
+
+    let firstState = await supervisor.state(for: firstID)
+    let secondState = await supervisor.state(for: secondID)
+    XCTAssertEqual(firstState, .stopped)
+    XCTAssertEqual(secondState, .stopped)
   }
 
   func testMissingExecutableReportsAnActionableFailure() async throws {
@@ -154,6 +225,60 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
           """
       )
     )
+  }
+
+  func testReadinessCleanupFailureRetainsOwnershipAndBlocksReplacement() async throws {
+    let pidFile = temporaryDirectory.appendingPathComponent("daemon.pid")
+    let executable = try makeExecutable(
+      named: "unstoppable",
+      body: """
+        echo $$ > '\(pidFile.path)'
+        trap '' TERM
+        while :; do sleep 1; done
+        """
+    )
+    let ports = PortSequence([42311, 42312])
+    let supervisor = NamespaceDaemonSupervisor(
+      executableURL: executable,
+      readinessTimeout: 0.01,
+      readinessProbe: { _ in false },
+      portAllocator: { try ports.next() },
+      gracefulStopTimeout: 0.01,
+      forcedStopTimeout: 0.01,
+      forceKill: { _ in -1 }
+    )
+    let namespaceID = UUID()
+    let directory = try makeNamespaceDirectory(namespaceID)
+
+    await supervisor.start(namespaceID: namespaceID, namespaceDirectory: directory)
+    let failedState = await supervisor.state(for: namespaceID)
+    XCTAssertEqual(
+      failedState,
+      .failed(
+        message: """
+          The Symphony daemon could not be stopped safely. \
+          Try again before deleting or locking the namespace.
+          """
+      )
+    )
+
+    await supervisor.start(namespaceID: namespaceID, namespaceDirectory: directory)
+
+    let retainedState = await supervisor.state(for: namespaceID)
+    let portRequests = ports.requestCount
+    XCTAssertEqual(retainedState, failedState)
+    XCTAssertEqual(portRequests, 1)
+    do {
+      try await supervisor.stopAll()
+      XCTFail("Expected stop-all failure")
+    } catch let error as NamespaceDaemonStopAllError {
+      XCTAssertNotNil(error.failures[namespaceID])
+    }
+
+    let pidText = try String(contentsOf: pidFile, encoding: .utf8)
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    let pid = try XCTUnwrap(Int32(pidText))
+    Darwin.kill(pid, SIGKILL)
   }
 
   private func makeNamespaceDirectory(_ id: UUID) throws -> URL {
@@ -195,6 +320,7 @@ private enum TestFailure: Error {
 private final class PortSequence: @unchecked Sendable {
   private let lock = NSLock()
   private var ports: [UInt16]
+  private var requests = 0
 
   init(_ ports: [UInt16]) {
     self.ports = ports
@@ -202,10 +328,49 @@ private final class PortSequence: @unchecked Sendable {
 
   func next() throws -> UInt16 {
     try lock.withLock {
+      requests += 1
       guard !ports.isEmpty else {
         throw NamespaceDaemonError.endpointUnavailable
       }
       return ports.removeFirst()
+    }
+  }
+
+  var requestCount: Int {
+    lock.withLock { requests }
+  }
+}
+
+private final class DeferredTerminationDelivery: @unchecked Sendable {
+  typealias Operation = @Sendable () async -> Void
+
+  private let lock = NSLock()
+  private var operations: [Operation] = []
+
+  func `defer`(_ operation: @escaping Operation) {
+    lock.withLock {
+      operations.append(operation)
+    }
+  }
+
+  func waitForDeferredOperation() async {
+    let deadline = Date().addingTimeInterval(1)
+    while Date() < deadline {
+      if lock.withLock({ !operations.isEmpty }) {
+        return
+      }
+      try? await Task.sleep(for: .milliseconds(10))
+    }
+  }
+
+  func deliverAll() async {
+    let deferred = lock.withLock {
+      let deferred = operations
+      operations.removeAll()
+      return deferred
+    }
+    for operation in deferred {
+      await operation()
     }
   }
 }

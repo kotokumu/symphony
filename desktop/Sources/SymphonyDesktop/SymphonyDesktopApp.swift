@@ -5,6 +5,9 @@ import SymphonyDesktopInfrastructure
 
 @main
 struct SymphonyDesktopApp: App {
+  @NSApplicationDelegateAdaptor(SymphonyApplicationDelegate.self)
+  private var applicationDelegate
+
   @StateObject private var controller: NamespaceController
   @StateObject private var daemonController: NamespaceDaemonController
 
@@ -15,7 +18,6 @@ struct SymphonyDesktopApp: App {
       argumentPrefix: command?.argumentPrefix ?? [],
       workingDirectoryURL: command?.workingDirectoryURL
     )
-
     do {
       let repository = try FileNamespaceRepository()
       _daemonController = StateObject(
@@ -46,10 +48,14 @@ struct SymphonyDesktopApp: App {
       )
       _controller = StateObject(wrappedValue: NamespaceController(repository: repository))
     }
+
+    applicationDelegate.configure {
+      try await supervisor.stopAll()
+    }
   }
 
   var body: some Scene {
-    WindowGroup("Symphony") {
+    Window("Symphony", id: "main") {
       ContentView(controller: controller, daemonController: daemonController)
     }
     .defaultSize(width: 760, height: 520)

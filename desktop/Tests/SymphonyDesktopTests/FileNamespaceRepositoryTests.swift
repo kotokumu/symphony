@@ -35,7 +35,7 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     let repository = FileNamespaceRepository(storageDirectory: storageDirectory)
     var catalog = NamespaceCatalog()
     let namespace = try catalog.create(named: "Research")
-    let directory = await repository.directoryURL(for: namespace.id)
+    let directory = repository.directoryURL(for: namespace.id)
 
     try await repository.create(namespace, saving: catalog)
     let reloaded = try await FileNamespaceRepository(storageDirectory: storageDirectory).load()
@@ -123,7 +123,7 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     var catalog = NamespaceCatalog()
     let namespace = try catalog.create(named: "Research")
     try await repository.create(namespace, saving: catalog)
-    let directory = await repository.directoryURL(for: namespace.id)
+    let directory = repository.directoryURL(for: namespace.id)
     try FileManager.default.removeItem(at: directory)
 
     await assertThrowsErrorAsync(try await repository.load()) { error in
@@ -149,7 +149,7 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     let repository = FileNamespaceRepository(storageDirectory: storageDirectory)
     var catalog = NamespaceCatalog()
     let namespace = try catalog.create(named: "Research")
-    let directory = await repository.directoryURL(for: namespace.id)
+    let directory = repository.directoryURL(for: namespace.id)
 
     await assertThrowsErrorAsync(try await repository.create(namespace, saving: catalog)) { error in
       XCTAssertEqual(
@@ -170,7 +170,7 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     )
     var catalog = NamespaceCatalog()
     let namespace = try catalog.create(named: "Research")
-    let directory = await repository.directoryURL(for: namespace.id)
+    let directory = repository.directoryURL(for: namespace.id)
 
     await assertThrowsErrorAsync(try await repository.create(namespace, saving: catalog)) { error in
       XCTAssertEqual(
@@ -186,7 +186,7 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     var catalog = NamespaceCatalog()
     let namespace = try catalog.create(named: "Research")
     try await repository.create(namespace, saving: catalog)
-    let directory = await repository.directoryURL(for: namespace.id)
+    let directory = repository.directoryURL(for: namespace.id)
     let metadataURL = storageDirectory.appendingPathComponent("namespaces.json")
     try FileManager.default.removeItem(at: metadataURL)
     try FileManager.default.createDirectory(at: metadataURL, withIntermediateDirectories: true)
@@ -260,7 +260,7 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     var catalog = NamespaceCatalog()
     let namespace = try catalog.create(named: "Research")
     try await repository.create(namespace, saving: catalog)
-    let directory = await repository.directoryURL(for: namespace.id)
+    let directory = repository.directoryURL(for: namespace.id)
     let pendingDirectory =
       storageDirectory
       .appendingPathComponent("PendingDeletions")
@@ -295,7 +295,7 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     var catalog = NamespaceCatalog()
     let namespace = try catalog.create(named: "Research")
     try await repository.create(namespace, saving: catalog)
-    let directory = await repository.directoryURL(for: namespace.id)
+    let directory = repository.directoryURL(for: namespace.id)
     let pendingDirectory =
       storageDirectory
       .appendingPathComponent("PendingDeletions")

@@ -5,6 +5,11 @@ import SymphonyDesktopCore
 public actor NamespaceDaemonSupervisor {
   public typealias ReadinessProbe = @Sendable (URL) async -> Bool
   public typealias PortAllocator = @Sendable () throws -> UInt16
+  public typealias TerminationDelivery =
+    @Sendable (
+      @escaping @Sendable () async -> Void
+    ) -> Void
+  public typealias ForceKill = @Sendable (Int32) -> Int32
 
   private struct Runtime {
     let generation: UUID
@@ -20,11 +25,16 @@ public actor NamespaceDaemonSupervisor {
   private let readinessTimeout: TimeInterval
   private let readinessProbe: ReadinessProbe
   private let portAllocator: PortAllocator
+  private let terminationDelivery: TerminationDelivery
+  private let gracefulStopTimeout: TimeInterval
+  private let forcedStopTimeout: TimeInterval
+  private let forceKill: ForceKill
   private let fileManager: FileManager
 
   private var generations: [Namespace.ID: UUID] = [:]
   private var runtimes: [Namespace.ID: Runtime] = [:]
   private var portReservations: [Namespace.ID: (generation: UUID, port: UInt16)] = [:]
+  private var intentionalTerminations: Set<UUID> = []
   private var states: [Namespace.ID: NamespaceDaemonState] = [:]
   private var eventContinuations: [UUID: AsyncStream<NamespaceDaemonEvent>.Continuation] = [:]
 
@@ -35,6 +45,14 @@ public actor NamespaceDaemonSupervisor {
     readinessTimeout: TimeInterval = 15,
     readinessProbe: @escaping ReadinessProbe = NamespaceDaemonSupervisor.probe,
     portAllocator: @escaping PortAllocator = NamespaceDaemonSupervisor.availableLoopbackPort,
+    terminationDelivery: @escaping TerminationDelivery = { operation in
+      Task {
+        await operation()
+      }
+    },
+    gracefulStopTimeout: TimeInterval = 3,
+    forcedStopTimeout: TimeInterval = 2,
+    forceKill: @escaping ForceKill = { Darwin.kill($0, SIGKILL) },
     fileManager: FileManager = .default
   ) {
     self.executableURL = executableURL
@@ -43,6 +61,10 @@ public actor NamespaceDaemonSupervisor {
     self.readinessTimeout = readinessTimeout
     self.readinessProbe = readinessProbe
     self.portAllocator = portAllocator
+    self.terminationDelivery = terminationDelivery
+    self.gracefulStopTimeout = gracefulStopTimeout
+    self.forcedStopTimeout = forcedStopTimeout
+    self.forceKill = forceKill
     self.fileManager = fileManager
   }
 
@@ -96,30 +118,42 @@ public actor NamespaceDaemonSupervisor {
   }
 
   public func stop(namespaceID: Namespace.ID) async throws {
-    generations.removeValue(forKey: namespaceID)
     guard let runtime = runtimes[namespaceID] else {
+      generations.removeValue(forKey: namespaceID)
       releasePort(for: namespaceID)
       publish(.stopped, for: namespaceID)
       return
     }
 
+    intentionalTerminations.insert(runtime.generation)
     do {
       try await terminate(runtime.process)
     } catch {
+      intentionalTerminations.remove(runtime.generation)
       publish(.failed(message: error.localizedDescription), for: namespaceID)
       throw error
     }
     if runtimes[namespaceID]?.generation == runtime.generation {
       runtimes.removeValue(forKey: namespaceID)
     }
+    generations.removeValue(forKey: namespaceID)
     releasePort(for: namespaceID, generation: runtime.generation)
+    intentionalTerminations.remove(runtime.generation)
     close(runtime)
     publish(.stopped, for: namespaceID)
   }
 
-  public func stopAll() async {
+  public func stopAll() async throws {
+    var failures: [Namespace.ID: String] = [:]
     for namespaceID in Set(generations.keys).union(runtimes.keys) {
-      try? await stop(namespaceID: namespaceID)
+      do {
+        try await stop(namespaceID: namespaceID)
+      } catch {
+        failures[namespaceID] = error.localizedDescription
+      }
+    }
+    if !failures.isEmpty {
+      throw NamespaceDaemonStopAllError(failures: failures)
     }
   }
 
@@ -228,10 +262,27 @@ public actor NamespaceDaemonSupervisor {
       }
     }
 
-    let output = try FileHandle(forWritingTo: layout.standardOutputURL)
-    let errorOutput = try FileHandle(forWritingTo: layout.standardErrorURL)
-    try output.seekToEnd()
-    try errorOutput.seekToEnd()
+    let output: FileHandle
+    let errorOutput: FileHandle
+    do {
+      output = try FileHandle(forWritingTo: layout.standardOutputURL)
+      do {
+        errorOutput = try FileHandle(forWritingTo: layout.standardErrorURL)
+      } catch {
+        try? output.close()
+        throw error
+      }
+      do {
+        try output.seekToEnd()
+        try errorOutput.seekToEnd()
+      } catch {
+        try? output.close()
+        try? errorOutput.close()
+        throw error
+      }
+    } catch {
+      throw NamespaceDaemonError.runtimePreparationFailed
+    }
 
     let process = Process()
     process.executableURL = executableURL
@@ -245,10 +296,11 @@ public actor NamespaceDaemonSupervisor {
     process.currentDirectoryURL = workingDirectoryURL
     process.standardOutput = output
     process.standardError = errorOutput
-    process.terminationHandler = { [weak self] process in
+    let terminationDelivery = self.terminationDelivery
+    process.terminationHandler = { [self, terminationDelivery] process in
       let status = process.terminationStatus
-      Task {
-        await self?.processDidTerminate(
+      terminationDelivery { [self] in
+        await processDidTerminate(
           namespaceID: namespaceID,
           generation: generation,
           status: status
@@ -299,12 +351,24 @@ public actor NamespaceDaemonSupervisor {
     guard generations[namespaceID] == generation else {
       return
     }
-    generations.removeValue(forKey: namespaceID)
-    releasePort(for: namespaceID, generation: generation)
-    if let runtime = runtimes.removeValue(forKey: namespaceID), runtime.generation == generation {
-      try? await terminate(runtime.process)
+    guard !intentionalTerminations.contains(generation) else {
+      return
+    }
+    if let runtime = runtimes[namespaceID], runtime.generation == generation {
+      intentionalTerminations.insert(generation)
+      do {
+        try await terminate(runtime.process)
+      } catch {
+        intentionalTerminations.remove(generation)
+        publish(.failed(message: error.localizedDescription), for: namespaceID)
+        return
+      }
+      runtimes.removeValue(forKey: namespaceID)
       close(runtime)
     }
+    intentionalTerminations.remove(generation)
+    generations.removeValue(forKey: namespaceID)
+    releasePort(for: namespaceID, generation: generation)
     publish(.failed(message: error.localizedDescription), for: namespaceID)
   }
 
@@ -318,6 +382,9 @@ public actor NamespaceDaemonSupervisor {
       runtime.generation == generation,
       generations[namespaceID] == generation
     else {
+      return
+    }
+    guard !intentionalTerminations.contains(generation) else {
       return
     }
     runtimes.removeValue(forKey: namespaceID)
@@ -340,11 +407,13 @@ public actor NamespaceDaemonSupervisor {
       return
     }
     process.terminate()
-    if await waitForExit(process, timeout: 3) {
+    if await waitForExit(process, timeout: gracefulStopTimeout) {
       return
     }
-    Darwin.kill(process.processIdentifier, SIGKILL)
-    guard await waitForExit(process, timeout: 2) else {
+    guard forceKill(process.processIdentifier) == 0 else {
+      throw NamespaceDaemonError.stopFailed
+    }
+    guard await waitForExit(process, timeout: forcedStopTimeout) else {
       throw NamespaceDaemonError.stopFailed
     }
   }
@@ -418,6 +487,14 @@ public actor NamespaceDaemonSupervisor {
       throw NamespaceDaemonError.endpointUnavailable
     }
     return UInt16(bigEndian: boundAddress.sin_port)
+  }
+}
+
+public struct NamespaceDaemonStopAllError: LocalizedError, Sendable {
+  public let failures: [Namespace.ID: String]
+
+  public var errorDescription: String? {
+    "One or more Symphony daemons could not be stopped safely. Try again before quitting."
   }
 }
 

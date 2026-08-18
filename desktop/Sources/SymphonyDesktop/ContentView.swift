@@ -29,7 +29,7 @@ struct ContentView: View {
     }
     .onDisappear {
       Task {
-        await daemonController.stopAll()
+        try? await daemonController.stopAll()
       }
     }
     .sheet(item: $editor) { context in

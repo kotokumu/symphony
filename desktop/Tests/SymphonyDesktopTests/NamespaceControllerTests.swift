@@ -164,6 +164,32 @@ final class NamespaceControllerTests: XCTestCase {
     XCTAssertEqual(recorded.suffix(2), ["stop:\(namespace.id.uuidString)", "delete"])
   }
 
+  func testStopFailurePreventsDeletionAndPreservesTheCatalog() async throws {
+    var catalog = NamespaceCatalog()
+    let namespace = try catalog.create(named: "Research")
+    let repository = TestNamespaceRepository(catalog: catalog)
+    let controller = NamespaceController(
+      repository: repository,
+      beforeDelete: { _ in
+        throw TestDaemonStopError.failure
+      }
+    )
+    await controller.load()
+
+    do {
+      _ = try await controller.deleteNamespace(namespace.id)
+      XCTFail("Expected daemon stop failure")
+    } catch {
+      XCTAssertEqual(error.localizedDescription, "Test daemon stop failure.")
+    }
+
+    let snapshot = await repository.snapshot()
+    XCTAssertEqual(controller.catalog, catalog)
+    XCTAssertEqual(snapshot.catalog, catalog)
+    XCTAssertTrue(snapshot.deletedIDs.isEmpty)
+    XCTAssertFalse(controller.isChanging)
+  }
+
   func testDeleteFailurePreservesPublishedAndPersistedState() async throws {
     var catalog = NamespaceCatalog()
     let namespace = try catalog.create(named: "Research")
@@ -323,5 +349,13 @@ private enum TestRepositoryError: LocalizedError {
 
   var errorDescription: String? {
     "Test repository failure."
+  }
+}
+
+private enum TestDaemonStopError: LocalizedError {
+  case failure
+
+  var errorDescription: String? {
+    "Test daemon stop failure."
   }
 }

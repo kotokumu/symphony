@@ -17,6 +17,10 @@ final class NamespaceDaemonControllerTests: XCTestCase {
     await controller.startObserving()
 
     await controller.start(namespace)
+
+    await eventually {
+      controller.state(for: namespace.id) == .starting
+    }
     await supervisor.emit(
       NamespaceDaemonEvent(
         namespaceID: namespace.id,
@@ -50,7 +54,7 @@ final class NamespaceDaemonControllerTests: XCTestCase {
 
     await eventually {
       controller.state(for: first.id) == .failed(message: "Symphony exited with status 2.")
-        && controller.state(for: second.id) == .running(endpoint: endpoint(41002))
+        && controller.state(for: second.id) == .running(endpoint: self.endpoint(41002))
     }
   }
 
@@ -69,6 +73,28 @@ final class NamespaceDaemonControllerTests: XCTestCase {
     XCTAssertEqual(operations, [.stop(namespace.id), .start(namespace.id, directory)])
   }
 
+  func testConcurrentObservationRequestsCreateOneSubscription() async {
+    let supervisor = TestDaemonSupervisor(suspendEventSubscription: true)
+    let controller = NamespaceDaemonController(
+      supervisor: supervisor,
+      directoryURL: { id in URL(fileURLWithPath: "/namespaces/\(id.uuidString)") }
+    )
+
+    let first = Task { await controller.startObserving() }
+    while await supervisor.eventSubscriptionCount == 0 {
+      await Task.yield()
+    }
+    let second = Task { await controller.startObserving() }
+    await Task.yield()
+
+    let requestCount = await supervisor.eventSubscriptionCount
+    XCTAssertEqual(requestCount, 1)
+
+    await supervisor.resumeEventSubscription()
+    await first.value
+    await second.value
+  }
+
   private func makeNamespace(named name: String) throws -> DesktopNamespace {
     DesktopNamespace(id: UUID(), name: try NamespaceName(validating: name))
   }
@@ -82,11 +108,12 @@ final class NamespaceDaemonControllerTests: XCTestCase {
     file: StaticString = #filePath,
     line: UInt = #line
   ) async {
-    for _ in 0..<100 {
+    let deadline = Date().addingTimeInterval(1)
+    while Date() < deadline {
       if condition() {
         return
       }
-      await Task.yield()
+      try? await Task.sleep(for: .milliseconds(10))
     }
     XCTFail("Condition was not satisfied", file: file, line: line)
   }
@@ -99,9 +126,22 @@ private actor TestDaemonSupervisor: NamespaceDaemonSupervising {
   }
 
   private(set) var operations: [Operation] = []
+  private(set) var eventSubscriptionCount = 0
   private var continuation: AsyncStream<NamespaceDaemonEvent>.Continuation?
+  private var shouldSuspendEventSubscription: Bool
+  private var eventSubscriptionContinuation: CheckedContinuation<Void, Never>?
 
-  func events() -> AsyncStream<NamespaceDaemonEvent> {
+  init(suspendEventSubscription: Bool = false) {
+    shouldSuspendEventSubscription = suspendEventSubscription
+  }
+
+  func events() async -> AsyncStream<NamespaceDaemonEvent> {
+    eventSubscriptionCount += 1
+    if shouldSuspendEventSubscription {
+      await withCheckedContinuation { continuation in
+        eventSubscriptionContinuation = continuation
+      }
+    }
     AsyncStream { continuation in
       self.continuation = continuation
     }
@@ -117,9 +157,15 @@ private actor TestDaemonSupervisor: NamespaceDaemonSupervising {
     continuation?.yield(.init(namespaceID: namespaceID, state: .stopped))
   }
 
-  func stopAll() {}
+  func stopAll() throws {}
 
   func emit(_ event: NamespaceDaemonEvent) {
     continuation?.yield(event)
+  }
+
+  func resumeEventSubscription() {
+    shouldSuspendEventSubscription = false
+    eventSubscriptionContinuation?.resume()
+    eventSubscriptionContinuation = nil
   }
 }

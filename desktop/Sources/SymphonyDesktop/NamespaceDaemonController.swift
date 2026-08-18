@@ -6,7 +6,7 @@ protocol NamespaceDaemonSupervising: Sendable {
   func events() async -> AsyncStream<NamespaceDaemonEvent>
   func start(namespaceID: Namespace.ID, namespaceDirectory: URL) async
   func stop(namespaceID: Namespace.ID) async throws
-  func stopAll() async
+  func stopAll() async throws
 }
 
 @MainActor
@@ -15,6 +15,7 @@ final class NamespaceDaemonController: ObservableObject {
 
   private let supervisor: any NamespaceDaemonSupervising
   private let directoryURL: @Sendable (Namespace.ID) -> URL
+  private var eventStreamTask: Task<AsyncStream<NamespaceDaemonEvent>, Never>?
   private var observationTask: Task<Void, Never>?
 
   init(
@@ -26,14 +27,26 @@ final class NamespaceDaemonController: ObservableObject {
   }
 
   deinit {
+    eventStreamTask?.cancel()
     observationTask?.cancel()
   }
 
   func startObserving() async {
+    if observationTask != nil {
+      return
+    }
+    if eventStreamTask == nil {
+      eventStreamTask = Task { [supervisor] in
+        await supervisor.events()
+      }
+    }
+    guard let eventStreamTask else {
+      return
+    }
+    let events = await eventStreamTask.value
     guard observationTask == nil else {
       return
     }
-    let events = await supervisor.events()
     observationTask = Task { [weak self] in
       for await event in events {
         guard !Task.isCancelled else {
@@ -65,7 +78,7 @@ final class NamespaceDaemonController: ObservableObject {
     await start(namespace)
   }
 
-  func stopAll() async {
-    await supervisor.stopAll()
+  func stopAll() async throws {
+    try await supervisor.stopAll()
   }
 }

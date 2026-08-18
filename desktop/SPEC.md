@@ -70,4 +70,6 @@ communication endpoint. Runtime ownership follows the namespace's stable identit
 renaming a namespace does not start, stop, or replace its daemon.
 
 Deleting a namespace stops its daemon before deleting local namespace data. Closing the desktop
-window stops all namespace daemons owned by that application instance.
+window stops all namespace daemons owned by that application instance. Quitting the application
+waits for its daemons to stop; if safe shutdown fails, the application reports the failure and
+cancels termination.
