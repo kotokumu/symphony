@@ -78,7 +78,7 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     let repository = FileNamespaceRepository(storageDirectory: storageDirectory)
     var catalog = NamespaceCatalog()
     let namespace = try catalog.create(named: "Research")
-    try await repository.reserveDirectory(for: namespace.id)
+    _ = try await repository.reserveDirectory(for: namespace.id)
     try await repository.save(catalog)
     try await repository.removeDirectory(for: namespace.id)
 
