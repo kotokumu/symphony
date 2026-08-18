@@ -1,0 +1,24 @@
+name: desktop
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: desktop
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Build and test
+        run: make all
