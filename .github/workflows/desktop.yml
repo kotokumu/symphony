@@ -1,0 +1,32 @@
+name: desktop
+
+on:
+  pull_request:
+    paths:
+      - desktop/**
+      - .github/workflows/desktop.yml
+  push:
+    branches:
+      - main
+    paths:
+      - desktop/**
+      - .github/workflows/desktop.yml
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: macos-15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+    defaults:
+      run:
+        working-directory: desktop
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Build and test
+        run: make all
