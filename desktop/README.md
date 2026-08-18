@@ -7,6 +7,7 @@ application can create, rename, select, and delete multiple namespaces on one Ma
 
 - macOS 15.3 or later
 - Xcode 16.4 with its Swift 6 toolchain and macOS SDK
+- `mise` with the tools in `elixir/mise.toml` installed when running the daemon from a source checkout
 
 Xcode Command Line Tools alone are insufficient because the test suite uses XCTest.
 
@@ -36,3 +37,9 @@ Run `make -C desktop run`, then verify the following behavior:
 4. Quit and relaunch the app, then confirm the namespaces and selection are restored.
 5. Choose `Delete…`, confirm that canceling preserves the namespace, then delete it and confirm its
    local data is permanently removed.
+6. Start a daemon in each of two namespaces and confirm both reach `Daemon running` with different
+   local endpoints.
+7. Stop one daemon and confirm the other remains running, then restart the running daemon and confirm
+   it returns to `Daemon running`.
+8. Close the desktop window and confirm its namespace daemons stop. Relaunch a daemon, quit the
+   application, and confirm termination waits for the daemon to stop.

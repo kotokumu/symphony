@@ -3,6 +3,7 @@ import SymphonyDesktopCore
 
 struct ContentView: View {
   @ObservedObject var controller: NamespaceController
+  @ObservedObject var daemonController: NamespaceDaemonController
 
   @State private var editor: NamespaceEditorContext?
   @State private var namespaceToDelete: DesktopNamespace?
@@ -21,8 +22,14 @@ struct ContentView: View {
       }
     }
     .task {
+      await daemonController.startObserving()
       if controller.loadState == .loading {
         await controller.load()
+      }
+    }
+    .onDisappear {
+      Task {
+        try? await daemonController.stopAll()
       }
     }
     .sheet(item: $editor) { context in
@@ -97,6 +104,26 @@ struct ContentView: View {
       if let namespace = controller.catalog.selectedNamespace {
         NamespaceDetailView(
           namespace: namespace,
+          daemonState: daemonController.state(for: namespace.id),
+          start: {
+            Task {
+              await daemonController.start(namespace)
+            }
+          },
+          stop: {
+            Task {
+              await reportErrors {
+                try await daemonController.stop(namespace.id)
+              }
+            }
+          },
+          restart: {
+            Task {
+              await reportErrors {
+                try await daemonController.restart(namespace)
+              }
+            }
+          },
           rename: { editor = .rename(namespace) },
           delete: { namespaceToDelete = namespace }
         )
@@ -218,6 +245,10 @@ private struct EmptyNamespaceView: View {
 
 private struct NamespaceDetailView: View {
   let namespace: DesktopNamespace
+  let daemonState: NamespaceDaemonState
+  let start: () -> Void
+  let stop: () -> Void
+  let restart: () -> Void
   let rename: () -> Void
   let delete: () -> Void
 
@@ -231,8 +262,9 @@ private struct NamespaceDetailView: View {
       Text(namespace.name.value)
         .font(.title2.weight(.semibold))
 
-      Text("This namespace is ready for a platform connection.")
-        .foregroundStyle(.secondary)
+      daemonStatus
+
+      daemonControls
 
       HStack {
         Button("Rename…", action: rename)
@@ -240,5 +272,58 @@ private struct NamespaceDetailView: View {
       }
     }
     .padding(48)
+  }
+
+  @ViewBuilder
+  private var daemonStatus: some View {
+    switch daemonState {
+    case .stopped:
+      Label("Daemon stopped", systemImage: "stop.circle")
+        .foregroundStyle(.secondary)
+    case .starting:
+      HStack(spacing: 8) {
+        ProgressView()
+          .controlSize(.small)
+        Text("Daemon starting…")
+      }
+      .foregroundStyle(.secondary)
+    case .running(let endpoint):
+      VStack(spacing: 4) {
+        Label("Daemon running", systemImage: "checkmark.circle.fill")
+          .foregroundStyle(.green)
+        Text(endpoint.absoluteString)
+          .font(.caption.monospaced())
+          .foregroundStyle(.secondary)
+          .textSelection(.enabled)
+      }
+    case .failed(let message):
+      VStack(spacing: 6) {
+        Label("Daemon failed", systemImage: "exclamationmark.triangle.fill")
+          .foregroundStyle(.red)
+        Text(message)
+          .foregroundStyle(.secondary)
+          .multilineTextAlignment(.center)
+          .frame(maxWidth: 440)
+      }
+    }
+  }
+
+  @ViewBuilder
+  private var daemonControls: some View {
+    switch daemonState {
+    case .stopped:
+      Button("Start Daemon", action: start)
+        .buttonStyle(.borderedProminent)
+    case .starting:
+      Button("Stop Daemon", action: stop)
+    case .running:
+      HStack {
+        Button("Stop Daemon", action: stop)
+        Button("Restart Daemon", action: restart)
+      }
+    case .failed:
+      Button("Restart Daemon", action: restart)
+        .buttonStyle(.borderedProminent)
+    }
   }
 }

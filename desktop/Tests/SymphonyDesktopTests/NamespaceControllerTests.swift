@@ -144,6 +144,52 @@ final class NamespaceControllerTests: XCTestCase {
     XCTAssertEqual(snapshot.deletedIDs, [second.id])
   }
 
+  func testStopsTheDaemonBeforeDeletingNamespaceData() async throws {
+    var catalog = NamespaceCatalog()
+    let namespace = try catalog.create(named: "Research")
+    let repository = TestNamespaceRepository(catalog: catalog)
+    let operations = OperationRecorder()
+    let controller = NamespaceController(
+      repository: repository,
+      beforeDelete: { id in
+        operations.append("stop:\(id.uuidString)")
+      }
+    )
+    await repository.recordOperations(in: operations)
+    await controller.load()
+
+    _ = try await controller.deleteNamespace(namespace.id)
+
+    let recorded = operations.values
+    XCTAssertEqual(recorded.suffix(2), ["stop:\(namespace.id.uuidString)", "delete"])
+  }
+
+  func testStopFailurePreventsDeletionAndPreservesTheCatalog() async throws {
+    var catalog = NamespaceCatalog()
+    let namespace = try catalog.create(named: "Research")
+    let repository = TestNamespaceRepository(catalog: catalog)
+    let controller = NamespaceController(
+      repository: repository,
+      beforeDelete: { _ in
+        throw TestDaemonStopError.failure
+      }
+    )
+    await controller.load()
+
+    do {
+      _ = try await controller.deleteNamespace(namespace.id)
+      XCTFail("Expected daemon stop failure")
+    } catch {
+      XCTAssertEqual(error.localizedDescription, "Test daemon stop failure.")
+    }
+
+    let snapshot = await repository.snapshot()
+    XCTAssertEqual(controller.catalog, catalog)
+    XCTAssertEqual(snapshot.catalog, catalog)
+    XCTAssertTrue(snapshot.deletedIDs.isEmpty)
+    XCTAssertFalse(controller.isChanging)
+  }
+
   func testDeleteFailurePreservesPublishedAndPersistedState() async throws {
     var catalog = NamespaceCatalog()
     let namespace = try catalog.create(named: "Research")
@@ -198,6 +244,7 @@ private actor TestNamespaceRepository: NamespaceRepository {
   private var shouldFailSave = false
   private var shouldFailDelete = false
   private var deletionOutcome = NamespaceDeletionOutcome.complete
+  private var operationRecorder: OperationRecorder?
 
   init(catalog: NamespaceCatalog) {
     self.catalog = catalog
@@ -236,6 +283,9 @@ private actor TestNamespaceRepository: NamespaceRepository {
     saving catalog: NamespaceCatalog
   ) throws -> NamespaceDeletionOutcome {
     operations.append("delete")
+    if let operationRecorder {
+      operationRecorder.append("delete")
+    }
     if shouldFailDelete {
       shouldFailDelete = false
       throw TestRepositoryError.failure
@@ -265,6 +315,10 @@ private actor TestNamespaceRepository: NamespaceRepository {
     deletionOutcome = outcome
   }
 
+  func recordOperations(in recorder: OperationRecorder) {
+    operationRecorder = recorder
+  }
+
   func snapshot() -> Snapshot {
     Snapshot(
       catalog: catalog,
@@ -275,10 +329,33 @@ private actor TestNamespaceRepository: NamespaceRepository {
   }
 }
 
+private final class OperationRecorder: @unchecked Sendable {
+  private let lock = NSLock()
+  private var storage: [String] = []
+
+  func append(_ value: String) {
+    lock.withLock {
+      storage.append(value)
+    }
+  }
+
+  var values: [String] {
+    lock.withLock { storage }
+  }
+}
+
 private enum TestRepositoryError: LocalizedError {
   case failure
 
   var errorDescription: String? {
     "Test repository failure."
+  }
+}
+
+private enum TestDaemonStopError: LocalizedError {
+  case failure
+
+  var errorDescription: String? {
+    "Test daemon stop failure."
   }
 }

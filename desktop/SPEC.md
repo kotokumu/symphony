@@ -51,3 +51,25 @@ and allows the user to retry after correcting it. A missing namespace directory 
 without recreating or deleting data automatically. If local data cleanup is interrupted after a
 confirmed deletion, the application reports the remaining data and retries cleanup on its next
 start.
+
+---
+
+## 5. Namespace Daemon Lifecycle
+
+Each namespace has an independent Symphony daemon lifecycle. Daemons are stopped when the desktop
+application starts. A user can start, stop, or restart a namespace daemon without changing the
+state of another namespace daemon, and multiple namespace daemons can run concurrently.
+
+The application reports when a daemon is stopped, starting, running, or failed. A daemon is running
+only after its local endpoint responds successfully. The running state displays that endpoint. A
+failed start or unexpected exit displays an actionable error and allows the user to restart the
+affected daemon.
+
+Each namespace daemon has isolated workspace data, runtime configuration, logs, and a local
+communication endpoint. Runtime ownership follows the namespace's stable identity: selecting or
+renaming a namespace does not start, stop, or replace its daemon.
+
+Deleting a namespace stops its daemon before deleting local namespace data. Closing the desktop
+window stops all namespace daemons owned by that application instance. Quitting the application
+waits for its daemons to stop; if safe shutdown fails, the application reports the failure and
+cancels termination.
