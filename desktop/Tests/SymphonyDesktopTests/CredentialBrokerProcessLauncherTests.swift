@@ -702,7 +702,7 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
         directory.deleteLastPathComponent()
       }
     }
-    throw CredentialBrokerProcessLauncherError.executableNotFound
+    throw CredentialBrokerProcessError.executableNotFound
   }
 
   private func processExists(_ pid: Int32) -> Bool {
