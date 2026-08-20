@@ -287,6 +287,34 @@ final class NamespaceControllerTests: XCTestCase {
     XCTAssertEqual(recorder.values, ["credential-cleanup:false"])
     XCTAssertEqual(controller.catalog, catalog)
   }
+
+  func testGitHubConnectionPublishesOnlyAfterRepositorySaveAndDisconnectsTransactionally() async throws {
+    var catalog = NamespaceCatalog()
+    let namespace = try catalog.create(named: "Research")
+    let repository = TestNamespaceRepository(catalog: catalog)
+    let controller = NamespaceController(repository: repository)
+    await controller.load()
+    let connection = try GitHubConnection(
+      appID: 10,
+      installationID: 20,
+      accountLogin: "octo",
+      repositoryID: 30,
+      repositoryFullName: "octo/research",
+      repositoryURL: URL(string: "https://github.com/octo/research")!
+    )
+
+    await repository.failNextSave()
+    do {
+      try await controller.connectNamespace(namespace.id, to: connection)
+      XCTFail("Expected save failure")
+    } catch {}
+    XCTAssertNil(controller.catalog.selectedNamespace?.platformConnection)
+
+    try await controller.connectNamespace(namespace.id, to: connection)
+    XCTAssertEqual(controller.catalog.selectedNamespace?.platformConnection, .github(connection))
+    try await controller.disconnectNamespacePlatform(namespace.id)
+    XCTAssertNil(controller.catalog.selectedNamespace?.platformConnection)
+  }
 }
 
 private actor TestNamespaceRepository: NamespaceRepository {

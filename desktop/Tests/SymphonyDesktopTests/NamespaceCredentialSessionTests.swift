@@ -1,9 +1,11 @@
 import Foundation
 import CryptoKit
 import LocalAuthentication
+import Security
 import XCTest
 
 @testable import SymphonyCredentialBrokerKit
+@testable import SymphonyCredentialBrokerProtocol
 
 final class NamespaceCredentialSessionTests: XCTestCase {
   func testFirstUnlockAuthorizesStoresAndRetainsCredentialUntilLock() async throws {
@@ -152,6 +154,113 @@ final class NamespaceCredentialSessionTests: XCTestCase {
 
     XCTAssertEqual(generated.bytesForTesting, [0, 0, 0])
   }
+
+  func testConfiguresGitHubPrivateKeyAndExposesOnlyBrokeredDiscoveryResults() async throws {
+    let namespaceID = UUID()
+    let storage = RecordingCredentialStorage(credentials: [namespaceID: Data([1, 2, 3])])
+    let githubAPI = RecordingGitHubAppAPI()
+    let session = NamespaceCredentialSession(
+      namespaceID: namespaceID,
+      authorizer: RecordingUnlockAuthorizer(),
+      storage: storage,
+      githubAPI: githubAPI
+    )
+    let privateKeyURL = try makePrivateKeyPEM()
+    defer { try? FileManager.default.removeItem(at: privateKeyURL) }
+    try await session.unlock(reason: "Test unlock")
+
+    try await session.configureGitHubApp(
+      appID: 10,
+      privateKeyFilePath: privateKeyURL.path
+    )
+    let installations = try await session.listGitHubInstallations()
+    let repositories = try await session.listGitHubRepositories(installationID: 20)
+
+    XCTAssertEqual(installations.first?.accountLogin, "octo")
+    XCTAssertEqual(repositories.first?.fullName, "octo/research")
+    var stored = try StoredGitHubAppCredential.decode(
+      from: XCTUnwrap(storage.storedCredential(for: namespaceID))
+    )
+    XCTAssertEqual(stored.appID, 10)
+    stored.clear()
+    let jwtValues = await githubAPI.jwtValues
+    XCTAssertEqual(jwtValues.count, 2)
+    XCTAssertTrue(jwtValues.allSatisfy { $0.split(separator: ".").count == 3 })
+    let privateKeyText = try String(contentsOf: privateKeyURL, encoding: .utf8)
+    XCTAssertTrue(jwtValues.allSatisfy { !$0.contains(privateKeyText) })
+  }
+
+  func testInvalidGitHubPrivateKeyDoesNotReplaceStoredCredential() async throws {
+    let namespaceID = UUID()
+    let original = Data([9, 8, 7])
+    let storage = RecordingCredentialStorage(credentials: [namespaceID: original])
+    let session = NamespaceCredentialSession(
+      namespaceID: namespaceID,
+      authorizer: RecordingUnlockAuthorizer(),
+      storage: storage
+    )
+    let invalidURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("invalid-github-key-\(UUID().uuidString)")
+    try Data("not a private key".utf8).write(to: invalidURL)
+    defer { try? FileManager.default.removeItem(at: invalidURL) }
+    try await session.unlock(reason: "Test unlock")
+
+    do {
+      try await session.configureGitHubApp(appID: 10, privateKeyFilePath: invalidURL.path)
+      XCTFail("Expected invalid private key")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("not a valid RSA private key"))
+    }
+    XCTAssertEqual(storage.storedCredential(for: namespaceID), original)
+  }
+
+  private func makePrivateKeyPEM() throws -> URL {
+    let attributes: [String: Any] = [
+      kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+      kSecAttrKeySizeInBits as String: 2_048,
+    ]
+    var error: Unmanaged<CFError>?
+    let key = try XCTUnwrap(SecKeyCreateRandomKey(attributes as CFDictionary, &error))
+    let der = try XCTUnwrap(SecKeyCopyExternalRepresentation(key, &error) as Data?)
+    let base64 = der.base64EncodedString(options: [.lineLength64Characters])
+    let pem = "-----BEGIN RSA PRIVATE KEY-----\n\(base64)\n-----END RSA PRIVATE KEY-----\n"
+    let url = FileManager.default.temporaryDirectory
+      .appendingPathComponent("github-app-\(UUID().uuidString).pem")
+    try Data(pem.utf8).write(to: url, options: .atomic)
+    return url
+  }
+}
+
+private actor RecordingGitHubAppAPI: GitHubAppAPIRequesting {
+  private(set) var jwtValues: [String] = []
+
+  func listInstallations(jwt: String) -> [GitHubInstallationDescriptor] {
+    jwtValues.append(jwt)
+    return [
+      GitHubInstallationDescriptor(
+        id: 20,
+        accountLogin: "octo",
+        accountType: "Organization",
+        permissions: ["issues": "read", "contents": "write"],
+        isSuspended: false
+      )
+    ]
+  }
+
+  func listRepositories(
+    installationID: Int64,
+    jwt: String
+  ) -> [GitHubRepositoryDescriptor] {
+    jwtValues.append(jwt)
+    return [
+      GitHubRepositoryDescriptor(
+        id: 30,
+        fullName: "octo/research",
+        htmlURL: URL(string: "https://github.com/octo/research")!,
+        isPrivate: true
+      )
+    ]
+  }
 }
 
 private actor RecordingUnlockAuthorizer: NamespaceUnlockAuthorizing {
@@ -203,6 +312,16 @@ private final class RecordingCredentialStorage: NamespaceCredentialStoring, @unc
       credentials[namespaceID] = credential
     }
     if let storeError { throw storeError }
+  }
+
+  func replace(
+    _ credential: Data,
+    namespaceID: UUID,
+    authorization: NamespaceUnlockAuthorization
+  ) throws {
+    lock.withLock {
+      credentials[namespaceID] = credential
+    }
   }
 
   func removeAll(namespaceID: UUID) throws {

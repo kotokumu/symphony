@@ -2,6 +2,7 @@ import Foundation
 import XCTest
 
 @testable import SymphonyDesktopInfrastructure
+@testable import SymphonyDesktopCore
 
 final class NamespaceCredentialCleanupCoordinatorTests: XCTestCase {
   func testRepositoryRollbackUnstagesDeletionWithoutPurgingCredential() async throws {
@@ -77,6 +78,61 @@ final class NamespaceCredentialCleanupCoordinatorTests: XCTestCase {
     XCTAssertTrue(text.contains(namespaceID.uuidString))
     let attributes = try FileManager.default.attributesOfItem(atPath: fileURL.path)
     XCTAssertEqual((attributes[.posixPermissions] as? NSNumber)?.intValue, 0o600)
+  }
+
+  func testGitHubCleanupIsPersistedAndRetriedOnlyForDisconnectedNamespace() async throws {
+    let store = PendingCredentialCleanupStore(fileURL: try ledgerURL())
+    let failingPurge = RecordingCredentialPurge(shouldFail: true)
+    let namespaceID = UUID()
+    let coordinator = GitHubCredentialCleanupCoordinator(
+      store: store,
+      purge: { id in try await failingPurge.call(id) }
+    )
+
+    let warning = try await coordinator.cleanup(namespaceID)
+
+    XCTAssertTrue(try XCTUnwrap(warning).contains("will be retried"))
+    let pendingAfterFailure = try await store.pendingNamespaceIDs()
+    XCTAssertEqual(pendingAfterFailure, [namespaceID])
+
+    await failingPurge.allowSuccess()
+    var disconnectedCatalog = NamespaceCatalog()
+    try disconnectedCatalog.create(named: "Research", id: namespaceID)
+    try await coordinator.reconcile(disconnectedCatalog)
+
+    let purged = await failingPurge.namespaceIDs
+    let pendingAfterRetry = try await store.pendingNamespaceIDs()
+    XCTAssertEqual(purged, [namespaceID, namespaceID])
+    XCTAssertTrue(pendingAfterRetry.isEmpty)
+  }
+
+  func testCommittedGitHubConnectionCancelsStaleCleanupWithoutPurgingCredential() async throws {
+    let store = PendingCredentialCleanupStore(fileURL: try ledgerURL())
+    let namespaceID = UUID()
+    try await store.mark(namespaceID)
+    var catalog = NamespaceCatalog()
+    try catalog.create(named: "Research", id: namespaceID)
+    let connection = try GitHubConnection(
+      appID: 10,
+      installationID: 20,
+      accountLogin: "octo",
+      repositoryID: 30,
+      repositoryFullName: "octo/research",
+      repositoryURL: URL(string: "https://github.com/octo/research")!
+    )
+    try catalog.connect(namespaceID, to: .github(connection))
+    let purge = RecordingCredentialPurge()
+    let coordinator = GitHubCredentialCleanupCoordinator(
+      store: store,
+      purge: { id in try await purge.call(id) }
+    )
+
+    try await coordinator.reconcile(catalog)
+
+    let purged = await purge.namespaceIDs
+    let pending = try await store.pendingNamespaceIDs()
+    XCTAssertTrue(purged.isEmpty)
+    XCTAssertTrue(pending.isEmpty)
   }
 
   private func ledgerURL() throws -> URL {

@@ -120,6 +120,51 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
     }
   }
 
+  func testGitHubCapabilitiesUseFramedRequestsAndReturnOnlyDescriptors() async throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let configureURL = directory.appendingPathComponent("configure-command")
+    let script = try executableScript(
+      in: directory,
+      contents: """
+        #!/bin/sh
+        printf '{"status":"unlocked"}\n'
+        IFS= read -r configure
+        printf '%s' "$configure" > "$BROKER_CONFIGURE_FILE"
+        printf '{"status":"githubAppConfigured"}\n'
+        IFS= read -r installations
+        printf '{"status":"githubInstallations","installations":[{"id":20,"accountLogin":"octo","accountType":"Organization","permissions":{"issues":"read","contents":"write"},"isSuspended":false}]}\n'
+        IFS= read -r repositories
+        printf '{"status":"githubRepositories","repositories":[{"id":30,"fullName":"octo/research","htmlURL":"https://github.com/octo/research","isPrivate":true}]}\n'
+        IFS= read -r lock_command
+        """
+    )
+    let launcher = CredentialBrokerProcessLauncher(
+      executableURL: script,
+      handshakeTimeout: 1,
+      stopTimeout: 1,
+      environment: [
+        "PATH": "/usr/bin:/bin",
+        "BROKER_CONFIGURE_FILE": configureURL.path,
+      ]
+    )
+    let session = try await launcher.unlock(namespaceID: UUID())
+    let keyURL = URL(fileURLWithPath: "/private/github-app.pem")
+
+    try await session.configureGitHubApp(appID: 10, privateKeyFileURL: keyURL)
+    let installations = try await session.listGitHubInstallations()
+    let repositories = try await session.listGitHubRepositories(installationID: 20)
+
+    let configure = try JSONDecoder().decode(
+      CredentialBrokerCommand.self,
+      from: Data(contentsOf: configureURL)
+    )
+    XCTAssertEqual(configure, .configureGitHubApp(appID: 10, privateKeyFilePath: keyURL.path))
+    XCTAssertEqual(installations.first?.accountLogin, "octo")
+    XCTAssertEqual(repositories.first?.fullName, "octo/research")
+    try await session.lock()
+  }
+
   func testMissingExecutableProducesActionableError() async {
     let launcher = CredentialBrokerProcessLauncher(
       executableURL: nil,

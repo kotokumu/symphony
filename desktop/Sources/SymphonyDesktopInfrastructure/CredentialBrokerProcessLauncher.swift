@@ -5,8 +5,29 @@ import SymphonyDesktopCore
 
 public protocol CredentialBrokerSessionHandle: Sendable {
   func signChallenge(_ challenge: Data) async throws -> Data
+  func configureGitHubApp(appID: Int64, privateKeyFileURL: URL) async throws
+  func listGitHubInstallations() async throws -> [GitHubInstallationDescriptor]
+  func listGitHubRepositories(
+    installationID: Int64
+  ) async throws -> [GitHubRepositoryDescriptor]
   /// Returns only after the broker process no longer retains namespace credentials.
   func lock() async throws
+}
+
+public extension CredentialBrokerSessionHandle {
+  func configureGitHubApp(appID: Int64, privateKeyFileURL: URL) async throws {
+    throw CredentialBrokerProcessError.capabilityUnavailable
+  }
+
+  func listGitHubInstallations() async throws -> [GitHubInstallationDescriptor] {
+    throw CredentialBrokerProcessError.capabilityUnavailable
+  }
+
+  func listGitHubRepositories(
+    installationID: Int64
+  ) async throws -> [GitHubRepositoryDescriptor] {
+    throw CredentialBrokerProcessError.capabilityUnavailable
+  }
 }
 
 public protocol CredentialBrokerSessionLaunching: Sendable {
@@ -147,6 +168,82 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
     guard challenge.count <= 32_768 else {
       throw CredentialBrokerProcessError.requestTooLarge
     }
+    switch try await perform(
+      .signChallenge(challenge),
+      namespaceID: namespaceID,
+      generation: generation
+    ) {
+    case .signature(let signature):
+      return signature
+    case .failed(let message):
+      throw CredentialBrokerProcessError.capabilityFailed(message)
+    default:
+      throw CredentialBrokerProcessError.handshakeFailed
+    }
+  }
+
+  fileprivate func configureGitHubApp(
+    appID: Int64,
+    privateKeyFileURL: URL,
+    namespaceID: Namespace.ID,
+    generation: UUID
+  ) async throws {
+    switch try await perform(
+      .configureGitHubApp(appID: appID, privateKeyFilePath: privateKeyFileURL.path),
+      namespaceID: namespaceID,
+      generation: generation
+    ) {
+    case .githubAppConfigured:
+      return
+    case .failed(let message):
+      throw CredentialBrokerProcessError.capabilityFailed(message)
+    default:
+      throw CredentialBrokerProcessError.handshakeFailed
+    }
+  }
+
+  fileprivate func listGitHubInstallations(
+    namespaceID: Namespace.ID,
+    generation: UUID
+  ) async throws -> [GitHubInstallationDescriptor] {
+    switch try await perform(
+      .listGitHubInstallations,
+      namespaceID: namespaceID,
+      generation: generation
+    ) {
+    case .githubInstallations(let installations):
+      return installations
+    case .failed(let message):
+      throw CredentialBrokerProcessError.capabilityFailed(message)
+    default:
+      throw CredentialBrokerProcessError.handshakeFailed
+    }
+  }
+
+  fileprivate func listGitHubRepositories(
+    installationID: Int64,
+    namespaceID: Namespace.ID,
+    generation: UUID
+  ) async throws -> [GitHubRepositoryDescriptor] {
+    switch try await perform(
+      .listGitHubRepositories(installationID: installationID),
+      namespaceID: namespaceID,
+      generation: generation
+    ) {
+    case .githubRepositories(let repositories):
+      return repositories
+    case .failed(let message):
+      throw CredentialBrokerProcessError.capabilityFailed(message)
+    default:
+      throw CredentialBrokerProcessError.handshakeFailed
+    }
+  }
+
+  private func perform(
+    _ command: CredentialBrokerCommand,
+    namespaceID: Namespace.ID,
+    generation: UUID
+  ) async throws -> CredentialBrokerResult {
     try await acquireCommand(for: namespaceID)
     defer { commandGate.release(namespaceID) }
     guard let runtime = runtimes[namespaceID], runtime.generation == generation else {
@@ -158,24 +255,20 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
     let outputDescriptor = output.fileDescriptor
     let responseTimeout = handshakeTimeout
     do {
-      var command = try JSONEncoder().encode(CredentialBrokerCommand.signChallenge(challenge))
-      command.append(0x0A)
-      try input.write(contentsOf: command)
+      var requestData = try JSONEncoder().encode(command)
+      guard requestData.count <= 65_536 else {
+        throw CredentialBrokerProcessError.requestTooLarge
+      }
+      requestData.append(0x0A)
+      try input.write(contentsOf: requestData)
       let responseData = try await Task.detached {
         try BrokerPipeReader.readLine(
           from: outputDescriptor,
           timeout: responseTimeout,
-          maximumBytes: 65_536
+          maximumBytes: 1_048_576
         )
       }.value
-      switch try JSONDecoder().decode(CredentialBrokerResult.self, from: responseData) {
-      case .signature(let signature):
-        return signature
-      case .failed(let message):
-        throw CredentialBrokerProcessError.capabilityFailed(message)
-      case .locked:
-        throw CredentialBrokerProcessError.handshakeFailed
-      }
+      return try JSONDecoder().decode(CredentialBrokerResult.self, from: responseData)
     } catch {
       if stopTasks[namespaceID] == nil {
         do {
@@ -398,6 +491,32 @@ private struct ProcessCredentialBrokerSession: CredentialBrokerSessionHandle {
       generation: generation
     )
   }
+
+  func configureGitHubApp(appID: Int64, privateKeyFileURL: URL) async throws {
+    try await launcher.configureGitHubApp(
+      appID: appID,
+      privateKeyFileURL: privateKeyFileURL,
+      namespaceID: namespaceID,
+      generation: generation
+    )
+  }
+
+  func listGitHubInstallations() async throws -> [GitHubInstallationDescriptor] {
+    try await launcher.listGitHubInstallations(
+      namespaceID: namespaceID,
+      generation: generation
+    )
+  }
+
+  func listGitHubRepositories(
+    installationID: Int64
+  ) async throws -> [GitHubRepositoryDescriptor] {
+    try await launcher.listGitHubRepositories(
+      installationID: installationID,
+      namespaceID: namespaceID,
+      generation: generation
+    )
+  }
 }
 
 private final class UnsafeProcessReference: @unchecked Sendable {
@@ -457,6 +576,7 @@ public enum CredentialBrokerProcessError: LocalizedError, Sendable {
   case sessionAlreadyRunning
   case sessionNotRunning
   case requestTooLarge
+  case capabilityUnavailable
   case pipeConfigurationFailed
   case capabilityFailed(String)
   case launchFailed(String)
@@ -478,6 +598,8 @@ public enum CredentialBrokerProcessError: LocalizedError, Sendable {
       "The namespace credential broker is not running. Unlock the namespace and try again."
     case .requestTooLarge:
       "The credential capability request is too large."
+    case .capabilityUnavailable:
+      "This credential broker does not support the requested GitHub capability."
     case .pipeConfigurationFailed:
       "The credential broker pipe could not be configured safely."
     case .capabilityFailed(let message):

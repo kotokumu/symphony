@@ -81,10 +81,10 @@ or receive raw stored credential values.
 Before accepting an operation, the helper requires its packaged location inside a valid sealed
 application and verifies both the on-disk desktop executable and its running parent against a fixed
 desktop signing identifier and the helper's own trusted signing team. This applies to unlock, purge,
-and capability operations. Unknown operations are rejected. The initial opaque capability signs a
-bounded challenge and returns the HMAC result; no protocol response can return the stored
-credential. Each namespace pipe admits one complete request-response transaction at a time, and
-locking closes capability admission before waiting for an in-flight transaction.
+and capability operations. Unknown operations are rejected. Capability responses return derived
+results or non-secret metadata and cannot return the stored credential. Each namespace pipe admits
+one complete request-response transaction at a time, and locking closes capability admission before
+waiting for an in-flight transaction.
 
 The helper uses LocalAuthentication for device owner approval and protects its namespace credential
 with a Data Protection Keychain user-presence policy and `ThisDeviceOnly` accessibility. It copies
@@ -100,3 +100,22 @@ protection is registered for the application lifetime and uses IOKit's power ack
 Mac does not proceed with cancellable sleep until broker locking completes successfully. A
 registration failure keeps credential unlock disabled. Window-close cleanup remains tracked after
 the view disappears and exposes failures for retry without unregistering sleep protection.
+
+## GitHub App Connection Boundary
+
+The connection sheet sends the numeric GitHub App ID and the user-selected key file path through the
+authenticated broker pipe. Only `SymphonyCredentialBroker` opens that file. It validates an RSA
+private key, replaces the namespace's protected Keychain payload, and keeps the decoded key inside
+its explicitly cleared process memory.
+
+The broker signs short-lived RS256 GitHub App JWTs and performs installation discovery internally.
+For repository discovery it exchanges a JWT for an installation access token, uses that token only
+inside the helper, and returns repository descriptors to the desktop. JWTs and installation tokens
+are never written to application files, command lines, environment variables, or broker responses.
+Requests use GitHub's versioned REST API and bounded pagination and response frames.
+
+The desktop persists only the App ID, installation and account identities, and selected repository
+identity and URL in `namespaces.json`. It requires Issues read access and Contents write access for
+the initial Symphony workflow. A separate owner-only cleanup ledger makes connection rollback,
+setup cancellation, and disconnection credential deletion retryable without deleting a credential
+before the namespace metadata transaction commits.

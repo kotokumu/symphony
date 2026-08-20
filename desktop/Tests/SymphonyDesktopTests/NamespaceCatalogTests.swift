@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 
 @testable import SymphonyDesktopCore
@@ -125,5 +126,40 @@ final class NamespaceCatalogTests: XCTestCase {
     ) { error in
       XCTAssertEqual(error.localizedDescription, "The selected namespace no longer exists.")
     }
+  }
+
+  func testNamespaceAcceptsExactlyOnePlatformConnectionUntilDisconnected() throws {
+    var catalog = NamespaceCatalog()
+    let namespace = try catalog.create(named: "Research")
+    let connection = try githubConnection(repositoryID: 30, fullName: "octo/research")
+
+    try catalog.connect(namespace.id, to: .github(connection))
+
+    XCTAssertEqual(catalog.selectedNamespace?.platformConnection, .github(connection))
+    XCTAssertThrowsError(
+      try catalog.connect(
+        namespace.id,
+        to: .github(try githubConnection(repositoryID: 31, fullName: "octo/other"))
+      )
+    ) { error in
+      XCTAssertEqual(
+        error.localizedDescription,
+        "This namespace already has a platform connection. Disconnect it before connecting another platform."
+      )
+    }
+
+    XCTAssertEqual(try catalog.disconnectPlatform(namespace.id), .github(connection))
+    XCTAssertNil(catalog.selectedNamespace?.platformConnection)
+  }
+
+  private func githubConnection(repositoryID: Int64, fullName: String) throws -> GitHubConnection {
+    try GitHubConnection(
+      appID: 10,
+      installationID: 20,
+      accountLogin: "octo",
+      repositoryID: repositoryID,
+      repositoryFullName: fullName,
+      repositoryURL: URL(string: "https://github.com/\(fullName)")!
+    )
   }
 }

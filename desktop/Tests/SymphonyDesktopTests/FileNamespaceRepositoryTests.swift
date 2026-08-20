@@ -46,6 +46,41 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     XCTAssertFalse(directory.path.contains(namespace.name.value))
   }
 
+  func testPersistsGitHubConnectionAndMigratesVersionOneMetadata() async throws {
+    let repository = FileNamespaceRepository(storageDirectory: storageDirectory)
+    var catalog = NamespaceCatalog()
+    let namespace = try catalog.create(named: "Research")
+    try await repository.create(namespace, saving: catalog)
+    let connection = try GitHubConnection(
+      appID: 10,
+      installationID: 20,
+      accountLogin: "octo",
+      repositoryID: 30,
+      repositoryFullName: "octo/research",
+      repositoryURL: URL(string: "https://github.com/octo/research")!
+    )
+    try catalog.connect(namespace.id, to: .github(connection))
+    try await repository.save(catalog)
+
+    let connected = try await repository.load()
+
+    XCTAssertEqual(connected.selectedNamespace?.platformConnection, .github(connection))
+    let metadataURL = storageDirectory.appendingPathComponent("namespaces.json")
+    let oldNamespaceID = UUID()
+    let oldDirectory = repository.directoryURL(for: oldNamespaceID)
+    try FileManager.default.createDirectory(at: oldDirectory, withIntermediateDirectories: true)
+    try Data(
+      """
+      {"version":1,"namespaces":[{"id":"\(oldNamespaceID.uuidString)","name":"Legacy"}],"selectedID":"\(oldNamespaceID.uuidString)"}
+      """.utf8
+    ).write(to: metadataURL, options: .atomic)
+
+    let migrated = try await repository.load()
+
+    XCTAssertEqual(migrated.selectedNamespace?.name.value, "Legacy")
+    XCTAssertNil(migrated.selectedNamespace?.platformConnection)
+  }
+
   func testDoesNotOverwriteCorruptMetadata() async throws {
     let metadataURL = storageDirectory.appendingPathComponent("namespaces.json")
     let corruptData = Data("{not-json".utf8)
@@ -82,14 +117,14 @@ final class FileNamespaceRepositoryTests: XCTestCase {
 
   func testRejectsUnsupportedMetadataWithoutOverwritingIt() async throws {
     let metadataURL = storageDirectory.appendingPathComponent("namespaces.json")
-    let unsupportedData = Data("{\"version\":2,\"namespaces\":[],\"selectedID\":null}".utf8)
+    let unsupportedData = Data("{\"version\":3,\"namespaces\":[],\"selectedID\":null}".utf8)
     try unsupportedData.write(to: metadataURL)
     let repository = FileNamespaceRepository(storageDirectory: storageDirectory)
 
     await assertThrowsErrorAsync(try await repository.load()) { error in
       XCTAssertEqual(
         error.localizedDescription,
-        "Namespace data version 2 is not supported. The file was not changed."
+        "Namespace data version 3 is not supported. The file was not changed."
       )
     }
     XCTAssertEqual(try Data(contentsOf: metadataURL), unsupportedData)

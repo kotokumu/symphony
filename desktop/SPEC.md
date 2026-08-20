@@ -113,3 +113,29 @@ Symphony reports the failure and does not allow protected credentials to be unlo
 window-close cleanup remains visible and can be retried when the window is shown again. Stored
 credential deletion occurs only after the namespace deletion commits. A failed stored-credential
 cleanup is reported and retried without restoring the deleted namespace.
+
+---
+
+## 8. GitHub App Connection
+
+A namespace can connect to one platform. The first supported connection is one GitHub App
+installation and one repository. A user supplies the numeric GitHub App ID and selects its private
+key file, then chooses from the installations and repositories accessible to that app. Connection
+setup requires the namespace to be unlocked.
+
+The GitHub App private key is imported and used through the protected credential boundary. Symphony
+Desktop does not read or return the private key. GitHub App authentication and installation-token
+use during connection discovery remain inside that boundary. The connection is accepted only when
+the installation is active, can read issues, can write repository contents, and can access the
+selected repository. Missing permissions, suspended or revoked installations, inaccessible
+repositories, rejected credentials, and GitHub service failures produce actionable errors.
+
+The selected app identity, installation, account, and repository remain associated with the
+namespace's stable identity across application restarts and namespace renames. Stored private-key
+material remains namespace-scoped. Connecting, checking, or disconnecting one namespace does not
+grant access to or change another namespace.
+
+A user can check a saved connection after unlocking the namespace or disconnect it. Disconnection
+commits the removal of connection metadata before protected credential deletion. Failed credential
+cleanup is reported and retried, while the namespace remains disconnected. A failed connection save
+does not publish the connection and schedules cleanup of the imported credential.

@@ -1,4 +1,5 @@
 import Foundation
+import SymphonyCredentialBrokerProtocol
 import SymphonyDesktopCore
 
 public actor NamespaceCredentialBroker {
@@ -83,15 +84,32 @@ public actor NamespaceCredentialBroker {
   }
 
   public func signChallenge(_ challenge: Data, namespaceID: Namespace.ID) async throws -> Data {
-    guard
-      let session = sessions[namespaceID],
-      !lockingNamespaces.contains(namespaceID),
-      startSuspensionCount == 0,
-      !applicationTerminationRequested
-    else {
-      throw NamespaceCredentialBrokerError.locked
-    }
+    let session = try availableSession(namespaceID)
     return try await session.signChallenge(challenge)
+  }
+
+  public func configureGitHubApp(
+    appID: Int64,
+    privateKeyFileURL: URL,
+    namespaceID: Namespace.ID
+  ) async throws {
+    let session = try availableSession(namespaceID)
+    try await session.configureGitHubApp(appID: appID, privateKeyFileURL: privateKeyFileURL)
+  }
+
+  public func listGitHubInstallations(
+    namespaceID: Namespace.ID
+  ) async throws -> [GitHubInstallationDescriptor] {
+    let session = try availableSession(namespaceID)
+    return try await session.listGitHubInstallations()
+  }
+
+  public func listGitHubRepositories(
+    installationID: Int64,
+    namespaceID: Namespace.ID
+  ) async throws -> [GitHubRepositoryDescriptor] {
+    let session = try availableSession(namespaceID)
+    return try await session.listGitHubRepositories(installationID: installationID)
   }
 
   public func lockAll() async throws {
@@ -119,6 +137,10 @@ public actor NamespaceCredentialBroker {
     try await launcher.purge(namespaceID: namespaceID)
   }
 
+  public func removeGitHubAppCredential(namespaceID: Namespace.ID) async throws {
+    try await removeNamespace(namespaceID)
+  }
+
   public func isUnlocked(_ namespaceID: Namespace.ID) -> Bool {
     sessions[namespaceID] != nil
   }
@@ -138,6 +160,20 @@ public actor NamespaceCredentialBroker {
     guard failures.isEmpty else {
       throw NamespaceCredentialBrokerError.lockAllFailed(failures)
     }
+  }
+
+  private func availableSession(
+    _ namespaceID: Namespace.ID
+  ) throws -> any CredentialBrokerSessionHandle {
+    guard
+      let session = sessions[namespaceID],
+      !lockingNamespaces.contains(namespaceID),
+      startSuspensionCount == 0,
+      !applicationTerminationRequested
+    else {
+      throw NamespaceCredentialBrokerError.locked
+    }
+    return session
   }
 }
 

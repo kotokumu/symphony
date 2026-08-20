@@ -56,6 +56,30 @@ struct SymphonyCredentialBrokerMain {
             throw BrokerCommandError.missingPayload
           }
           write(CredentialBrokerResult.signature(try await session.signChallenge(challenge)))
+        case .configureGitHubApp:
+          guard let configuration = command.githubAppConfiguration else {
+            throw BrokerCommandError.missingPayload
+          }
+          try await session.configureGitHubApp(
+            appID: configuration.appID,
+            privateKeyFilePath: configuration.privateKeyFilePath
+          )
+          write(CredentialBrokerResult.githubAppConfigured)
+        case .listGitHubInstallations:
+          write(
+            CredentialBrokerResult.githubInstallations(
+              try await session.listGitHubInstallations()
+            )
+          )
+        case .listGitHubRepositories:
+          guard let installationID = command.installationID else {
+            throw BrokerCommandError.missingPayload
+          }
+          write(
+            CredentialBrokerResult.githubRepositories(
+              try await session.listGitHubRepositories(installationID: installationID)
+            )
+          )
         case .lock:
           await session.lock()
           write(CredentialBrokerResult.locked)

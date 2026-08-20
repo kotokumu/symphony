@@ -72,6 +72,27 @@ final class KeychainNamespaceCredentialStorageTests: XCTestCase {
     assertBaseQuery(deleteQuery, namespaceID: namespaceID)
   }
 
+  func testReplaceUpdatesOnlyProtectedValueWithTheAuthorizationContext() throws {
+    let keychain = RecordingNamespaceKeychain()
+    let storage = KeychainNamespaceCredentialStorage(keychain: keychain)
+    let namespaceID = UUID()
+    let authorization = NamespaceUnlockAuthorization(context: LAContext())
+
+    try storage.replace(
+      Data([4, 5, 6]),
+      namespaceID: namespaceID,
+      authorization: authorization
+    )
+
+    let (query, attributes) = try XCTUnwrap(keychain.updateQueries.first)
+    assertBaseQuery(query, namespaceID: namespaceID)
+    XCTAssertTrue(
+      query[kSecUseAuthenticationContext as String] as? LAContext === authorization.context
+    )
+    XCTAssertEqual(attributes.count, 1)
+    XCTAssertEqual(attributes[kSecValueData as String] as? Data, Data([4, 5, 6]))
+  }
+
   func testInvalidValueAndSecurityStatusesRemainVisible() throws {
     let namespaceID = UUID()
     let authorization = NamespaceUnlockAuthorization(context: LAContext())
@@ -182,6 +203,7 @@ private final class RecordingNamespaceKeychain: NamespaceKeychainAccessing, @unc
   private let accessControlError: Error?
   private(set) var copyQueries: [[String: Any]] = []
   private(set) var addQueries: [[String: Any]] = []
+  private(set) var updateQueries: [([String: Any], [String: Any])] = []
   private(set) var deleteQueries: [[String: Any]] = []
   private(set) var accessControlFlags: [SecAccessControlCreateFlags] = []
   private(set) var accessibilityMatchesThisDeviceOnly: [Bool] = []
@@ -225,6 +247,16 @@ private final class RecordingNamespaceKeychain: NamespaceKeychainAccessing, @unc
   func add(_ attributes: CFDictionary) -> OSStatus {
     addQueries.append(attributes as NSDictionary as! [String: Any])
     return addStatus
+  }
+
+  func update(_ query: CFDictionary, attributes: CFDictionary) -> OSStatus {
+    updateQueries.append(
+      (
+        query as NSDictionary as! [String: Any],
+        attributes as NSDictionary as! [String: Any]
+      )
+    )
+    return errSecSuccess
   }
 
   func delete(_ query: CFDictionary) -> OSStatus {

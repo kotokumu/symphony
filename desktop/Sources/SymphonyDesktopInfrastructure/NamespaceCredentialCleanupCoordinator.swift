@@ -15,7 +15,16 @@ public actor PendingCredentialCleanupStore {
   }
 
   public init(fileManager: FileManager = .default) throws {
+    try self.init(
+      fileName: "pending-credential-cleanup.json",
+      fileManager: fileManager
+    )
+  }
+
+  public init(fileName: String, fileManager: FileManager = .default) throws {
     guard
+      !fileName.isEmpty,
+      !fileName.contains("/"),
       let applicationSupport = fileManager.urls(
         for: .applicationSupportDirectory,
         in: .userDomainMask
@@ -25,7 +34,7 @@ public actor PendingCredentialCleanupStore {
     }
     fileURL = applicationSupport
       .appendingPathComponent("Symphony", isDirectory: true)
-      .appendingPathComponent("pending-credential-cleanup.json")
+      .appendingPathComponent(fileName)
     self.fileManager = fileManager
   }
 
@@ -73,6 +82,56 @@ public actor PendingCredentialCleanupStore {
     } catch {
       throw PendingCredentialCleanupError.saveFailed
     }
+  }
+}
+
+public actor GitHubCredentialCleanupCoordinator {
+  public typealias Purge = @Sendable (Namespace.ID) async throws -> Void
+
+  private let store: PendingCredentialCleanupStore
+  private let purge: Purge
+
+  public init(store: PendingCredentialCleanupStore, purge: @escaping Purge) {
+    self.store = store
+    self.purge = purge
+  }
+
+  public func reconcile(_ catalog: NamespaceCatalog) async throws {
+    var failures: [Namespace.ID: String] = [:]
+    for namespaceID in try await store.pendingNamespaceIDs() {
+      do {
+        let connectionExists = catalog.namespaces.first(where: { $0.id == namespaceID })?
+          .platformConnection != nil
+        if !connectionExists {
+          try await purge(namespaceID)
+        }
+        try await store.unmark(namespaceID)
+      } catch {
+        failures[namespaceID] = error.localizedDescription
+      }
+    }
+    guard failures.isEmpty else {
+      throw PendingCredentialCleanupError.cleanupFailed(failures)
+    }
+  }
+
+  public func cleanup(_ namespaceID: Namespace.ID) async throws -> String? {
+    try await store.mark(namespaceID)
+    do {
+      try await purge(namespaceID)
+      try await store.unmark(namespaceID)
+      return nil
+    } catch {
+      return "Protected GitHub credential cleanup is pending and will be retried: \(error.localizedDescription)"
+    }
+  }
+
+  public func setupStarted(_ namespaceID: Namespace.ID) async throws {
+    try await store.mark(namespaceID)
+  }
+
+  public func connectionCommitted(_ namespaceID: Namespace.ID) async throws {
+    try await store.unmark(namespaceID)
   }
 }
 

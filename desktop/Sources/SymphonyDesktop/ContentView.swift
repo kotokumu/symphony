@@ -1,15 +1,19 @@
 import SwiftUI
+import AppKit
 import SymphonyDesktopCore
+import SymphonyCredentialBrokerProtocol
 
 struct ContentView: View {
   @ObservedObject var controller: NamespaceController
   @ObservedObject var daemonController: NamespaceDaemonController
   @ObservedObject var authenticationController: CodexAuthenticationController
   @ObservedObject var lockController: NamespaceLockController
+  @ObservedObject var githubConnectionController: GitHubConnectionController
   @ObservedObject var windowSecurityCoordinator: NamespaceWindowSecurityCoordinator
 
   @State private var editor: NamespaceEditorContext?
   @State private var namespaceToDelete: DesktopNamespace?
+  @State private var githubSetupNamespace: DesktopNamespace?
   @State private var notice: NamespaceNotice?
 
   var body: some View {
@@ -49,6 +53,29 @@ struct ContentView: View {
           try await controller.renameNamespace(namespace.id, to: name)
         }
       }
+    }
+    .sheet(item: $githubSetupNamespace) { namespace in
+      GitHubConnectionSheet(
+        namespace: namespace,
+        controller: githubConnectionController,
+        connect: { repository in
+          try await githubConnectionController.connect(
+            repository,
+            namespaceID: namespace.id,
+            save: { connection in
+              try await controller.connectNamespace(namespace.id, to: connection)
+            }
+          )
+          githubSetupNamespace = nil
+        },
+        cancel: {
+          if let message = await githubConnectionController.cancelSetup(namespaceID: namespace.id) {
+            notice = .changeFailed(message)
+          }
+          githubSetupNamespace = nil
+        }
+      )
+      .interactiveDismissDisabled()
     }
     .alert(
       "Delete Namespace?",
@@ -143,6 +170,7 @@ struct ContentView: View {
           daemonState: daemonController.state(for: namespace.id),
           authenticationState: authenticationController.state(for: namespace.id),
           lockState: lockController.state(for: namespace.id),
+          githubConnectionState: githubConnectionController.state(for: namespace.id),
           start: {
             Task {
               await daemonController.start(namespace)
@@ -181,6 +209,30 @@ struct ContentView: View {
             Task {
               await reportErrors {
                 try await lockController.lock(namespace.id)
+              }
+            }
+          },
+          connectGitHub: {
+            githubSetupNamespace = namespace
+          },
+          checkGitHub: {
+            guard case .github(let connection) = namespace.platformConnection else { return }
+            Task {
+              await githubConnectionController.check(connection, namespaceID: namespace.id)
+            }
+          },
+          disconnectGitHub: {
+            Task {
+              await reportErrors {
+                let warning = try await githubConnectionController.disconnect(
+                  namespaceID: namespace.id,
+                  remove: {
+                    try await controller.disconnectNamespacePlatform(namespace.id)
+                  }
+                )
+                if let warning {
+                  notice = .cleanupPending(warning)
+                }
               }
             }
           },
@@ -268,7 +320,7 @@ private enum NamespaceNotice: Identifiable {
     case .changeFailed:
       "Namespace Change Failed"
     case .cleanupPending:
-      "Namespace Deleted; Cleanup Pending"
+      "Cleanup Pending"
     }
   }
 
@@ -308,6 +360,7 @@ private struct NamespaceDetailView: View {
   let daemonState: NamespaceDaemonState
   let authenticationState: CodexAuthenticationState
   let lockState: NamespaceLockState
+  let githubConnectionState: GitHubConnectionOperationState
   let start: () -> Void
   let stop: () -> Void
   let restart: () -> Void
@@ -315,43 +368,106 @@ private struct NamespaceDetailView: View {
   let signOut: () -> Void
   let unlock: () -> Void
   let lock: () -> Void
+  let connectGitHub: () -> Void
+  let checkGitHub: () -> Void
+  let disconnectGitHub: () -> Void
   let rename: () -> Void
   let delete: () -> Void
 
   var body: some View {
-    VStack(spacing: 16) {
-      Image(systemName: "square.stack.3d.up.fill")
-        .font(.system(size: 48, weight: .light))
+    ScrollView {
+      VStack(spacing: 16) {
+        Image(systemName: "square.stack.3d.up.fill")
+          .font(.system(size: 48, weight: .light))
+          .foregroundStyle(.secondary)
+          .accessibilityHidden(true)
+
+        Text(namespace.name.value)
+          .font(.title2.weight(.semibold))
+
+        daemonStatus
+
+        daemonControls
+
+        Divider()
+          .frame(maxWidth: 440)
+
+        credentialLockStatus
+
+        credentialLockControls
+
+        Divider()
+          .frame(maxWidth: 440)
+
+        githubConnectionStatus
+
+        githubConnectionControls
+
+        Divider()
+          .frame(maxWidth: 440)
+
+        authenticationStatus
+
+        authenticationControls
+
+        HStack {
+          Button("Rename…", action: rename)
+          Button("Delete…", role: .destructive, action: delete)
+        }
+      }
+      .padding(48)
+      .frame(maxWidth: .infinity)
+    }
+  }
+
+  @ViewBuilder
+  private var githubConnectionStatus: some View {
+    if case .github(let connection) = namespace.platformConnection {
+      VStack(spacing: 6) {
+        Label("GitHub connected", systemImage: "link.circle.fill")
+          .foregroundStyle(.green)
+        Text(connection.repositoryFullName)
+          .font(.body.monospaced())
+        Text("Installation for \(connection.accountLogin)")
+          .foregroundStyle(.secondary)
+      }
+    } else {
+      Label("GitHub not connected", systemImage: "link.badge.plus")
         .foregroundStyle(.secondary)
-        .accessibilityHidden(true)
+    }
 
-      Text(namespace.name.value)
-        .font(.title2.weight(.semibold))
-
-      daemonStatus
-
-      daemonControls
-
-      Divider()
+    switch githubConnectionState {
+    case .checking:
+      HStack(spacing: 8) {
+        ProgressView().controlSize(.small)
+        Text("Checking GitHub access…")
+      }
+      .foregroundStyle(.secondary)
+    case .verified:
+      Text("GitHub access verified")
+        .foregroundStyle(.green)
+    case .failed(let message):
+      Text(message)
+        .foregroundStyle(.red)
+        .multilineTextAlignment(.center)
         .frame(maxWidth: 440)
+    default:
+      EmptyView()
+    }
+  }
 
-      credentialLockStatus
-
-      credentialLockControls
-
-      Divider()
-        .frame(maxWidth: 440)
-
-      authenticationStatus
-
-      authenticationControls
-
+  @ViewBuilder
+  private var githubConnectionControls: some View {
+    if namespace.platformConnection == nil {
+      Button("Connect GitHub App…", action: connectGitHub)
+        .disabled(lockState != .unlocked)
+    } else {
       HStack {
-        Button("Rename…", action: rename)
-        Button("Delete…", role: .destructive, action: delete)
+        Button("Check Connection", action: checkGitHub)
+          .disabled(lockState != .unlocked || githubConnectionState == .checking)
+        Button("Disconnect", role: .destructive, action: disconnectGitHub)
       }
     }
-    .padding(48)
   }
 
   @ViewBuilder
@@ -512,6 +628,161 @@ private struct NamespaceDetailView: View {
     case .failed:
       Button("Restart Daemon", action: restart)
         .buttonStyle(.borderedProminent)
+    }
+  }
+}
+
+private struct GitHubConnectionSheet: View {
+  let namespace: DesktopNamespace
+  @ObservedObject var controller: GitHubConnectionController
+  let connect: (GitHubRepositoryDescriptor) async throws -> Void
+  let cancel: () async -> Void
+
+  @State private var appID = ""
+  @State private var privateKeyFileURL: URL?
+  @State private var selectedInstallationID: Int64?
+  @State private var selectedRepositoryID: Int64?
+  @State private var localError: String?
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 18) {
+      Text("Connect GitHub App")
+        .font(.title2.weight(.semibold))
+      Text("Configure a GitHub App for \(namespace.name.value), then choose one installation and one repository.")
+        .foregroundStyle(.secondary)
+
+      setupContent
+
+      if let localError {
+        Text(localError)
+          .foregroundStyle(.red)
+      }
+
+      HStack {
+        Button("Cancel") {
+          Task { await cancel() }
+        }
+        .disabled(controller.state(for: namespace.id) == .saving)
+        Spacer()
+        primaryAction
+      }
+    }
+    .padding(24)
+    .frame(width: 560)
+    .frame(minHeight: 330)
+  }
+
+  @ViewBuilder
+  private var setupContent: some View {
+    switch controller.state(for: namespace.id) {
+    case .idle, .failed:
+      Form {
+        TextField("GitHub App ID", text: $appID)
+        HStack {
+          Text(privateKeyFileURL?.lastPathComponent ?? "No private key selected")
+            .foregroundStyle(privateKeyFileURL == nil ? .secondary : .primary)
+          Spacer()
+          Button("Choose Private Key…", action: choosePrivateKey)
+        }
+      }
+      if case .failed(let message) = controller.state(for: namespace.id) {
+        Text(message)
+          .foregroundStyle(.red)
+      }
+    case .loadingInstallations:
+      progress("Authenticating the GitHub App…")
+    case .choosingInstallation(_, let installations):
+      Picker("Installation", selection: $selectedInstallationID) {
+        Text("Choose an installation").tag(Int64?.none)
+        ForEach(installations) { installation in
+          Text("\(installation.accountLogin) (\(installation.accountType))")
+            .tag(Optional(installation.id))
+        }
+      }
+    case .loadingRepositories:
+      progress("Loading accessible repositories…")
+    case .choosingRepository(_, let installation, let repositories):
+      VStack(alignment: .leading, spacing: 12) {
+        Text("Installation: \(installation.accountLogin)")
+          .foregroundStyle(.secondary)
+        Picker("Repository", selection: $selectedRepositoryID) {
+          Text("Choose a repository").tag(Int64?.none)
+          ForEach(repositories) { repository in
+            Text(repository.fullName).tag(Optional(repository.id))
+          }
+        }
+      }
+    case .saving:
+      progress("Saving the GitHub connection…")
+    case .checking, .verified:
+      EmptyView()
+    }
+  }
+
+  @ViewBuilder
+  private var primaryAction: some View {
+    switch controller.state(for: namespace.id) {
+    case .idle, .failed:
+      Button("Load Installations") {
+        guard let privateKeyFileURL else { return }
+        Task {
+          await controller.beginConnection(
+            namespaceID: namespace.id,
+            appIDText: appID,
+            privateKeyFileURL: privateKeyFileURL
+          )
+        }
+      }
+      .buttonStyle(.borderedProminent)
+      .disabled(appID.isEmpty || privateKeyFileURL == nil)
+    case .choosingInstallation(_, let installations):
+      Button("Load Repositories") {
+        guard let selectedInstallationID,
+          let installation = installations.first(where: { $0.id == selectedInstallationID })
+        else { return }
+        Task {
+          await controller.chooseInstallation(installation, namespaceID: namespace.id)
+        }
+      }
+      .buttonStyle(.borderedProminent)
+      .disabled(selectedInstallationID == nil)
+    case .choosingRepository(_, _, let repositories):
+      Button("Connect") {
+        guard let selectedRepositoryID,
+          let repository = repositories.first(where: { $0.id == selectedRepositoryID })
+        else { return }
+        Task {
+          do {
+            try await connect(repository)
+          } catch {
+            localError = error.localizedDescription
+          }
+        }
+      }
+      .buttonStyle(.borderedProminent)
+      .disabled(selectedRepositoryID == nil)
+    default:
+      EmptyView()
+    }
+  }
+
+  private func progress(_ title: String) -> some View {
+    HStack(spacing: 10) {
+      ProgressView()
+      Text(title)
+    }
+    .frame(maxWidth: .infinity, minHeight: 100)
+  }
+
+  private func choosePrivateKey() {
+    let panel = NSOpenPanel()
+    panel.title = "Choose GitHub App Private Key"
+    panel.prompt = "Choose"
+    panel.allowsMultipleSelection = false
+    panel.canChooseDirectories = false
+    panel.canChooseFiles = true
+    if panel.runModal() == .OK {
+      privateKeyFileURL = panel.url
     }
   }
 }
