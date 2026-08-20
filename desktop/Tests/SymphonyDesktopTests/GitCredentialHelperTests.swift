@@ -78,7 +78,7 @@ final class GitCredentialHelperTests: XCTestCase {
     let oversized = BrokerGitCredentialHelper.exchange(
       action: "get",
       input: Data(repeating: 0x61, count: CredentialBrokerProtocolLimits.maximumGitCredentialInputBytes + 1),
-      environment: ["SYMPHONY_GIT_HELPER_PORT": "1", "SYMPHONY_GIT_HELPER_NONCE": "nonce"]
+      environment: ["SYMPHONY_GIT_HELPER_FD": "3"]
     )
     XCTAssertNotEqual(oversized.status, 0)
     XCTAssertTrue(oversized.output.isEmpty)
@@ -111,9 +111,6 @@ final class GitCredentialHelperTests: XCTestCase {
   }
 
   private func helperEnvironment(_ server: PrivateGitCredentialServer) -> [String: String] {
-    [
-      "SYMPHONY_GIT_HELPER_PORT": String(server.port),
-      "SYMPHONY_GIT_HELPER_NONCE": server.nonce,
-    ]
+    server.helperEnvironment
   }
 }

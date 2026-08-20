@@ -34,7 +34,7 @@ final class GitHubRepositoryAPIClientTests: XCTestCase {
       token: lease.token
     )
 
-    XCTAssertEqual(response.status, 200)
+    XCTAssertEqual(response, .issueList([GitHubIssueRecord(number: 7)]))
     let requests = await transport.requests
     XCTAssertEqual(requests[0].url?.path, "/app/installations/20/access_tokens")
     let body = try XCTUnwrap(requests[0].httpBody)
@@ -94,6 +94,83 @@ final class GitHubRepositoryAPIClientTests: XCTestCase {
         XCTAssertFalse(error.failure.message.contains("secret-echo"))
       }
     }
+  }
+
+  func testRendersEveryTypedIssueOperationWithoutScopeOverrides() async throws {
+    let transport = RepositoryTransport(responses: [
+      .json(status: 200, body: #"{"number":7}"#),
+      .json(status: 200, body: "[]"),
+      .json(status: 201, body: #"{"id":70}"#),
+      .json(status: 200, body: #"{"number":7,"state":"open"}"#),
+      .json(status: 200, body: #"{"number":7,"state":"closed"}"#),
+    ])
+    let client = GitHubAppAPIClient(
+      baseURL: URL(string: "https://api.github.test")!,
+      transport: transport
+    )
+    let fixture = try makeScope()
+    let token = SecureSecretBuffer(copying: Data("token".utf8))
+    defer { token.clear() }
+    let operations: [GitHubIssueCapabilityRequest] = [
+      .getIssue(issueNumber: 7),
+      .listComments(issueNumber: 7, page: try GitHubPage(perPage: 50, page: 2)),
+      .createComment(issueNumber: 7, body: "hello"),
+      .setIssueState(issueNumber: 7, state: .open),
+      .setIssueState(issueNumber: 7, state: .closed),
+    ]
+    for operation in operations {
+      _ = try await client.performIssueRequest(operation, scope: fixture.scope, token: token)
+    }
+    let requests = await transport.requests
+    XCTAssertEqual(requests.map(\.httpMethod), ["GET", "GET", "POST", "PATCH", "PATCH"])
+    XCTAssertEqual(requests.map { $0.url?.path }, [
+      "/repos/octo/repo/issues/7",
+      "/repos/octo/repo/issues/7/comments",
+      "/repos/octo/repo/issues/7/comments",
+      "/repos/octo/repo/issues/7",
+      "/repos/octo/repo/issues/7",
+    ])
+    XCTAssertEqual(
+      URLComponents(url: requests[1].url!, resolvingAgainstBaseURL: false)?.query,
+      "per_page=50&page=2"
+    )
+    XCTAssertEqual(try jsonObject(requests[2]), ["body": "hello"])
+    XCTAssertEqual(try jsonObject(requests[3]), ["state": "open"])
+    XCTAssertEqual(try jsonObject(requests[4]), ["state": "closed"])
+    XCTAssertTrue(requests.allSatisfy {
+      $0.url?.absoluteString.contains("installation") == false
+        && $0.url?.absoluteString.contains("repository_id") == false
+    })
+  }
+
+  func testMapsRepositoryScopedTokenMintFailures() async throws {
+    let fixture = try makeScope()
+    let cases: [(Int, GitHubCapabilityFailure.Category)] = [
+      (401, .appCredentialRejected),
+      (404, .installationRevoked),
+      (422, .repositoryUnavailable),
+    ]
+    for (status, category) in cases {
+      let transport = RepositoryTransport(responses: [
+        .init(status: status, headers: [:], data: Data("ignored".utf8))
+      ])
+      let client = GitHubAppAPIClient(
+        baseURL: URL(string: "https://api.github.test")!,
+        transport: transport
+      )
+      do {
+        _ = try await client.mintInstallationToken(scope: fixture.scope, jwt: "jwt")
+        XCTFail("Expected mint failure for HTTP \(status)")
+      } catch let error as GitHubRepositoryAPIError {
+        XCTAssertEqual(error.failure.category, category)
+      }
+    }
+  }
+
+  private func jsonObject(_ request: URLRequest) throws -> [String: String] {
+    try XCTUnwrap(
+      JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: String]
+    )
   }
 
   private func makeScope() throws -> (root: URL, scope: AuthorizedGitHubRepositoryScope) {

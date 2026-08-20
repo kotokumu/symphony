@@ -32,12 +32,20 @@ protocol GitHubRepositoryAPIRequesting: Sendable {
 }
 
 actor NamespaceGitHubAccessSession {
+  typealias JWTProvider = @Sendable () async throws -> String
+
+  private struct TrackedAPIOperation: Sendable {
+    let cancel: @Sendable () -> Void
+    let wait: @Sendable () async -> Void
+  }
   private let api: any GitHubRepositoryAPIRequesting
   private let now: @Sendable () -> Date
   private let git: any ScopedGitRunning
   private var scope: AuthorizedGitHubRepositoryScope?
   private var lease: InstallationTokenLease?
   private var generation = UUID()
+  private var apiOperations: [UUID: TrackedAPIOperation] = [:]
+  private var quiescing = false
 
   init(
     api: any GitHubRepositoryAPIRequesting,
@@ -53,6 +61,7 @@ actor NamespaceGitHubAccessSession {
     _ authorization: GitHubRepositoryAuthorization,
     storedAppID: Int64
   ) throws {
+    guard !quiescing else { throw GitHubRepositoryAccessError.locked }
     let candidate = try AuthorizedGitHubRepositoryScope(
       authorization,
       storedAppID: storedAppID
@@ -67,38 +76,35 @@ actor NamespaceGitHubAccessSession {
 
   func performIssueRequest(
     _ request: GitHubIssueCapabilityRequest,
-    jwt: String?
+    jwtProvider: @escaping JWTProvider
   ) async throws -> GitHubIssueCapabilityResponse {
-    guard let scope else { throw GitHubRepositoryAccessError.locked }
+    guard let scope, !quiescing else { throw GitHubRepositoryAccessError.locked }
     let operationGeneration = generation
     let token = try await installationToken(
       scope: scope,
-      jwt: jwt,
+      jwtProvider: jwtProvider,
       generation: operationGeneration
     )
     do {
-      let response = try await api.performIssueRequest(request, scope: scope, token: token)
+      let response = try await trackedAPIRequest {
+        try await self.api.performIssueRequest(request, scope: scope, token: token)
+      }
       try requireCurrent(operationGeneration, scope: scope)
-      return GitHubIssueCapabilityResponse(
-        status: response.status,
-        body: token.redacting(response.body)
-      )
+      return response.redacting(token)
     } catch let error as GitHubRepositoryAPIError {
       if error.invalidatesLease { clearLease() }
       if error.shouldRetryGET, request.isReadOperation {
-        guard let jwt else { throw error }
         let replacement = try await refreshToken(
           scope: scope,
-          jwt: jwt,
+          jwt: try await jwtProvider(),
           generation: operationGeneration
         )
         do {
-          let response = try await api.performIssueRequest(request, scope: scope, token: replacement)
+          let response = try await trackedAPIRequest {
+            try await self.api.performIssueRequest(request, scope: scope, token: replacement)
+          }
           try requireCurrent(operationGeneration, scope: scope)
-          return GitHubIssueCapabilityResponse(
-            status: response.status,
-            body: replacement.redacting(response.body)
-          )
+          return response.redacting(replacement)
         } catch let retryError as GitHubRepositoryAPIError {
           if retryError.invalidatesLease { clearLease() }
           throw retryError.afterRetry
@@ -108,23 +114,31 @@ actor NamespaceGitHubAccessSession {
     }
   }
 
-  func clear() {
+  func performIssueRequest(
+    _ request: GitHubIssueCapabilityRequest,
+    jwt: String
+  ) async throws -> GitHubIssueCapabilityResponse {
+    try await performIssueRequest(request) { jwt }
+  }
+
+  private func clear() {
     generation = UUID()
     clearLease()
     scope = nil
+    quiescing = false
   }
 
   func performGitOperation(
     _ request: GitRepositoryCapabilityRequest,
-    jwt: String
+    jwtProvider: @escaping JWTProvider
   ) async throws -> GitRepositoryCapabilityResult {
-    guard let scope else { throw GitHubRepositoryAccessError.locked }
+    guard let scope, !quiescing else { throw GitHubRepositoryAccessError.locked }
     let operationGeneration = generation
     do {
       return try await git.run(request, in: scope) {
         try await self.operationCredential(
           scope: scope,
-          jwt: jwt,
+          jwtProvider: jwtProvider,
           generation: operationGeneration
         )
       }
@@ -148,8 +162,29 @@ actor NamespaceGitHubAccessSession {
     }
   }
 
+  func performGitOperation(
+    _ request: GitRepositoryCapabilityRequest,
+    jwt: String
+  ) async throws -> GitRepositoryCapabilityResult {
+    try await performGitOperation(request) { jwt }
+  }
+
   func stopRetainedGitOperation() async throws {
     try await git.stopRetainedOperation()
+  }
+
+  func quiesceAndClear() async throws {
+    quiescing = true
+    generation = UUID()
+    let operations = Array(apiOperations.values)
+    operations.forEach { $0.cancel() }
+    for operation in operations { await operation.wait() }
+    do {
+      try await git.stopRetainedOperation()
+    } catch {
+      throw error
+    }
+    clear()
   }
 
   var hasAuthorizedScope: Bool { scope != nil }
@@ -158,13 +193,16 @@ actor NamespaceGitHubAccessSession {
 
   private func installationToken(
     scope: AuthorizedGitHubRepositoryScope,
-    jwt: String?,
+    jwtProvider: @escaping JWTProvider,
     generation: UUID
   ) async throws -> SecureSecretBuffer {
     try requireCurrent(generation, scope: scope)
     if let lease, lease.isUsable(at: now()) { return lease.token }
-    guard let jwt else { throw GitHubRepositoryAccessError.locked }
-    return try await refreshToken(scope: scope, jwt: jwt, generation: generation)
+    return try await refreshToken(
+      scope: scope,
+      jwt: try await jwtProvider(),
+      generation: generation
+    )
   }
 
   private func refreshToken(
@@ -173,7 +211,9 @@ actor NamespaceGitHubAccessSession {
     generation: UUID
   ) async throws -> SecureSecretBuffer {
     clearLease()
-    let minted = try await api.mintInstallationToken(scope: scope, jwt: jwt)
+    let minted = try await trackedAPIRequest {
+      try await self.api.mintInstallationToken(scope: scope, jwt: jwt)
+    }
     do {
       try requireCurrent(generation, scope: scope)
     } catch {
@@ -186,10 +226,14 @@ actor NamespaceGitHubAccessSession {
 
   private func operationCredential(
     scope: AuthorizedGitHubRepositoryScope,
-    jwt: String,
+    jwtProvider: @escaping JWTProvider,
     generation: UUID
   ) async throws -> OperationCredential {
-    let token = try await installationToken(scope: scope, jwt: jwt, generation: generation)
+    let token = try await installationToken(
+      scope: scope,
+      jwtProvider: jwtProvider,
+      generation: generation
+    )
     try requireCurrent(generation, scope: scope)
     return OperationCredential(copying: token)
   }
@@ -206,6 +250,58 @@ actor NamespaceGitHubAccessSession {
   private func clearLease() {
     lease?.clear()
     lease = nil
+  }
+
+  private func trackedAPIRequest<Value: Sendable>(
+    _ operation: @escaping @Sendable () async throws -> Value
+  ) async throws -> Value {
+    guard !quiescing else { throw GitHubRepositoryAccessError.locked }
+    let id = UUID()
+    let task = Task { try await operation() }
+    apiOperations[id] = TrackedAPIOperation(
+      cancel: { task.cancel() },
+      wait: { _ = try? await task.value }
+    )
+    defer { apiOperations.removeValue(forKey: id) }
+    return try await task.value
+  }
+}
+
+private extension GitHubIssueCapabilityResponse {
+  func redacting(_ token: SecureSecretBuffer) -> GitHubIssueCapabilityResponse {
+    func text(_ value: String?) -> String? {
+      guard let value else { return nil }
+      return String(decoding: token.redacting(Data(value.utf8)), as: UTF8.self)
+    }
+    func issue(_ value: GitHubIssueRecord) -> GitHubIssueRecord {
+      GitHubIssueRecord(
+        number: value.number,
+        title: text(value.title),
+        body: text(value.body),
+        state: value.state,
+        htmlURL: value.htmlURL,
+        authorLogin: text(value.authorLogin),
+        labels: value.labels.compactMap { text($0) },
+        assigneeLogins: value.assigneeLogins.compactMap { text($0) }
+      )
+    }
+    func comment(_ value: GitHubIssueCommentRecord) -> GitHubIssueCommentRecord {
+      GitHubIssueCommentRecord(
+        id: value.id,
+        body: text(value.body),
+        htmlURL: value.htmlURL,
+        authorLogin: text(value.authorLogin),
+        createdAt: value.createdAt,
+        updatedAt: value.updatedAt
+      )
+    }
+    switch self {
+    case .issueList(let values): return .issueList(values.map(issue))
+    case .issue(let value): return .issue(issue(value))
+    case .comments(let values): return .comments(values.map(comment))
+    case .comment(let value): return .comment(comment(value))
+    case .stateChanged(let value): return .stateChanged(issue(value))
+    }
   }
 }
 
@@ -254,11 +350,18 @@ public enum GitHubRepositoryAPIError: Error, Sendable {
   func forRequest(_ request: GitHubIssueCapabilityRequest) -> GitHubRepositoryAPIError {
     switch self {
     case .failure(let failure, let invalidates, let retry):
-      guard failure.category == .authExpired, !request.isReadOperation else { return self }
+      guard !request.isReadOperation else { return self }
+      let ambiguousCategories: Set<GitHubCapabilityFailure.Category> = [
+        .authExpired, .networkUnavailable, .timedOut, .serviceUnavailable,
+        .invalidServiceResponse,
+      ]
+      guard ambiguousCategories.contains(failure.category) else { return self }
       return .failure(
         GitHubCapabilityFailure(
-          category: .ambiguousMutationAuthenticationFailure,
-          message: "GitHub authentication failed after the mutation was dispatched. Inspect the issue before retrying.",
+          category: failure.category == .authExpired
+            ? .ambiguousMutationAuthenticationFailure
+            : .ambiguousMutationFailure,
+          message: "The GitHub mutation may have completed before its result became unavailable. Inspect the issue before retrying.",
           status: failure.status,
           effectMayHaveOccurred: true
         ),

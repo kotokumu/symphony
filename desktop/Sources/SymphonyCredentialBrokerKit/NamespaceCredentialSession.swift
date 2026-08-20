@@ -28,7 +28,9 @@ public actor NamespaceCredentialSession {
     self.storage = storage
     self.credentialGenerator = credentialGenerator
     self.githubAPI = githubAPI
-    githubAccess = NamespaceGitHubAccessSession(api: GitHubAppAPIClient())
+    githubAccess = NamespaceGitHubAccessSession(
+      api: (githubAPI as? any GitHubRepositoryAPIRequesting) ?? GitHubAppAPIClient()
+    )
   }
 
   init(
@@ -90,8 +92,7 @@ public actor NamespaceCredentialSession {
   }
 
   public func lock() async throws {
-    try await githubAccess.stopRetainedGitOperation()
-    await githubAccess.clear()
+    try await githubAccess.quiesceAndClear()
     credential?.clear()
     credential = nil
     authorization?.invalidate()
@@ -121,7 +122,7 @@ public actor NamespaceCredentialSession {
     guard let authorization, credential != nil else {
       throw NamespaceCredentialSessionError.locked
     }
-    await githubAccess.clear()
+    try await githubAccess.quiesceAndClear()
     var pemData = try Self.readPrivateKey(at: privateKeyFilePath)
     defer { pemData.resetBytes(in: pemData.startIndex..<pemData.endIndex) }
     var githubCredential = try StoredGitHubAppCredential(appID: appID, pemData: pemData)
@@ -159,19 +160,36 @@ public actor NamespaceCredentialSession {
   public func authorizeGitHubRepository(
     _ authorization: GitHubRepositoryAuthorization
   ) async throws {
+    let repositories = try await githubAPI.listRepositories(
+      installationID: authorization.installationID,
+      jwt: githubJWT()
+    )
+    guard repositories.contains(where: {
+      $0.id == authorization.repositoryID
+        && $0.fullName.caseInsensitiveCompare(authorization.repositoryFullName) == .orderedSame
+        && $0.htmlURL == authorization.repositoryURL
+    }) else {
+      throw GitHubRepositoryAccessError.unauthorizedScope
+    }
     try await githubAccess.authorize(authorization, storedAppID: try githubCredentialAppID())
   }
 
   public func performGitHubIssueRequest(
     _ request: GitHubIssueCapabilityRequest
   ) async throws -> GitHubIssueCapabilityResponse {
-    try await githubAccess.performIssueRequest(request, jwt: githubJWT())
+    try await githubAccess.performIssueRequest(request) { [weak self] in
+      guard let self else { throw NamespaceCredentialSessionError.locked }
+      return try await self.githubJWT()
+    }
   }
 
   public func performGitHubGitOperation(
     _ request: GitRepositoryCapabilityRequest
   ) async throws -> GitRepositoryCapabilityResult {
-    try await githubAccess.performGitOperation(request, jwt: githubJWT())
+    try await githubAccess.performGitOperation(request) { [weak self] in
+      guard let self else { throw NamespaceCredentialSessionError.locked }
+      return try await self.githubJWT()
+    }
   }
 
   var retainedByteCount: Int {

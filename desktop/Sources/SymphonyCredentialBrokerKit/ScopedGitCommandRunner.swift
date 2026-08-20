@@ -52,6 +52,9 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     let server: PrivateGitCredentialServer
     let credential: OperationCredential
     let temporaryDirectory: URL
+    let plan: ValidatedGitOperationPlan
+    let cloneTargetIdentity: FileIdentity?
+    let scope: AuthorizedGitHubRepositoryScope
   }
 
   private let policy: GitRepositoryTrustPolicy
@@ -60,6 +63,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
   private let operationTimeout: TimeInterval
   private let stopTimeout: TimeInterval
   private let wrapsGitInBrokerExecutable: Bool
+  private let beforeLaunch: @Sendable () async -> Void
   private let lock = NSLock()
   private var active: RetainedRuntime?
   private var retained: RetainedRuntime?
@@ -72,7 +76,8 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     brokerExecutableURL: URL = URL(fileURLWithPath: CommandLine.arguments[0]),
     operationTimeout: TimeInterval = 300,
     stopTimeout: TimeInterval = 0.75,
-    wrapsGitInBrokerExecutable: Bool = true
+    wrapsGitInBrokerExecutable: Bool = true,
+    beforeLaunch: @escaping @Sendable () async -> Void = {}
   ) {
     self.policy = policy
     self.gitExecutableURL = gitExecutableURL
@@ -80,6 +85,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     self.operationTimeout = operationTimeout
     self.stopTimeout = stopTimeout
     self.wrapsGitInBrokerExecutable = wrapsGitInBrokerExecutable
+    self.beforeLaunch = beforeLaunch
   }
 
   func run(
@@ -112,7 +118,39 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       throw error
     }
 
-    let server = try PrivateGitCredentialServer(scope: scope, credential: credential)
+    let isolated: (environment: [String: String], temporaryDirectory: URL)
+    do {
+      isolated = try isolatedEnvironment()
+    } catch {
+      credential.clear()
+      throw error
+    }
+    let cloneTargetIdentity: FileIdentity?
+    do {
+      cloneTargetIdentity = try prepareCloneTarget(plan)
+    } catch {
+      credential.clear()
+      try? FileManager.default.removeItem(at: isolated.temporaryDirectory)
+      throw error
+    }
+    await beforeLaunch()
+    do {
+      try requireAdmission()
+    } catch {
+      credential.clear()
+      try? cleanupFailedClone(plan, expectedIdentity: cloneTargetIdentity, scope: scope)
+      try? FileManager.default.removeItem(at: isolated.temporaryDirectory)
+      throw error
+    }
+    let server: PrivateGitCredentialServer
+    do {
+      server = try PrivateGitCredentialServer(scope: scope, credential: credential)
+    } catch {
+      credential.clear()
+      try? cleanupFailedClone(plan, expectedIdentity: cloneTargetIdentity, scope: scope)
+      try? FileManager.default.removeItem(at: isolated.temporaryDirectory)
+      throw error
+    }
     let serverTask = Task.detached { server.serve() }
     let process = Process()
     let output = Pipe()
@@ -121,17 +159,21 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     process.arguments = wrapsGitInBrokerExecutable
       ? ["git-runner", gitExecutableURL.path] + arguments
       : arguments
-    let isolated = try isolatedEnvironment(server: server)
     process.environment = isolated.environment
-    process.standardInput = FileHandle.nullDevice
+    process.standardInput = server.clientHandle
     process.standardOutput = output
     process.standardError = output
     do {
       try process.run()
+      if !wrapsGitInBrokerExecutable {
+        _ = Darwin.setpgid(process.processIdentifier, process.processIdentifier)
+      }
+      server.closeClientCopy()
     } catch {
       server.stop()
       _ = await serverTask.value
       credential.clear()
+      try? cleanupFailedClone(plan, expectedIdentity: cloneTargetIdentity, scope: scope)
       try? FileManager.default.removeItem(at: isolated.temporaryDirectory)
       throw GitCommandRunnerError.launchFailed
     }
@@ -140,9 +182,26 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       process: processReference,
       server: server,
       credential: credential,
-      temporaryDirectory: isolated.temporaryDirectory
+      temporaryDirectory: isolated.temporaryDirectory,
+      plan: plan,
+      cloneTargetIdentity: cloneTargetIdentity,
+      scope: scope
     )
-    lock.withLock { active = ownedRuntime }
+    let stopAfterLaunch = lock.withLock { () -> Bool in
+      active = ownedRuntime
+      return stopRequested
+    }
+    if stopAfterLaunch {
+      do {
+        try await stop(processReference)
+      } catch {
+        lock.withLock {
+          active = nil
+          retained = ownedRuntime
+        }
+        throw GitCommandRunnerError.cleanupRequired
+      }
+    }
     let collector = GitOutputCollector(
       handle: output.fileHandleForReading,
       maximumBytes: CredentialBrokerProtocolLimits.maximumGitOutputBytes
@@ -150,11 +209,11 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     let reader = Task.detached { collector.readToEnd() }
     let deadline = ContinuousClock.now.advanced(by: .milliseconds(Int64(operationTimeout * 1_000)))
     var timedOut = false
-    while processReference.isRunning, ContinuousClock.now < deadline, !collector.exceededLimit {
+    while processReference.groupExists, ContinuousClock.now < deadline, !collector.exceededLimit {
       if Task.isCancelled { break }
       try? await Task.sleep(for: .milliseconds(20))
     }
-    if processReference.isRunning {
+    if processReference.groupExists {
       timedOut = ContinuousClock.now >= deadline
       do {
         try await stop(processReference)
@@ -179,7 +238,12 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     lock.withLock { active = nil }
 
     if collector.exceededLimit || timedOut || Task.isCancelled || erased || status != 0 {
-      try cleanupFailedClone(plan, scope: scope)
+      do {
+        try cleanupFailedClone(plan, expectedIdentity: cloneTargetIdentity, scope: scope)
+      } catch {
+        lock.withLock { retained = ownedRuntime }
+        throw error
+      }
     }
     if collector.exceededLimit { throw GitCommandRunnerError.outputTooLarge(sanitized) }
     if timedOut || Task.isCancelled { throw GitCommandRunnerError.timedOut }
@@ -209,9 +273,14 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       throw GitCommandRunnerError.cleanupRequired
     }
     if let retained = lock.withLock({ self.retained }) {
-      guard !retained.process.isRunning else { throw GitCommandRunnerError.cleanupRequired }
+      guard !retained.process.groupExists else { throw GitCommandRunnerError.cleanupRequired }
       retained.server.stop()
       retained.credential.clear()
+      try cleanupFailedClone(
+        retained.plan,
+        expectedIdentity: retained.cloneTargetIdentity,
+        scope: retained.scope
+      )
       try? FileManager.default.removeItem(at: retained.temporaryDirectory)
     }
     lock.withLock {
@@ -241,13 +310,14 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     ] + operationArguments
   }
 
-  private func isolatedEnvironment(
-    server: PrivateGitCredentialServer
-  ) throws -> (environment: [String: String], temporaryDirectory: URL) {
+  private func isolatedEnvironment() throws -> (environment: [String: String], temporaryDirectory: URL) {
     let directory = FileManager.default.temporaryDirectory
       .appendingPathComponent("symphony-git-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
-    guard chmod(directory.path, S_IRWXU) == 0 else { throw GitCommandRunnerError.launchFailed }
+    guard chmod(directory.path, S_IRWXU) == 0 else {
+      try? FileManager.default.removeItem(at: directory)
+      throw GitCommandRunnerError.launchFailed
+    }
     return ([
       "PATH": "/usr/bin:/bin",
       "HOME": directory.path,
@@ -257,13 +327,11 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       "GIT_CONFIG_GLOBAL": "/dev/null",
       "GIT_TERMINAL_PROMPT": "0",
       "GIT_ASKPASS": "/usr/bin/false",
-      "SYMPHONY_GIT_HELPER_PORT": String(server.port),
-      "SYMPHONY_GIT_HELPER_NONCE": server.nonce,
     ], directory)
   }
 
   private func stop(_ process: GitProcessReference) async throws {
-    guard process.isRunning else { return }
+    guard process.groupExists else { return }
     process.terminateGroup(SIGTERM)
     if await waitForExit(process, timeout: stopTimeout) { return }
     process.terminateGroup(SIGKILL)
@@ -274,10 +342,10 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
 
   private func waitForExit(_ process: GitProcessReference, timeout: TimeInterval) async -> Bool {
     let deadline = ContinuousClock.now.advanced(by: .milliseconds(Int64(timeout * 1_000)))
-    while process.isRunning, ContinuousClock.now < deadline {
+    while process.groupExists, ContinuousClock.now < deadline {
       try? await Task.sleep(for: .milliseconds(20))
     }
-    return !process.isRunning
+    return !process.groupExists
   }
 
   private func shellQuote(_ value: String) -> String {
@@ -288,11 +356,24 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     guard !lock.withLock({ stopRequested }) else { throw CancellationError() }
   }
 
+  private func prepareCloneTarget(_ plan: ValidatedGitOperationPlan) throws -> FileIdentity? {
+    guard case .clone = plan.request else { return nil }
+    guard mkdir(plan.targetURL.path, S_IRWXU) == 0 else {
+      throw GitCommandRunnerError.launchFailed
+    }
+    var information = stat()
+    guard lstat(plan.targetURL.path, &information) == 0,
+      information.st_mode & S_IFMT == S_IFDIR
+    else { throw GitCommandRunnerError.cleanupRequired }
+    return FileIdentity(device: UInt64(information.st_dev), inode: UInt64(information.st_ino))
+  }
+
   private func cleanupFailedClone(
     _ plan: ValidatedGitOperationPlan,
+    expectedIdentity: FileIdentity?,
     scope: AuthorizedGitHubRepositoryScope
   ) throws {
-    guard case .clone = plan.request,
+    guard case .clone = plan.request, let expectedIdentity,
       FileManager.default.fileExists(atPath: plan.targetURL.path)
     else { return }
     var root = stat()
@@ -301,6 +382,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       FileIdentity(device: UInt64(root.st_dev), inode: UInt64(root.st_ino)) == plan.rootIdentity,
       lstat(plan.targetURL.path, &target) == 0,
       target.st_mode & S_IFMT == S_IFDIR,
+      FileIdentity(device: UInt64(target.st_dev), inode: UInt64(target.st_ino)) == expectedIdentity,
       plan.targetURL.deletingLastPathComponent().standardizedFileURL == scope.workspacesRoot
     else { throw GitCommandRunnerError.cleanupRequired }
     do {
@@ -315,6 +397,10 @@ private final class GitProcessReference: @unchecked Sendable {
   private let process: Process
   init(_ process: Process) { self.process = process }
   var isRunning: Bool { process.isRunning }
+  var groupExists: Bool {
+    let result = Darwin.kill(-process.processIdentifier, 0)
+    return result == 0 || errno == EPERM
+  }
   var terminationStatus: Int32 { process.terminationStatus }
   func terminateGroup(_ signal: Int32) {
     if Darwin.kill(-process.processIdentifier, signal) != 0 {
@@ -390,20 +476,63 @@ enum GitCommandRunnerError: LocalizedError, Sendable {
 }
 
 private struct GitCredentialWireRequest: Codable {
-  let nonce: String
   let action: String
   let input: Data
+
+  init(action: String, input: Data) {
+    self.action = action
+    self.input = input
+  }
+
+  init(from decoder: any Decoder) throws {
+    let values = try decoder.container(keyedBy: AnyWireCodingKey.self)
+    guard Set(values.allKeys.map(\.stringValue)) == Set(CodingKeys.allCases.map(\.stringValue)) else {
+      throw GitCommandRunnerError.authenticationRejected
+    }
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    self.init(
+      action: try container.decode(String.self, forKey: .action),
+      input: try container.decode(Data.self, forKey: .input)
+    )
+  }
+
+  private enum CodingKeys: String, CodingKey, CaseIterable { case action, input }
 }
 
 private struct GitCredentialWireResponse: Codable {
   let succeeded: Bool
   let output: Data
+
+  init(succeeded: Bool, output: Data) {
+    self.succeeded = succeeded
+    self.output = output
+  }
+
+  init(from decoder: any Decoder) throws {
+    let values = try decoder.container(keyedBy: AnyWireCodingKey.self)
+    guard Set(values.allKeys.map(\.stringValue)) == Set(CodingKeys.allCases.map(\.stringValue)) else {
+      throw GitCommandRunnerError.authenticationRejected
+    }
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    self.init(
+      succeeded: try container.decode(Bool.self, forKey: .succeeded),
+      output: try container.decode(Data.self, forKey: .output)
+    )
+  }
+
+  private enum CodingKeys: String, CodingKey, CaseIterable { case succeeded, output }
+}
+
+private struct AnyWireCodingKey: CodingKey {
+  let stringValue: String
+  let intValue: Int?
+  init?(stringValue: String) { self.stringValue = stringValue; intValue = nil }
+  init?(intValue: Int) { stringValue = String(intValue); self.intValue = intValue }
 }
 
 final class PrivateGitCredentialServer: @unchecked Sendable {
-  let port: UInt16
-  let nonce: String
   private let descriptor: Int32
+  let clientHandle: FileHandle
   private let scope: AuthorizedGitHubRepositoryScope
   private let credential: OperationCredential
   private let stateLock = NSLock()
@@ -413,54 +542,43 @@ final class PrivateGitCredentialServer: @unchecked Sendable {
   init(scope: AuthorizedGitHubRepositoryScope, credential: OperationCredential) throws {
     self.scope = scope
     self.credential = credential
-    nonce = UUID().uuidString + UUID().uuidString
-    let listeningDescriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
-    guard listeningDescriptor >= 0 else { throw GitCommandRunnerError.launchFailed }
-    var address = sockaddr_in()
-    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-    address.sin_family = sa_family_t(AF_INET)
-    address.sin_port = 0
-    address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
-    let bound = withUnsafePointer(to: &address) {
-      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        Darwin.bind(listeningDescriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-      }
-    }
-    guard bound == 0, Darwin.listen(listeningDescriptor, 8) == 0 else {
-      Darwin.close(listeningDescriptor)
+    var descriptors: [Int32] = [-1, -1]
+    guard Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors) == 0 else {
       throw GitCommandRunnerError.launchFailed
     }
-    var actual = sockaddr_in()
-    var length = socklen_t(MemoryLayout<sockaddr_in>.size)
-    let named = withUnsafeMutablePointer(to: &actual) {
-      $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        Darwin.getsockname(listeningDescriptor, $0, &length)
-      }
-    }
-    guard named == 0 else {
-      Darwin.close(listeningDescriptor)
+    var enabled: Int32 = 1
+    guard setsockopt(
+      descriptors[0], SOL_SOCKET, SO_NOSIGPIPE, &enabled, socklen_t(MemoryLayout<Int32>.size)
+    ) == 0,
+      setsockopt(
+        descriptors[1], SOL_SOCKET, SO_NOSIGPIPE, &enabled, socklen_t(MemoryLayout<Int32>.size)
+      ) == 0
+    else {
+      Darwin.close(descriptors[0])
+      Darwin.close(descriptors[1])
       throw GitCommandRunnerError.launchFailed
     }
-    descriptor = listeningDescriptor
-    port = UInt16(bigEndian: actual.sin_port)
+    descriptor = descriptors[0]
+    clientHandle = FileHandle(fileDescriptor: descriptors[1], closeOnDealloc: true)
   }
 
   var authenticationWasRejected: Bool { stateLock.withLock { rejected } }
 
+  var helperEnvironment: [String: String] {
+    ["SYMPHONY_GIT_HELPER_FD": String(clientHandle.fileDescriptor)]
+  }
+
   func serve() {
     while !stateLock.withLock({ stopped }) {
-      let client = Darwin.accept(descriptor, nil, nil)
-      if client < 0 { break }
-      defer { Darwin.close(client) }
       do {
-        let data = try SocketLine.read(client, maximumBytes: 32_768, timeoutMilliseconds: 5_000)
+        let data = try SocketLine.read(descriptor, maximumBytes: 32_768, timeoutMilliseconds: 5_000)
         let request = try JSONDecoder().decode(GitCredentialWireRequest.self, from: data)
-        guard request.nonce == nonce else { throw GitCommandRunnerError.authenticationRejected }
         let response = try conversation(action: request.action, input: request.input)
-        try SocketLine.write(JSONEncoder().encode(response), to: client)
+        try SocketLine.write(JSONEncoder().encode(response), to: descriptor)
       } catch {
+        if stateLock.withLock({ stopped }) { break }
         let response = GitCredentialWireResponse(succeeded: false, output: Data())
-        try? SocketLine.write(JSONEncoder().encode(response), to: client)
+        try? SocketLine.write(JSONEncoder().encode(response), to: descriptor)
       }
     }
   }
@@ -472,6 +590,10 @@ final class PrivateGitCredentialServer: @unchecked Sendable {
       Darwin.shutdown(descriptor, SHUT_RDWR)
       Darwin.close(descriptor)
     }
+  }
+
+  func closeClientCopy() {
+    try? clientHandle.close()
   }
 
   private func conversation(action: String, input: Data) throws -> GitCredentialWireResponse {
@@ -544,27 +666,13 @@ public enum BrokerGitCredentialHelper {
     environment: [String: String]
   ) -> (status: Int32, output: Data) {
     guard ["get", "store", "erase"].contains(action),
-      let portText = environment["SYMPHONY_GIT_HELPER_PORT"],
-      let port = UInt16(portText),
-      let nonce = environment["SYMPHONY_GIT_HELPER_NONCE"],
+      let descriptorText = environment["SYMPHONY_GIT_HELPER_FD"],
+      let descriptor = Int32(descriptorText),
+      descriptor >= 3,
       input.count <= CredentialBrokerProtocolLimits.maximumGitCredentialInputBytes
     else { return (1, Data()) }
     do {
-      let descriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
-      guard descriptor >= 0 else { return (1, Data()) }
-      defer { Darwin.close(descriptor) }
-      var address = sockaddr_in()
-      address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
-      address.sin_family = sa_family_t(AF_INET)
-      address.sin_port = port.bigEndian
-      address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
-      let connected = withUnsafePointer(to: &address) {
-        $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-          Darwin.connect(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
-        }
-      }
-      guard connected == 0 else { return (1, Data()) }
-      let request = GitCredentialWireRequest(nonce: nonce, action: action, input: input)
+      let request = GitCredentialWireRequest(action: action, input: input)
       try SocketLine.write(JSONEncoder().encode(request), to: descriptor)
       let responseData = try SocketLine.read(
         descriptor,

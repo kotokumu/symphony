@@ -386,7 +386,40 @@ public struct GitHubAppAPIClient: GitHubAppAPIRequesting, GitHubRepositoryAPIReq
     guard (200..<300).contains(response.statusCode) else {
       throw repositoryError(response: response, isMint: false)
     }
-    return GitHubIssueCapabilityResponse(status: response.statusCode, body: data)
+    do {
+      let decoder = JSONDecoder()
+      switch request {
+      case .listIssues:
+        let values = try decoder.decode([GitHubIssueAPIResponse].self, from: data).map(\.record)
+        guard values.allSatisfy({ $0.number > 0 }) else { throw GitHubAppAPIError.invalidResponse }
+        return .issueList(values)
+      case .getIssue:
+        let value = try decoder.decode(GitHubIssueAPIResponse.self, from: data).record
+        guard value.number > 0 else { throw GitHubAppAPIError.invalidResponse }
+        return .issue(value)
+      case .listComments:
+        let values = try decoder.decode([GitHubCommentAPIResponse].self, from: data).map(\.record)
+        guard values.allSatisfy({ $0.id > 0 }) else { throw GitHubAppAPIError.invalidResponse }
+        return .comments(values)
+      case .createComment:
+        let value = try decoder.decode(GitHubCommentAPIResponse.self, from: data).record
+        guard value.id > 0 else { throw GitHubAppAPIError.invalidResponse }
+        return .comment(value)
+      case .setIssueState:
+        let value = try decoder.decode(GitHubIssueAPIResponse.self, from: data).record
+        guard value.number > 0 else { throw GitHubAppAPIError.invalidResponse }
+        return .stateChanged(value)
+      }
+    } catch {
+      throw GitHubRepositoryAPIError.failure(
+        GitHubCapabilityFailure(
+          category: .invalidServiceResponse,
+          message: "GitHub returned an unreadable issue response."
+        ),
+        invalidatesLease: false,
+        retryGET: false
+      )
+    }
   }
 
   private func pageQuery(_ page: Int) -> [URLQueryItem] {
@@ -735,6 +768,67 @@ private struct RepositoryResponse: Decodable {
 
 private struct APIErrorResponse: Decodable {
   let message: String
+}
+
+private struct GitHubIssueAPIResponse: Decodable {
+  struct User: Decodable { let login: String }
+  struct Label: Decodable { let name: String }
+
+  let number: Int32
+  let title: String?
+  let body: String?
+  let state: GitHubIssueState?
+  let htmlURL: URL?
+  let user: User?
+  let labels: [Label]?
+  let assignees: [User]?
+
+  enum CodingKeys: String, CodingKey {
+    case number, title, body, state, user, labels, assignees
+    case htmlURL = "html_url"
+  }
+
+  var record: GitHubIssueRecord {
+    GitHubIssueRecord(
+      number: number,
+      title: title,
+      body: body,
+      state: state,
+      htmlURL: htmlURL,
+      authorLogin: user?.login,
+      labels: labels?.map(\.name) ?? [],
+      assigneeLogins: assignees?.map(\.login) ?? []
+    )
+  }
+}
+
+private struct GitHubCommentAPIResponse: Decodable {
+  struct User: Decodable { let login: String }
+
+  let id: Int64
+  let body: String?
+  let htmlURL: URL?
+  let user: User?
+  let createdAt: String?
+  let updatedAt: String?
+
+  enum CodingKeys: String, CodingKey {
+    case id, body, user
+    case htmlURL = "html_url"
+    case createdAt = "created_at"
+    case updatedAt = "updated_at"
+  }
+
+  var record: GitHubIssueCommentRecord {
+    GitHubIssueCommentRecord(
+      id: id,
+      body: body,
+      htmlURL: htmlURL,
+      authorLogin: user?.login,
+      createdAt: createdAt,
+      updatedAt: updatedAt
+    )
+  }
 }
 
 public enum GitHubAppAPIError: LocalizedError, Sendable {

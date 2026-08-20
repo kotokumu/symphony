@@ -2,7 +2,18 @@ import Foundation
 import SymphonyCredentialBrokerProtocol
 import SymphonyDesktopCore
 
-public actor NamespaceCredentialBroker {
+public protocol NamespaceGitHubRepositoryCapabilityServing: Sendable {
+  func performGitHubIssueRequest(
+    _ request: GitHubIssueCapabilityRequest,
+    namespaceID: Namespace.ID
+  ) async throws -> GitHubIssueCapabilityResponse
+  func performGitHubGitOperation(
+    _ request: GitRepositoryCapabilityRequest,
+    namespaceID: Namespace.ID
+  ) async throws -> GitRepositoryCapabilityResult
+}
+
+public actor NamespaceCredentialBroker: NamespaceGitHubRepositoryCapabilityServing {
   private struct PendingUnlock {
     let generation: UUID
     let task: Task<any NamespaceCredentialBrokerSessionHandle, Error>

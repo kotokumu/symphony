@@ -3,19 +3,25 @@ import Foundation
 import SymphonyCredentialBrokerProtocol
 import SymphonyDesktopCore
 
+@_silgen_name("proc_listchildpids")
+private func symphonyListChildProcessIDs(_ parent: pid_t, _ buffer: UnsafeMutableRawPointer?, _ size: Int32) -> Int32
+
 public protocol CredentialBrokerSessionHandle: Sendable {
   func signChallenge(_ challenge: Data) async throws -> Data
   /// Returns only after the broker process no longer retains namespace credentials.
   func lock() async throws
 }
 
-public protocol GitHubCredentialBrokerSessionHandle: Sendable {
+public protocol GitHubCredentialBrokerConfigurationSessionHandle: Sendable {
   func configureGitHubApp(appID: Int64, privateKeyFileURL: URL) async throws
   func listGitHubInstallations() async throws -> [GitHubInstallationDescriptor]
   func listGitHubRepositories(
     installationID: Int64
   ) async throws -> [GitHubRepositoryDescriptor]
   func authorizeGitHubRepository(_ authorization: GitHubRepositoryAuthorization) async throws
+}
+
+public protocol GitHubRepositoryCapabilitySessionHandle: Sendable {
   func performGitHubIssueRequest(
     _ request: GitHubIssueCapabilityRequest
   ) async throws -> GitHubIssueCapabilityResponse
@@ -25,7 +31,9 @@ public protocol GitHubCredentialBrokerSessionHandle: Sendable {
 }
 
 public protocol NamespaceCredentialBrokerSessionHandle:
-  CredentialBrokerSessionHandle, GitHubCredentialBrokerSessionHandle {}
+  CredentialBrokerSessionHandle,
+  GitHubCredentialBrokerConfigurationSessionHandle,
+  GitHubRepositoryCapabilitySessionHandle {}
 
 public protocol CredentialBrokerSessionLaunching: Sendable {
   func unlock(namespaceID: Namespace.ID) async throws -> any NamespaceCredentialBrokerSessionHandle
@@ -444,6 +452,7 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
     timeout: TimeInterval,
     forceKill: ForceKill
   ) async throws {
+    var descendantGroups = descendantProcessGroups(of: process.processIdentifier)
     if process.isRunning {
       if let input {
         if var command = try? JSONEncoder().encode(CredentialBrokerCommand.lock) {
@@ -452,31 +461,97 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
         }
         try? input.close()
       }
-      if await waitForExit(process, timeout: timeout) {
+      if await waitForExit(process, timeout: timeout, descendantGroups: &descendantGroups) {
+        try await stopDescendantGroups(descendantGroups, timeout: timeout)
         return
       }
       process.terminate()
-      if await waitForExit(process, timeout: timeout) {
+      if await waitForExit(process, timeout: timeout, descendantGroups: &descendantGroups) {
+        try await stopDescendantGroups(descendantGroups, timeout: timeout)
         return
       }
       guard forceKill(process.processIdentifier) == 0 else {
         throw CredentialBrokerProcessError.stopTimedOut
       }
-      guard await waitForExit(process, timeout: timeout) else {
+      guard await waitForExit(process, timeout: timeout, descendantGroups: &descendantGroups) else {
         throw CredentialBrokerProcessError.stopTimedOut
       }
     }
+    try await stopDescendantGroups(descendantGroups, timeout: timeout)
   }
 
   private static func waitForExit(
     _ process: UnsafeProcessReference,
     timeout: TimeInterval
   ) async -> Bool {
+    var descendantGroups: Set<Int32> = []
+    return await waitForExit(
+      process,
+      timeout: timeout,
+      descendantGroups: &descendantGroups
+    )
+  }
+
+  private static func waitForExit(
+    _ process: UnsafeProcessReference,
+    timeout: TimeInterval,
+    descendantGroups: inout Set<Int32>
+  ) async -> Bool {
     let deadline = ContinuousClock.now.advanced(by: .seconds(timeout))
     while process.isRunning, ContinuousClock.now < deadline {
+      descendantGroups.formUnion(descendantProcessGroups(of: process.processIdentifier))
       try? await Task.sleep(for: .milliseconds(20))
     }
+    descendantGroups.formUnion(descendantProcessGroups(of: process.processIdentifier))
     return !process.isRunning
+  }
+
+  private static func descendantProcessGroups(of parent: Int32) -> Set<Int32> {
+    var pending = [parent]
+    var visited: Set<Int32> = []
+    var groups: Set<Int32> = []
+    while let current = pending.popLast() {
+      guard visited.insert(current).inserted else { continue }
+      let byteCount = Int(symphonyListChildProcessIDs(current, nil, 0))
+      guard byteCount > 0 else { continue }
+      var children = [pid_t](repeating: 0, count: byteCount / MemoryLayout<pid_t>.size)
+      let written = children.withUnsafeMutableBytes {
+        symphonyListChildProcessIDs(current, $0.baseAddress, Int32($0.count))
+      }
+      guard written > 0 else { continue }
+      for child in children.prefix(Int(written) / MemoryLayout<pid_t>.size) where child > 0 {
+        pending.append(child)
+        let group = Darwin.getpgid(child)
+        if group > 0, group != Darwin.getpgid(parent) { groups.insert(group) }
+      }
+    }
+    return groups
+  }
+
+  private static func stopDescendantGroups(
+    _ groups: Set<Int32>,
+    timeout: TimeInterval
+  ) async throws {
+    let liveGroups = groups.filter(groupExists)
+    liveGroups.forEach { _ = Darwin.kill(-$0, SIGTERM) }
+    if await waitForGroups(liveGroups, timeout: timeout) { return }
+    liveGroups.filter(groupExists).forEach { _ = Darwin.kill(-$0, SIGKILL) }
+    guard await waitForGroups(liveGroups, timeout: timeout) else {
+      throw CredentialBrokerProcessError.stopTimedOut
+    }
+  }
+
+  private static func waitForGroups(_ groups: Set<Int32>, timeout: TimeInterval) async -> Bool {
+    let deadline = ContinuousClock.now.advanced(by: .seconds(timeout))
+    while groups.contains(where: groupExists), ContinuousClock.now < deadline {
+      try? await Task.sleep(for: .milliseconds(20))
+    }
+    return !groups.contains(where: groupExists)
+  }
+
+  private static func groupExists(_ group: Int32) -> Bool {
+    let result = Darwin.kill(-group, 0)
+    return result == 0 || errno == EPERM
   }
 }
 

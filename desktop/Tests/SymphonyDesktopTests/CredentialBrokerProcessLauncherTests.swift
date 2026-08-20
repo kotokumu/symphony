@@ -285,7 +285,7 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
         printf '{"status":"githubRepositoryAuthorized"}\n'
         IFS= read -r issue
         printf '%s' "$issue" > "$BROKER_ISSUE_FILE"
-        printf '{"status":"githubIssueResponse","githubIssueResponse":{"status":200,"body":"e30="}}\n'
+        printf '{"status":"githubIssueResponse","githubIssueResponse":{"kind":"issue","issue":{"number":7,"labels":[],"assigneeLogins":[]}}}\n'
         IFS= read -r git
         printf '%s' "$git" > "$BROKER_GIT_FILE"
         printf '{"status":"githubGitResult","githubGitResult":{"exitStatus":0,"output":"ok","wasTruncated":false}}\n'
@@ -317,7 +317,7 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
     let issue = try await session.performGitHubIssueRequest(.getIssue(issueNumber: 7))
     let git = try await session.performGitHubGitOperation(.clone(targetName: "issue-7"))
 
-    XCTAssertEqual(issue.body, Data("{}".utf8))
+    XCTAssertEqual(issue, .issue(GitHubIssueRecord(number: 7)))
     XCTAssertEqual(git.output, "ok")
     XCTAssertEqual(
       try JSONDecoder().decode(CredentialBrokerCommand.self, from: Data(contentsOf: authorizationURL)),

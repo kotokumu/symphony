@@ -34,6 +34,8 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     XCTAssertFalse(result.output.contains("never-print-this-token"))
     XCTAssertFalse(result.output.lowercased().contains("http_proxy"))
     XCTAssertFalse(result.output.contains("GITHUB_TOKEN"))
+    XCTAssertFalse(result.output.contains("SYMPHONY_GIT_HELPER_PORT"))
+    XCTAssertFalse(result.output.contains("SYMPHONY_GIT_HELPER_NONCE"))
   }
 
   func testRemovesBrokerCreatedPartialCloneAfterFailure() async throws {
@@ -94,6 +96,118 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       XCTAssertEqual(error.failure.category, .gitOutputTooLarge)
       XCTAssertLessThanOrEqual(error.failure.message.utf8.count, 65_700)
     }
+  }
+
+  func testDoesNotDeleteAReplacementAtTheFailedClonePath() async throws {
+    let fixture = try makeFixture()
+    let ready = fixture.root.appendingPathComponent("ready")
+    let release = fixture.root.appendingPathComponent("release")
+    let executable = try makeExecutable(
+      """
+      #!/bin/sh
+      touch "\(ready.path)"
+      while [ ! -e "\(release.path)" ]; do sleep 0.01; done
+      exit 2
+      """
+    )
+    let runner = ScopedGitCommandRunner(
+      gitExecutableURL: executable,
+      brokerExecutableURL: executable,
+      operationTimeout: 2,
+      wrapsGitInBrokerExecutable: false
+    )
+    let source = SecureSecretBuffer(copying: Data("token".utf8))
+    defer { source.clear() }
+    let operation = Task {
+      try await runner.run(.clone(targetName: "partial"), in: fixture.scope) {
+        OperationCredential(copying: source)
+      }
+    }
+    try await waitForFile(ready)
+    let target = fixture.root.appendingPathComponent("partial", isDirectory: true)
+    let original = fixture.root.appendingPathComponent("original-partial", isDirectory: true)
+    try FileManager.default.moveItem(at: target, to: original)
+    try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
+    try Data("sentinel".utf8).write(to: target.appendingPathComponent("keep"))
+    FileManager.default.createFile(atPath: release.path, contents: Data())
+
+    do {
+      _ = try await operation.value
+      XCTFail("Expected cleanup-required failure")
+    } catch let error as GitCommandRunnerError {
+      XCTAssertEqual(error.failure.category, .cleanupRequired)
+    }
+    XCTAssertEqual(
+      try Data(contentsOf: target.appendingPathComponent("keep")),
+      Data("sentinel".utf8)
+    )
+    do {
+      try await runner.stopRetainedOperation()
+      XCTFail("Expected replacement identity to keep cleanup blocked")
+    } catch let error as GitCommandRunnerError {
+      XCTAssertEqual(error.failure.category, .cleanupRequired)
+    }
+    try FileManager.default.removeItem(at: target)
+    try await runner.stopRetainedOperation()
+  }
+
+  func testStopAtFinalPreparationBarrierPreventsLaunch() async throws {
+    let fixture = try makeFixture()
+    let marker = fixture.root.appendingPathComponent("launched")
+    let executable = try makeExecutable("#!/bin/sh\ntouch \"\(marker.path)\"\n")
+    let gate = GitLaunchGate()
+    let runner = ScopedGitCommandRunner(
+      gitExecutableURL: executable,
+      brokerExecutableURL: executable,
+      operationTimeout: 2,
+      wrapsGitInBrokerExecutable: false,
+      beforeLaunch: { await gate.pause() }
+    )
+    let source = SecureSecretBuffer(copying: Data("token".utf8))
+    defer { source.clear() }
+    let operation = Task {
+      try await runner.run(.clone(targetName: "cancelled-late"), in: fixture.scope) {
+        OperationCredential(copying: source)
+      }
+    }
+    await gate.waitUntilPaused()
+    let stop = Task { try await runner.stopRetainedOperation() }
+    XCTAssertTrue(await runner.waitUntilStopRequested())
+    await gate.resume()
+    do {
+      _ = try await operation.value
+      XCTFail("Expected stop admission to reject launch")
+    } catch is CancellationError {}
+    try await stop.value
+    XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+  }
+
+  func testInheritedSocketCapabilityWorksThroughTheRealBrokerHelperExecutable() async throws {
+    let fixture = try makeFixture()
+    let broker = try brokerExecutable()
+    let quotedBroker = broker.path.replacingOccurrences(of: "'", with: "'\\''")
+    let executable = try makeExecutable(
+      """
+      #!/bin/sh
+      printf 'protocol=https\nhost=github.com\npath=octo/repo\n\n' | '\(quotedBroker)' git-credential get
+      """
+    )
+    let runner = ScopedGitCommandRunner(
+      gitExecutableURL: executable,
+      brokerExecutableURL: broker,
+      operationTimeout: 2,
+      wrapsGitInBrokerExecutable: true
+    )
+    let source = SecureSecretBuffer(copying: Data("socket-canary-token".utf8))
+    defer { source.clear() }
+
+    let result = try await runner.run(.clone(targetName: "helper"), in: fixture.scope) {
+      OperationCredential(copying: source)
+    }
+
+    XCTAssertTrue(result.output.contains("username=x-access-token"))
+    XCTAssertFalse(result.output.contains("socket-canary-token"))
+    XCTAssertTrue(result.output.contains("[REDACTED]"))
   }
 
   func testRedactsEveryCredentialRepresentation() {
@@ -169,6 +283,47 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     XCTAssertEqual(chmod(url.path, 0o700), 0)
     addTeardownBlock { try? FileManager.default.removeItem(at: url) }
     return url
+  }
+
+  private func waitForFile(_ url: URL) async throws {
+    let deadline = ContinuousClock.now.advanced(by: .seconds(1))
+    while !FileManager.default.fileExists(atPath: url.path), ContinuousClock.now < deadline {
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
+  }
+
+  private func brokerExecutable() throws -> URL {
+    var directory = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
+    for _ in 0..<6 {
+      let candidate = directory.appendingPathComponent("SymphonyCredentialBroker")
+      if FileManager.default.isExecutableFile(atPath: candidate.path) { return candidate }
+      directory.deleteLastPathComponent()
+    }
+    throw GitCommandRunnerError.launchFailed
+  }
+}
+
+private actor GitLaunchGate {
+  private var paused = false
+  private var pauseWaiters: [CheckedContinuation<Void, Never>] = []
+  private var resumeContinuation: CheckedContinuation<Void, Never>?
+
+  func pause() async {
+    paused = true
+    pauseWaiters.forEach { $0.resume() }
+    pauseWaiters.removeAll()
+    await withCheckedContinuation { resumeContinuation = $0 }
+  }
+
+  func waitUntilPaused() async {
+    if paused { return }
+    await withCheckedContinuation { pauseWaiters.append($0) }
+  }
+
+  func resume() {
+    resumeContinuation?.resume()
+    resumeContinuation = nil
   }
 }
 

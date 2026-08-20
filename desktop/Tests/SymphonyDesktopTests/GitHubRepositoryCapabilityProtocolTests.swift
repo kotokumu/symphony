@@ -66,4 +66,36 @@ final class GitHubRepositoryCapabilityProtocolTests: XCTestCase {
     XCTAssertFalse(String(decoding: issue, as: UTF8.self).contains("github.com"))
     XCTAssertFalse(String(decoding: issue, as: UTF8.self).contains("octo"))
   }
+
+  func testRejectsUnknownAuthorityFieldsAtEveryBrokerFrame() {
+    let commandFrames = [
+      #"{"operation":"performGitHubIssueRequest","githubIssueRequest":{"operation":"getIssue","issueNumber":1},"namespace":"other"}"#,
+      #"{"operation":"performGitHubGitOperation","githubGitRequest":{"clone":{"targetName":"x"}},"token":"secret"}"#,
+      #"{"operation":"authorizeGitHubRepository","githubRepositoryAuthorization":{"appID":10,"installationID":20,"repositoryID":30,"repositoryFullName":"octo/repo","repositoryURL":"https:\/\/github.com\/octo\/repo","workspacesRoot":"file:\/\/\/tmp\/workspaces","override":"other\/repo"}}"#,
+    ]
+    for frame in commandFrames {
+      XCTAssertThrowsError(
+        try JSONDecoder().decode(CredentialBrokerCommand.self, from: Data(frame.utf8)),
+        frame
+      )
+    }
+
+    let resultFrames = [
+      #"{"status":"locked","payload":"c2VjcmV0"}"#,
+      #"{"status":"githubGitResult","githubGitResult":{"exitStatus":0,"output":"","wasTruncated":false,"token":"secret"}}"#,
+      #"{"status":"githubCapabilityFailed","githubCapabilityFailure":{"category":"locked","message":"locked","effectMayHaveOccurred":false,"repository":"other"}}"#,
+    ]
+    for frame in resultFrames {
+      XCTAssertThrowsError(
+        try JSONDecoder().decode(CredentialBrokerResult.self, from: Data(frame.utf8)),
+        frame
+      )
+    }
+    XCTAssertThrowsError(
+      try JSONDecoder().decode(
+        CredentialBrokerHandshake.self,
+        from: Data(#"{"status":"unlocked","token":"secret"}"#.utf8)
+      )
+    )
+  }
 }

@@ -13,6 +13,11 @@ struct SymphonyCredentialBrokerMain {
     if arguments.count >= 2, arguments[0] == "git-runner" {
       Foundation.exit(runGitProcess(executable: arguments[1], arguments: Array(arguments.dropFirst(2))))
     }
+    if arguments.count == 2, arguments[0] == "git-watchdog",
+      let gitProcessID = Int32(arguments[1])
+    {
+      monitorBrokerLifetime(descriptor: STDIN_FILENO, gitProcessID: gitProcessID)
+    }
     guard arguments.count == 2, let namespaceID = UUID(uuidString: arguments[1]) else {
       FileHandle.standardError.write(Data("Invalid broker invocation.\n".utf8))
       Foundation.exit(64)
@@ -59,18 +64,56 @@ struct SymphonyCredentialBrokerMain {
 
   private static func runGitProcess(executable: String, arguments: [String]) -> Int32 {
     guard Darwin.setpgid(0, 0) == 0 else { return 1 }
-    let process = Process()
-    process.executableURL = URL(fileURLWithPath: executable)
-    process.arguments = arguments
-    process.standardInput = FileHandle.standardInput
-    process.standardOutput = FileHandle.standardOutput
-    process.standardError = FileHandle.standardError
+    let credentialDescriptor: Int32 = 3
+    guard Darwin.dup2(STDIN_FILENO, credentialDescriptor) == credentialDescriptor else { return 1 }
+    var descriptorFlags = Darwin.fcntl(credentialDescriptor, F_GETFD)
+    guard descriptorFlags >= 0 else { return 1 }
+    descriptorFlags &= ~FD_CLOEXEC
+    guard Darwin.fcntl(credentialDescriptor, F_SETFD, descriptorFlags) == 0 else { return 1 }
+    let nullDescriptor = Darwin.open("/dev/null", O_RDONLY)
+    guard nullDescriptor >= 0 else { return 1 }
+    defer { Darwin.close(nullDescriptor) }
+    guard Darwin.dup2(nullDescriptor, STDIN_FILENO) == STDIN_FILENO else { return 1 }
+    guard setenv("SYMPHONY_GIT_HELPER_FD", String(credentialDescriptor), 1) == 0 else { return 1 }
+
+    let gitProcessID = getpid()
+    let watchdog = Process()
+    watchdog.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+    watchdog.arguments = ["git-watchdog", String(gitProcessID)]
+    watchdog.standardInput = FileHandle(fileDescriptor: credentialDescriptor, closeOnDealloc: false)
+    watchdog.standardOutput = FileHandle.nullDevice
+    watchdog.standardError = FileHandle.nullDevice
     do {
-      try process.run()
-      process.waitUntilExit()
-      return process.terminationStatus
+      try watchdog.run()
     } catch {
       return 1
+    }
+
+    var pointers: [UnsafeMutablePointer<CChar>?] = ([executable] + arguments).map { strdup($0) }
+    guard pointers.allSatisfy({ $0 != nil }) else { return 1 }
+    defer { pointers.compactMap { $0 }.forEach { free($0) } }
+    pointers.append(nil)
+    executable.withCString { path in
+      _ = Darwin.execv(path, &pointers)
+    }
+    return 1
+  }
+
+  private static func monitorBrokerLifetime(descriptor: Int32, gitProcessID: Int32) -> Never {
+    while true {
+      var polled = pollfd(
+        fd: descriptor,
+        events: Int16(POLLHUP | POLLERR | POLLNVAL),
+        revents: 0
+      )
+      let result = Darwin.poll(&polled, 1, 50)
+      if result > 0, polled.revents & Int16(POLLHUP | POLLERR | POLLNVAL) != 0 {
+        _ = Darwin.kill(-gitProcessID, SIGKILL)
+        Darwin._exit(1)
+      }
+      if getppid() != gitProcessID {
+        Darwin._exit(0)
+      }
     }
   }
 

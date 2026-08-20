@@ -15,7 +15,7 @@ public enum CredentialBrokerHandshake: Codable, Equatable, Sendable {
   case unlocked
   case failed(message: String)
 
-  private enum CodingKeys: String, CodingKey {
+  private enum CodingKeys: String, CodingKey, CaseIterable {
     case status
     case message
   }
@@ -26,11 +26,21 @@ public enum CredentialBrokerHandshake: Codable, Equatable, Sendable {
   }
 
   public init(from decoder: any Decoder) throws {
+    try StrictProtocolCoding.rejectUnknownKeys(
+      in: decoder,
+      allowed: CodingKeys.allCases.map(\.stringValue)
+    )
     let container = try decoder.container(keyedBy: CodingKeys.self)
     switch try container.decode(Status.self, forKey: .status) {
     case .unlocked:
+      guard container.allKeys == [.status] else {
+        throw GitHubCapabilityProtocolError.invalidPayload
+      }
       self = .unlocked
     case .failed:
+      guard Set(container.allKeys) == Set([.status, .message]) else {
+        throw GitHubCapabilityProtocolError.invalidPayload
+      }
       self = .failed(message: try container.decode(String.self, forKey: .message))
     }
   }
@@ -83,6 +93,41 @@ public struct CredentialBrokerCommand: Codable, Equatable, Sendable {
     self.githubRepositoryAuthorization = githubRepositoryAuthorization
     self.githubIssueRequest = githubIssueRequest
     self.githubGitRequest = githubGitRequest
+  }
+
+  public init(from decoder: any Decoder) throws {
+    try StrictProtocolCoding.rejectUnknownKeys(
+      in: decoder,
+      allowed: CodingKeys.allCases.map(\.stringValue)
+    )
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    self.init(
+      operation: try container.decode(Operation.self, forKey: .operation),
+      payload: try container.decodeIfPresent(Data.self, forKey: .payload),
+      githubAppConfiguration: try container.decodeIfPresent(
+        GitHubAppConfigurationRequest.self,
+        forKey: .githubAppConfiguration
+      ),
+      installationID: try container.decodeIfPresent(Int64.self, forKey: .installationID),
+      githubRepositoryAuthorization: try container.decodeIfPresent(
+        GitHubRepositoryAuthorization.self,
+        forKey: .githubRepositoryAuthorization
+      ),
+      githubIssueRequest: try container.decodeIfPresent(
+        GitHubIssueCapabilityRequest.self,
+        forKey: .githubIssueRequest
+      ),
+      githubGitRequest: try container.decodeIfPresent(
+        GitRepositoryCapabilityRequest.self,
+        forKey: .githubGitRequest
+      )
+    )
+    try validatePayloadShape()
+  }
+
+  private enum CodingKeys: String, CodingKey, CaseIterable {
+    case operation, payload, githubAppConfiguration, installationID
+    case githubRepositoryAuthorization, githubIssueRequest, githubGitRequest
   }
 
   public static func signChallenge(_ challenge: Data) -> Self {
@@ -160,6 +205,22 @@ public struct GitHubAppConfigurationRequest: Codable, Equatable, Sendable {
     self.appID = appID
     self.privateKeyFilePath = privateKeyFilePath
   }
+
+  public init(from decoder: any Decoder) throws {
+    try StrictProtocolCoding.rejectUnknownKeys(
+      in: decoder,
+      allowed: CodingKeys.allCases.map(\.stringValue)
+    )
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    self.init(
+      appID: try container.decode(Int64.self, forKey: .appID),
+      privateKeyFilePath: try container.decode(String.self, forKey: .privateKeyFilePath)
+    )
+  }
+
+  private enum CodingKeys: String, CodingKey, CaseIterable {
+    case appID, privateKeyFilePath
+  }
 }
 
 public struct GitHubInstallationDescriptor: Codable, Equatable, Identifiable, Sendable {
@@ -210,7 +271,7 @@ public enum CredentialBrokerResult: Codable, Equatable, Sendable {
   case locked
   case failed(message: String)
 
-  private enum CodingKeys: String, CodingKey {
+  private enum CodingKeys: String, CodingKey, CaseIterable {
     case status
     case payload
     case installations
@@ -235,8 +296,27 @@ public enum CredentialBrokerResult: Codable, Equatable, Sendable {
   }
 
   public init(from decoder: any Decoder) throws {
+    try StrictProtocolCoding.rejectUnknownKeys(
+      in: decoder,
+      allowed: CodingKeys.allCases.map(\.stringValue)
+    )
     let container = try decoder.container(keyedBy: CodingKeys.self)
-    switch try container.decode(Status.self, forKey: .status) {
+    let status = try container.decode(Status.self, forKey: .status)
+    let expectedKeys: Set<CodingKeys>
+    switch status {
+    case .signature: expectedKeys = [.status, .payload]
+    case .githubAppConfigured, .githubRepositoryAuthorized, .locked: expectedKeys = [.status]
+    case .githubInstallations: expectedKeys = [.status, .installations]
+    case .githubRepositories: expectedKeys = [.status, .repositories]
+    case .githubIssueResponse: expectedKeys = [.status, .githubIssueResponse]
+    case .githubGitResult: expectedKeys = [.status, .githubGitResult]
+    case .githubCapabilityFailed: expectedKeys = [.status, .githubCapabilityFailure]
+    case .failed: expectedKeys = [.status, .message]
+    }
+    guard Set(container.allKeys) == expectedKeys else {
+      throw GitHubCapabilityProtocolError.invalidPayload
+    }
+    switch status {
     case .signature:
       self = .signature(try container.decode(Data.self, forKey: .payload))
     case .githubAppConfigured:

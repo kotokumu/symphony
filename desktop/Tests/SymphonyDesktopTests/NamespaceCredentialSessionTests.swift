@@ -176,6 +176,36 @@ final class NamespaceCredentialSessionTests: XCTestCase {
     let installations = try await session.listGitHubInstallations()
     let repositories = try await session.listGitHubRepositories(installationID: 20)
 
+    let workspacesRoot = FileManager.default.temporaryDirectory
+      .appendingPathComponent("symphony-scope-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: workspacesRoot, withIntermediateDirectories: false)
+    defer { try? FileManager.default.removeItem(at: workspacesRoot) }
+    do {
+      try await session.authorizeGitHubRepository(
+        GitHubRepositoryAuthorization(
+          appID: 10,
+          installationID: 20,
+          repositoryID: 31,
+          repositoryFullName: "octo/other",
+          repositoryURL: URL(string: "https://github.com/octo/other")!,
+          workspacesRoot: workspacesRoot
+        )
+      )
+      XCTFail("Expected repository claims absent from GitHub discovery to be rejected")
+    } catch let error as GitHubRepositoryAccessError {
+      XCTAssertEqual(error.failure.category, .unauthorizedScope)
+    }
+    try await session.authorizeGitHubRepository(
+      GitHubRepositoryAuthorization(
+        appID: 10,
+        installationID: 20,
+        repositoryID: 30,
+        repositoryFullName: "octo/research",
+        repositoryURL: URL(string: "https://github.com/octo/research")!,
+        workspacesRoot: workspacesRoot
+      )
+    )
+
     XCTAssertEqual(installations.first?.accountLogin, "octo")
     XCTAssertEqual(repositories.first?.fullName, "octo/research")
     var stored = try StoredGitHubAppCredential.decode(
@@ -184,7 +214,7 @@ final class NamespaceCredentialSessionTests: XCTestCase {
     XCTAssertEqual(stored.appID, 10)
     stored.clear()
     let jwtValues = await githubAPI.jwtValues
-    XCTAssertEqual(jwtValues.count, 2)
+    XCTAssertEqual(jwtValues.count, 4)
     XCTAssertTrue(jwtValues.allSatisfy { $0.split(separator: ".").count == 3 })
     let privateKeyText = try String(contentsOf: privateKeyURL, encoding: .utf8)
     XCTAssertTrue(jwtValues.allSatisfy { !$0.contains(privateKeyText) })
