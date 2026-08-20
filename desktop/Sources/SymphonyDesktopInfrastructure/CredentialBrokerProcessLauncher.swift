@@ -546,13 +546,21 @@ private enum BrokerPipeReader {
     maximumBytes: Int = 16_384,
     context: Context = .handshake
   ) throws -> Data {
-    let deadline = Date().addingTimeInterval(timeout)
+    let clock = ContinuousClock()
+    let timeoutMilliseconds = max(Int64(1), Int64((timeout * 1_000).rounded(.up)))
+    let deadline = clock.now.advanced(by: .milliseconds(timeoutMilliseconds))
     var accumulated = Data()
 
-    while Date() < deadline {
-      let remaining = max(0, deadline.timeIntervalSinceNow)
+    while clock.now < deadline {
+      let remaining = clock.now.duration(to: deadline).components
+      let remainingMilliseconds =
+        Double(remaining.seconds) * 1_000
+        + Double(remaining.attoseconds) / 1_000_000_000_000_000
+      let pollTimeout = Int32(
+        max(1, min(remainingMilliseconds.rounded(.up), Double(Int32.max)))
+      )
       var pollDescriptor = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
-      let result = Darwin.poll(&pollDescriptor, 1, Int32(remaining * 1_000))
+      let result = Darwin.poll(&pollDescriptor, 1, pollTimeout)
       if result == 0 {
         break
       }

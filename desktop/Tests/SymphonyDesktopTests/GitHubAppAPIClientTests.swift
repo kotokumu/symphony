@@ -276,6 +276,8 @@ final class GitHubAppAPIClientTests: XCTestCase {
     configuration.protocolClasses = [StreamingGitHubURLProtocol.self]
     StreamingGitHubURLProtocol.responseData = Data(repeating: 0x61, count: 17)
     StreamingGitHubURLProtocol.contentLength = nil
+    StreamingGitHubURLProtocol.withholdCompletion = false
+    StreamingGitHubURLProtocol.wasStopped = false
     let transport = URLSessionGitHubHTTPTransport(
       session: URLSession(configuration: configuration)
     )
@@ -298,6 +300,8 @@ final class GitHubAppAPIClientTests: XCTestCase {
     configuration.protocolClasses = [StreamingGitHubURLProtocol.self]
     StreamingGitHubURLProtocol.responseData = Data()
     StreamingGitHubURLProtocol.contentLength = 17
+    StreamingGitHubURLProtocol.withholdCompletion = false
+    StreamingGitHubURLProtocol.wasStopped = false
     let transport = URLSessionGitHubHTTPTransport(
       session: URLSession(configuration: configuration)
     )
@@ -313,6 +317,35 @@ final class GitHubAppAPIClientTests: XCTestCase {
     } catch {
       XCTAssertTrue(error.localizedDescription.contains("more connection data"))
     }
+  }
+
+  func testURLSessionTransportCancelsStalledResponseAtMonotonicDeadline() async throws {
+    let configuration = URLSessionGitHubHTTPTransport.makeEphemeralConfiguration()
+    configuration.protocolClasses = [StreamingGitHubURLProtocol.self]
+    StreamingGitHubURLProtocol.responseData = Data([0x61])
+    StreamingGitHubURLProtocol.contentLength = nil
+    StreamingGitHubURLProtocol.withholdCompletion = true
+    StreamingGitHubURLProtocol.wasStopped = false
+    defer { StreamingGitHubURLProtocol.withholdCompletion = false }
+    let transport = URLSessionGitHubHTTPTransport(
+      session: URLSession(configuration: configuration)
+    )
+    let request = URLRequest(url: URL(string: "https://api.github.test/data")!)
+    let started = ContinuousClock.now
+
+    do {
+      _ = try await transport.data(
+        for: request,
+        maximumBytes: 16,
+        deadline: started.advanced(by: .milliseconds(50))
+      )
+      XCTFail("Expected deadline failure")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("deadline"), error.localizedDescription)
+    }
+
+    XCTAssertLessThan(started.duration(to: .now), .seconds(1))
+    XCTAssertTrue(StreamingGitHubURLProtocol.wasStopped)
   }
 
   private func installationPage(count: Int, startingAt firstID: Int) -> String {
@@ -333,6 +366,8 @@ final class GitHubAppAPIClientTests: XCTestCase {
 private final class StreamingGitHubURLProtocol: URLProtocol, @unchecked Sendable {
   nonisolated(unsafe) static var responseData = Data()
   nonisolated(unsafe) static var contentLength: Int?
+  nonisolated(unsafe) static var withholdCompletion = false
+  nonisolated(unsafe) static var wasStopped = false
 
   override class func canInit(with request: URLRequest) -> Bool { true }
   override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -352,10 +387,12 @@ private final class StreamingGitHubURLProtocol: URLProtocol, @unchecked Sendable
     if !Self.responseData.isEmpty {
       client?.urlProtocol(self, didLoad: Self.responseData)
     }
-    client?.urlProtocolDidFinishLoading(self)
+    if !Self.withholdCompletion {
+      client?.urlProtocolDidFinishLoading(self)
+    }
   }
 
-  override func stopLoading() {}
+  override func stopLoading() { Self.wasStopped = true }
 }
 
 private struct FailingGitHubTransport: GitHubHTTPTransporting {

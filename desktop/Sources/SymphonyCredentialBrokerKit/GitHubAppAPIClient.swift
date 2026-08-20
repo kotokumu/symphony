@@ -11,10 +11,14 @@ public protocol GitHubHTTPTransporting: Sendable {
 }
 
 public struct URLSessionGitHubHTTPTransport: GitHubHTTPTransporting {
-  private let session: URLSession
+  private let configuration: URLSessionConfiguration
 
-  public init(session: URLSession = URLSessionGitHubHTTPTransport.makeEphemeralSession()) {
-    self.session = session
+  public init(configuration: URLSessionConfiguration = makeEphemeralConfiguration()) {
+    self.configuration = configuration.copy() as! URLSessionConfiguration
+  }
+
+  public init(session: URLSession) {
+    configuration = session.configuration.copy() as! URLSessionConfiguration
   }
 
   public static func makeEphemeralConfiguration() -> URLSessionConfiguration {
@@ -36,33 +40,176 @@ public struct URLSessionGitHubHTTPTransport: GitHubHTTPTransporting {
     maximumBytes: Int,
     deadline: ContinuousClock.Instant
   ) async throws -> (Data, HTTPURLResponse) {
-    var boundedRequest = request
+    guard maximumBytes >= 0 else { throw GitHubAppAPIError.responseTooLarge }
     let remaining = ContinuousClock.now.duration(to: deadline)
     guard remaining > .zero else { throw GitHubAppAPIError.requestTimedOut }
-    let components = remaining.components
-    boundedRequest.timeoutInterval = min(
-      boundedRequest.timeoutInterval,
-      Double(components.seconds) + Double(components.attoseconds) / 1e18
+    let reader = BoundedURLSessionReader(
+      configuration: configuration,
+      maximumBytes: maximumBytes,
+      deadline: deadline
     )
-    let (bytes, response) = try await session.bytes(for: boundedRequest)
+    return try await withTaskCancellationHandler {
+      try await reader.read(request)
+    } onCancel: {
+      reader.cancel(with: CancellationError())
+    }
+  }
+}
+
+private final class BoundedURLSessionReader: NSObject, URLSessionDataDelegate,
+  @unchecked Sendable
+{
+  typealias Output = (Data, HTTPURLResponse)
+
+  private let lock = NSLock()
+  private let configuration: URLSessionConfiguration
+  private let maximumBytes: Int
+  private let deadline: ContinuousClock.Instant
+  private var continuation: CheckedContinuation<Output, any Error>?
+  private var session: URLSession?
+  private var dataTask: URLSessionDataTask?
+  private var deadlineTask: Task<Void, Never>?
+  private var pendingCancellation: (any Error)?
+  private var response: HTTPURLResponse?
+  private var data = Data()
+
+  init(
+    configuration: URLSessionConfiguration,
+    maximumBytes: Int,
+    deadline: ContinuousClock.Instant
+  ) {
+    self.configuration = configuration
+    self.maximumBytes = maximumBytes
+    self.deadline = deadline
+    data.reserveCapacity(min(maximumBytes, 64 * 1_024))
+  }
+
+  func read(_ request: URLRequest) async throws -> Output {
+    try await withCheckedThrowingContinuation { continuation in
+      let session = URLSession(configuration: configuration, delegate: self, delegateQueue: nil)
+      let dataTask = session.dataTask(with: request)
+      let cancellation = lock.withLock { () -> (any Error)? in
+        if let pendingCancellation {
+          self.pendingCancellation = nil
+          return pendingCancellation
+        }
+        self.continuation = continuation
+        self.session = session
+        self.dataTask = dataTask
+        return nil
+      }
+      if let cancellation {
+        session.invalidateAndCancel()
+        continuation.resume(throwing: cancellation)
+        return
+      }
+      let deadlineTask = Task { [weak self, deadline] in
+        do {
+          try await ContinuousClock().sleep(until: deadline)
+          self?.cancel(with: GitHubAppAPIError.requestTimedOut)
+        } catch {}
+      }
+      let shouldCancelDeadline = lock.withLock { () -> Bool in
+        guard self.continuation != nil else { return true }
+        self.deadlineTask = deadlineTask
+        return false
+      }
+      if shouldCancelDeadline { deadlineTask.cancel() }
+      dataTask.resume()
+    }
+  }
+
+  func cancel(with error: any Error) {
+    let hasContinuation = lock.withLock { () -> Bool in
+      guard continuation != nil else {
+        pendingCancellation = error
+        return false
+      }
+      return true
+    }
+    guard hasContinuation else { return }
+    finish(.failure(error), cancelling: true)
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    dataTask: URLSessionDataTask,
+    didReceive response: URLResponse,
+    completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+  ) {
     guard let response = response as? HTTPURLResponse else {
-      throw GitHubAppAPIError.invalidResponse
+      completionHandler(.cancel)
+      finish(.failure(GitHubAppAPIError.invalidResponse), cancelling: true)
+      return
     }
     guard response.expectedContentLength < 0 || response.expectedContentLength <= maximumBytes else {
-      throw GitHubAppAPIError.responseTooLarge
+      completionHandler(.cancel)
+      finish(.failure(GitHubAppAPIError.responseTooLarge), cancelling: true)
+      return
     }
-    var data = Data()
-    data.reserveCapacity(min(maximumBytes, 64 * 1_024))
-    for try await byte in bytes {
-      guard ContinuousClock.now < deadline else {
-        throw GitHubAppAPIError.requestTimedOut
-      }
-      guard data.count < maximumBytes else {
-        throw GitHubAppAPIError.responseTooLarge
-      }
-      data.append(byte)
+    lock.withLock { self.response = response }
+    completionHandler(.allow)
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    dataTask: URLSessionDataTask,
+    didReceive data: Data
+  ) {
+    let exceeded = lock.withLock { () -> Bool in
+      guard data.count <= maximumBytes,
+        self.data.count <= maximumBytes - data.count
+      else { return true }
+      self.data.append(data)
+      return false
     }
-    return (data, response)
+    if exceeded {
+      finish(.failure(GitHubAppAPIError.responseTooLarge), cancelling: true)
+    }
+  }
+
+  func urlSession(
+    _ session: URLSession,
+    task: URLSessionTask,
+    didCompleteWithError error: (any Error)?
+  ) {
+    if let error {
+      finish(.failure(error), cancelling: false)
+      return
+    }
+    let result = lock.withLock { () -> Result<Output, any Error> in
+      guard let response else {
+        return .failure(GitHubAppAPIError.invalidResponse)
+      }
+      return .success((data, response))
+    }
+    finish(result, cancelling: false)
+  }
+
+  private func finish(_ result: Result<Output, any Error>, cancelling: Bool) {
+    let owned = lock.withLock { () -> (
+      CheckedContinuation<Output, any Error>,
+      URLSessionDataTask?,
+      URLSession?,
+      Task<Void, Never>?
+    )? in
+      guard let continuation else { return nil }
+      self.continuation = nil
+      let owned = (continuation, dataTask, session, deadlineTask)
+      dataTask = nil
+      session = nil
+      deadlineTask = nil
+      return owned
+    }
+    guard let (continuation, dataTask, session, deadlineTask) = owned else { return }
+    deadlineTask?.cancel()
+    if cancelling {
+      dataTask?.cancel()
+      session?.invalidateAndCancel()
+    } else {
+      session?.finishTasksAndInvalidate()
+    }
+    continuation.resume(with: result)
   }
 }
 
