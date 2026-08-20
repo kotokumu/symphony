@@ -619,13 +619,13 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     """
     (version 1)
     (allow default)
-    (deny network-outbound)
-    (allow network-outbound (remote tcp "localhost:\(proxyPort)"))
-    (deny file-write*)
-    (allow file-write*
-      (subpath (param "WRITE_ROOT"))
-      (subpath (param "TEMP_ROOT"))
-      (literal "/dev/null"))
+    (deny network-outbound
+      (require-not (remote tcp "localhost:\(proxyPort)")))
+    (deny file-write*
+      (require-all
+        (require-not (subpath (param "WRITE_ROOT")))
+        (require-not (subpath (param "TEMP_ROOT")))
+        (require-not (literal "/dev/null"))))
     """
   }
 

@@ -752,7 +752,7 @@ private enum BrokerPipeReader {
       var pollDescriptor = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
       let result = Darwin.poll(&pollDescriptor, 1, pollTimeout)
       if result == 0 {
-        break
+        continue
       }
       if result < 0 {
         if errno == EINTR { continue }

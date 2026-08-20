@@ -8,7 +8,7 @@ import XCTest
 final class ScopedGitCommandRunnerTests: XCTestCase {
   func testSandboxProfileAllowsOnlyTheBrokerOwnedLoopbackTunnel() {
     let profile = ScopedGitCommandRunner.sandboxProfile(proxyPort: 43_123)
-    XCTAssertTrue(profile.contains("(deny network-outbound)"))
+    XCTAssertTrue(profile.contains("(deny network-outbound"))
     XCTAssertTrue(profile.contains("(remote tcp \"localhost:43123\")"))
     XCTAssertFalse(profile.contains("github.com"))
   }
