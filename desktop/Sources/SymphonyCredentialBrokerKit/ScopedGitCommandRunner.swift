@@ -418,7 +418,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       }
     }
     if collector.exceededLimit { throw GitCommandRunnerError.outputTooLarge(sanitized) }
-    if timedOut || Task.isCancelled { throw GitCommandRunnerError.timedOut }
+    if timedOut || Task.isCancelled { throw GitCommandRunnerError.timedOutWithOutput(sanitized) }
     if erased { throw GitCommandRunnerError.authenticationRejected }
     guard status == 0 else { throw GitCommandRunnerError.failed(status, sanitized) }
     if let cloneTarget {
@@ -1401,7 +1401,7 @@ private final class GitOutputCollector: @unchecked Sendable {
 
 enum GitCommandRunnerError: LocalizedError, Sendable {
   case launchFailed, timedOut, cleanupRequired, authenticationRejected
-  case outputTooLarge(String), failed(Int32, String)
+  case timedOutWithOutput(String), outputTooLarge(String), failed(Int32, String)
 
   var failure: GitHubCapabilityFailure {
     switch self {
@@ -1409,6 +1409,11 @@ enum GitCommandRunnerError: LocalizedError, Sendable {
       GitHubCapabilityFailure(category: .gitFailed, message: "Git could not start safely.")
     case .timedOut:
       GitHubCapabilityFailure(category: .timedOut, message: "Git did not finish within five minutes.")
+    case .timedOutWithOutput(let output):
+      GitHubCapabilityFailure(
+        category: .timedOut,
+        message: "Git did not finish within five minutes. \(output)"
+      )
     case .cleanupRequired:
       GitHubCapabilityFailure(
         category: .cleanupRequired,

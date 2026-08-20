@@ -837,10 +837,14 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       """
       #!/bin/sh
       set -e
+      printf 'STEP=started\n'
       credential_output=$(printf 'protocol=https\nhost=github.com\npath=octo/repo\n\n' | \
         /usr/bin/git "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" credential fill)
+      printf 'STEP=credential\n'
       touch sandbox-write-probe
+      printf 'STEP=workspace-write\n'
       if touch "$HOME/../sandbox-escape-$$" 2>/dev/null; then exit 91; fi
+      printf 'STEP=escape-denied\n'
       sleep 0.5
       printf 'TEMP_HOME=%s\n%s\n' "$HOME" "$credential_output"
       """
