@@ -122,8 +122,10 @@ struct SymphonyDesktopApp: App {
       )
       namespaceWindowSecurityCoordinator = NamespaceWindowSecurityCoordinator(
         lockCredentials: {
-          try await githubController.quiesceAll()
-          try await namespaceLockController.lockAll()
+          try await CredentialSecurityBarrier(
+            quiesceGitHub: { try await githubController.quiesceAll() },
+            lockCredentials: { try await namespaceLockController.lockAll() }
+          ).secure()
         },
         cancelAuthentication: {
           try await codexAuthenticationController.cancelAll()
@@ -170,8 +172,10 @@ struct SymphonyDesktopApp: App {
       _githubConnectionController = StateObject(wrappedValue: githubController)
       namespaceWindowSecurityCoordinator = NamespaceWindowSecurityCoordinator(
         lockCredentials: {
-          try await githubController.quiesceAll()
-          try await namespaceLockController.lockAll()
+          try await CredentialSecurityBarrier(
+            quiesceGitHub: { try await githubController.quiesceAll() },
+            lockCredentials: { try await namespaceLockController.lockAll() }
+          ).secure()
         },
         cancelAuthentication: {
           try await codexAuthenticationController.cancelAll()
@@ -199,8 +203,14 @@ struct SymphonyDesktopApp: App {
       try await ApplicationSecurityShutdownCoordinator(
         windowSecurity: namespaceWindowSecurityCoordinator,
         lockCredentials: {
-          try await githubConnectionControllerForShutdown.quiesceAll()
-          try await namespaceLockController.shutdownForApplicationTermination()
+          try await CredentialSecurityBarrier(
+            quiesceGitHub: {
+              try await githubConnectionControllerForShutdown.quiesceAll()
+            },
+            lockCredentials: {
+              try await namespaceLockController.shutdownForApplicationTermination()
+            }
+          ).secure()
         },
         shutdownAuthentication: {
           try await authenticationManager.shutdownForApplicationTermination()
@@ -216,6 +226,7 @@ struct SymphonyDesktopApp: App {
         },
         resumeCredentials: {
           await namespaceLockController.resumeAfterApplicationTerminationFailure()
+          githubConnectionControllerForShutdown.resumeAfterSecurityOperation()
         }
       ).shutdown()
     }

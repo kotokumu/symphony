@@ -225,13 +225,12 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
         #!/bin/sh
         printf '{"status":"unlocked"}\n'
         IFS= read -r command
-        /bin/dd if=/dev/zero bs=1048577 count=1 2>/dev/null | /usr/bin/tr '\\000' a
-        printf '\n'
+        /usr/bin/perl -e 'print "a" x 1048577, "\n"'
         """
     )
     let launcher = CredentialBrokerProcessLauncher(
       executableURL: script,
-      handshakeTimeout: 2,
+      handshakeTimeout: 10,
       stopTimeout: 1,
       environment: ["PATH": "/usr/bin:/bin"]
     )

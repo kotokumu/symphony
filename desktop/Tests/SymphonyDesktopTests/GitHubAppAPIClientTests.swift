@@ -41,6 +41,10 @@ final class GitHubAppAPIClientTests: XCTestCase {
     XCTAssertEqual(requests[0].value(forHTTPHeaderField: "Authorization"), "Bearer signed-jwt")
     XCTAssertEqual(requests[1].httpMethod, "POST")
     XCTAssertEqual(
+      requests[1].httpBody,
+      Data("{\"permissions\":{\"metadata\":\"read\"}}".utf8)
+    )
+    XCTAssertEqual(
       requests[2].value(forHTTPHeaderField: "Authorization"),
       "Bearer short-lived-secret"
     )
@@ -173,16 +177,193 @@ final class GitHubAppAPIClientTests: XCTestCase {
     }
   }
 
+  func testRejectsTenFullInstallationPages() async {
+    let page = installationPage(count: 100, startingAt: 1)
+    let transport = StubGitHubTransport(
+      responses: Array(repeating: .json(status: 200, body: page), count: 10)
+    )
+    let client = GitHubAppAPIClient(
+      baseURL: URL(string: "https://api.github.test")!,
+      transport: transport
+    )
+
+    do {
+      _ = try await client.listInstallations(jwt: "jwt")
+      XCTFail("Expected pagination limit")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("too many results"))
+    }
+  }
+
+  func testRejectsAggregateDescriptorBudgetBeforeEncodingBrokerFrame() async {
+    let longLogin = String(repeating: "a", count: 2_000)
+    let record = "{\"id\":1,\"account\":{\"login\":\"\(longLogin)\",\"type\":\"Organization\"},\"permissions\":{},\"suspended_at\":null}"
+    let page = "[\(Array(repeating: record, count: 100).joined(separator: ","))]"
+    let transport = StubGitHubTransport(
+      responses: Array(repeating: .json(status: 200, body: page), count: 10)
+    )
+    let client = GitHubAppAPIClient(
+      baseURL: URL(string: "https://api.github.test")!,
+      transport: transport
+    )
+
+    do {
+      _ = try await client.listInstallations(jwt: "jwt")
+      XCTFail("Expected aggregate descriptor limit")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("more connection data"))
+    }
+  }
+
+  func testPaginatesRepositoriesWithDownscopedInstallationToken() async throws {
+    let transport = StubGitHubTransport(
+      responses: [
+        .json(status: 201, body: "{\"token\":\"token\"}"),
+        .json(status: 200, body: repositoryPage(count: 100, startingAt: 1)),
+        .json(status: 200, body: repositoryPage(count: 1, startingAt: 101)),
+      ]
+    )
+    let client = GitHubAppAPIClient(
+      baseURL: URL(string: "https://api.github.test")!,
+      transport: transport
+    )
+
+    let repositories = try await client.listRepositories(installationID: 20, jwt: "jwt")
+
+    XCTAssertEqual(repositories.count, 101)
+    let requests = await transport.requests
+    XCTAssertEqual(requests[2].url?.query, "per_page=100&page=2")
+    XCTAssertEqual(
+      requests[0].httpBody,
+      Data("{\"permissions\":{\"metadata\":\"read\"}}".utf8)
+    )
+  }
+
+  func testRejectsMalformedInstallationTokenResponse() async {
+    let client = GitHubAppAPIClient(
+      baseURL: URL(string: "https://api.github.test")!,
+      transport: StubGitHubTransport(responses: [.json(status: 201, body: "{}")])
+    )
+
+    do {
+      _ = try await client.listRepositories(installationID: 20, jwt: "jwt")
+      XCTFail("Expected malformed token rejection")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("unreadable response"))
+    }
+  }
+
+  func testExpiredOperationDeadlineSendsNoCredential() async {
+    let transport = StubGitHubTransport(responses: [])
+    let client = GitHubAppAPIClient(
+      baseURL: URL(string: "https://api.github.test")!,
+      transport: transport,
+      operationTimeout: .zero
+    )
+
+    do {
+      _ = try await client.listInstallations(jwt: "secret-jwt")
+      XCTFail("Expected deadline failure")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("deadline"))
+    }
+    let requests = await transport.requests
+    XCTAssertTrue(requests.isEmpty)
+  }
+
+  func testURLSessionTransportStopsAtStreamingBodyLimit() async throws {
+    let configuration = URLSessionGitHubHTTPTransport.makeEphemeralConfiguration()
+    configuration.protocolClasses = [StreamingGitHubURLProtocol.self]
+    StreamingGitHubURLProtocol.responseData = Data(repeating: 0x61, count: 17)
+    StreamingGitHubURLProtocol.contentLength = nil
+    let transport = URLSessionGitHubHTTPTransport(
+      session: URLSession(configuration: configuration)
+    )
+    let request = URLRequest(url: URL(string: "https://api.github.test/data")!)
+
+    do {
+      _ = try await transport.data(
+        for: request,
+        maximumBytes: 16,
+        deadline: ContinuousClock.now.advanced(by: .seconds(1))
+      )
+      XCTFail("Expected streaming body limit")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("more connection data"))
+    }
+  }
+
+  func testURLSessionTransportRejectsOversizedContentLengthBeforeBody() async throws {
+    let configuration = URLSessionGitHubHTTPTransport.makeEphemeralConfiguration()
+    configuration.protocolClasses = [StreamingGitHubURLProtocol.self]
+    StreamingGitHubURLProtocol.responseData = Data()
+    StreamingGitHubURLProtocol.contentLength = 17
+    let transport = URLSessionGitHubHTTPTransport(
+      session: URLSession(configuration: configuration)
+    )
+    let request = URLRequest(url: URL(string: "https://api.github.test/data")!)
+
+    do {
+      _ = try await transport.data(
+        for: request,
+        maximumBytes: 16,
+        deadline: ContinuousClock.now.advanced(by: .seconds(1))
+      )
+      XCTFail("Expected content length limit")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("more connection data"))
+    }
+  }
+
   private func installationPage(count: Int, startingAt firstID: Int) -> String {
     let values = (firstID..<(firstID + count)).map { id in
       "{\"id\":\(id),\"account\":{\"login\":\"account-\(id)\",\"type\":\"Organization\"},\"permissions\":{\"issues\":\"read\",\"contents\":\"write\"},\"suspended_at\":null}"
     }
     return "[\(values.joined(separator: ","))]"
   }
+
+  private func repositoryPage(count: Int, startingAt firstID: Int) -> String {
+    let values = (firstID..<(firstID + count)).map { id in
+      "{\"id\":\(id),\"full_name\":\"octo/repository-\(id)\",\"html_url\":\"https://github.com/octo/repository-\(id)\",\"private\":true}"
+    }
+    return "{\"repositories\":[\(values.joined(separator: ","))]}"
+  }
+}
+
+private final class StreamingGitHubURLProtocol: URLProtocol, @unchecked Sendable {
+  nonisolated(unsafe) static var responseData = Data()
+  nonisolated(unsafe) static var contentLength: Int?
+
+  override class func canInit(with request: URLRequest) -> Bool { true }
+  override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+  override func startLoading() {
+    var headers: [String: String] = ["Content-Type": "application/json"]
+    if let contentLength = Self.contentLength {
+      headers["Content-Length"] = String(contentLength)
+    }
+    let response = HTTPURLResponse(
+      url: request.url!,
+      statusCode: 200,
+      httpVersion: "HTTP/1.1",
+      headerFields: headers
+    )!
+    client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+    if !Self.responseData.isEmpty {
+      client?.urlProtocol(self, didLoad: Self.responseData)
+    }
+    client?.urlProtocolDidFinishLoading(self)
+  }
+
+  override func stopLoading() {}
 }
 
 private struct FailingGitHubTransport: GitHubHTTPTransporting {
-  func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+  func data(
+    for request: URLRequest,
+    maximumBytes: Int,
+    deadline: ContinuousClock.Instant
+  ) async throws -> (Data, HTTPURLResponse) {
     throw URLError(.notConnectedToInternet)
   }
 }
@@ -204,7 +385,11 @@ private actor StubGitHubTransport: GitHubHTTPTransporting {
     self.responses = responses
   }
 
-  func data(for request: URLRequest) throws -> (Data, HTTPURLResponse) {
+  func data(
+    for request: URLRequest,
+    maximumBytes: Int,
+    deadline: ContinuousClock.Instant
+  ) throws -> (Data, HTTPURLResponse) {
     requests.append(request)
     let response = responses.removeFirst()
     return (

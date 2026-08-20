@@ -40,6 +40,7 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
 
   private let executableURL: URL?
   private let handshakeTimeout: TimeInterval
+  private let capabilityTimeout: TimeInterval
   private let stopTimeout: TimeInterval
   private let environment: [String: String]
   private let forceKill: ForceKill
@@ -50,12 +51,14 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
   public init(
     executableURL: URL?,
     handshakeTimeout: TimeInterval = 60,
+    capabilityTimeout: TimeInterval = CredentialBrokerProtocolLimits.defaultCapabilityTimeout,
     stopTimeout: TimeInterval = 2,
     environment: [String: String] = ProcessInfo.processInfo.environment,
     forceKill: @escaping ForceKill = { Darwin.kill($0, SIGKILL) }
   ) {
     self.executableURL = executableURL
     self.handshakeTimeout = handshakeTimeout
+    self.capabilityTimeout = capabilityTimeout
     self.stopTimeout = stopTimeout
     self.environment = NamespaceProcessEnvironment.sanitized(environment)
     self.forceKill = forceKill
@@ -65,6 +68,7 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
   init(
     executableURL: URL?,
     handshakeTimeout: TimeInterval,
+    capabilityTimeout: TimeInterval = CredentialBrokerProtocolLimits.defaultCapabilityTimeout,
     stopTimeout: TimeInterval,
     environment: [String: String],
     forceKill: @escaping ForceKill,
@@ -72,6 +76,7 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
   ) {
     self.executableURL = executableURL
     self.handshakeTimeout = handshakeTimeout
+    self.capabilityTimeout = capabilityTimeout
     self.stopTimeout = stopTimeout
     self.environment = NamespaceProcessEnvironment.sanitized(environment)
     self.forceKill = forceKill
@@ -245,7 +250,7 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
       throw CredentialBrokerProcessError.sessionNotRunning
     }
     let outputDescriptor = output.fileDescriptor
-    let responseTimeout = handshakeTimeout
+    let responseTimeout = capabilityTimeout
     do {
       var requestData = try JSONEncoder().encode(command)
       guard requestData.count <= CredentialBrokerProtocolLimits.maximumCommandBytes else {
@@ -563,6 +568,14 @@ private enum BrokerPipeReader {
       }
       accumulated.append(contentsOf: buffer.prefix(count))
       if let newline = accumulated.firstIndex(of: 0x0A) {
+        guard newline <= maximumBytes else {
+          switch context {
+          case .handshake:
+            throw CredentialBrokerProcessError.handshakeFailed
+          case .capability:
+            throw CredentialBrokerProcessError.capabilityResponseTooLarge
+          }
+        }
         return accumulated[..<newline]
       }
       guard accumulated.count <= maximumBytes else {

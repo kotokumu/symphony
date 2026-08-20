@@ -75,6 +75,8 @@ final class GitHubConnectionController: ObservableObject {
   private let broker: any GitHubConnectionBrokering
   private let credentialCleanup: any GitHubCredentialCleaning
   private var operations: [Namespace.ID: Operation] = [:]
+  private var cancellationTasks: [Namespace.ID: Task<Result<String?, Error>, Never>] = [:]
+  private var admissionSuspended = false
 
   init(
     broker: any GitHubConnectionBrokering,
@@ -88,6 +90,8 @@ final class GitHubConnectionController: ObservableObject {
     states[namespaceID] ?? .idle
   }
 
+  var isAdmissionSuspended: Bool { admissionSuspended }
+
   func beginConnection(
     namespaceID: Namespace.ID,
     appIDText: String,
@@ -96,6 +100,9 @@ final class GitHubConnectionController: ObservableObject {
     guard let appID = Int64(appIDText), appID > 0 else {
       states[namespaceID] = .failed(GitHubConnectionSetupError.invalidAppID.localizedDescription)
       return
+    }
+    if operations[namespaceID] != nil, case .failed = state(for: namespaceID) {
+      guard await cancelSetup(namespaceID: namespaceID) == nil else { return }
     }
     guard let operationID = reserve(.setup, namespaceID: namespaceID) else { return }
     states[namespaceID] = .loadingInstallations
@@ -361,48 +368,54 @@ final class GitHubConnectionController: ObservableObject {
     guard previous.kind == .setup || previous.kind == .cancelling else {
       return GitHubConnectionSetupError.operationInProgress.localizedDescription
     }
+    if previous.kind == .cancelling, let existing = cancellationTasks[namespaceID] {
+      return cancellationWarning(from: await existing.value)
+    }
     let operationID = UUID()
     operations[namespaceID] = Operation(id: operationID, kind: .cancelling, inFlight: nil)
-    await previous.inFlight?.value
-    do {
-      if let warning = try await credentialCleanup.cleanup(namespaceID) {
+    let task = Task { [credentialCleanup] in
+      await previous.inFlight?.value
+      do {
+        return Result<String?, Error>.success(
+          try await credentialCleanup.cleanup(namespaceID)
+        )
+      } catch {
+        return .failure(error)
+      }
+    }
+    cancellationTasks[namespaceID] = task
+    track(task, namespaceID: namespaceID, operationID: operationID)
+    let result = await task.value
+    clearInFlight(namespaceID: namespaceID, operationID: operationID)
+    guard owns(operationID, namespaceID: namespaceID) else { return nil }
+    switch result {
+    case .success(let warning):
+      if let warning {
         states[namespaceID] = .failed(warning)
+        cancellationTasks.removeValue(forKey: namespaceID)
         return warning
       }
       states[namespaceID] = .idle
       release(namespaceID: namespaceID, operationID: operationID)
       return nil
-    } catch {
+    case .failure(let error):
       let message = "Connection setup was cancelled, but protected credential cleanup is pending: \(error.localizedDescription)"
       states[namespaceID] = .failed(message)
+      cancellationTasks.removeValue(forKey: namespaceID)
       return message
     }
   }
 
   func quiesceAll() async throws {
+    admissionSuspended = true
     var failures: [String] = []
     for namespaceID in Array(operations.keys) {
       guard let operation = operations[namespaceID] else { continue }
-      if operation.kind == .setup, state(for: namespaceID) != .saving {
-        let cancellationID = UUID()
-        operations[namespaceID] = Operation(
-          id: cancellationID,
-          kind: .cancelling,
-          inFlight: nil
-        )
-        await operation.inFlight?.value
-        do {
-          if let warning = try await credentialCleanup.cleanup(namespaceID) {
-            states[namespaceID] = .failed(warning)
-            failures.append(warning)
-          } else {
-            states[namespaceID] = .idle
-            release(namespaceID: namespaceID, operationID: cancellationID)
-          }
-        } catch {
-          let message = "GitHub setup could not be secured: \(error.localizedDescription)"
-          states[namespaceID] = .failed(message)
-          failures.append(message)
+      if (operation.kind == .setup || operation.kind == .cancelling),
+        state(for: namespaceID) != .saving
+      {
+        if let warning = await cancelSetup(namespaceID: namespaceID) {
+          failures.append(warning)
         }
       } else {
         await operation.inFlight?.value
@@ -419,11 +432,24 @@ final class GitHubConnectionController: ObservableObject {
     }
   }
 
+  func resumeAfterSecurityOperation() {
+    admissionSuspended = false
+  }
+
   private func reserve(_ kind: OperationKind, namespaceID: Namespace.ID) -> UUID? {
-    guard operations[namespaceID] == nil else { return nil }
+    guard !admissionSuspended, operations[namespaceID] == nil else { return nil }
     let id = UUID()
     operations[namespaceID] = Operation(id: id, kind: kind, inFlight: nil)
     return id
+  }
+
+  private func cancellationWarning(from result: Result<String?, Error>) -> String? {
+    switch result {
+    case .success(let warning):
+      return warning
+    case .failure(let error):
+      return "Connection setup was cancelled, but protected credential cleanup is pending: \(error.localizedDescription)"
+    }
   }
 
   private func setupOperationID(_ namespaceID: Namespace.ID) -> UUID? {
@@ -456,6 +482,7 @@ final class GitHubConnectionController: ObservableObject {
   private func release(namespaceID: Namespace.ID, operationID: UUID) {
     guard owns(operationID, namespaceID: namespaceID) else { return }
     operations.removeValue(forKey: namespaceID)
+    cancellationTasks.removeValue(forKey: namespaceID)
   }
 }
 

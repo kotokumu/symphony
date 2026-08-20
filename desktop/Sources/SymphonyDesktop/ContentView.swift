@@ -28,6 +28,7 @@ struct ContentView: View {
       }
     }
     .task {
+      githubConnectionController.resumeAfterSecurityOperation()
       await daemonController.startObserving()
       await authenticationController.startObserving()
       if controller.loadState == .loading {

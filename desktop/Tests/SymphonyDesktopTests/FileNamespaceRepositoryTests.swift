@@ -67,14 +67,26 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     XCTAssertEqual(connected.selectedNamespace?.platformConnection, .github(connection))
     let metadataURL = storageDirectory.appendingPathComponent("namespaces.json")
     let metadata = try Data(contentsOf: metadataURL)
-    let serialized = try XCTUnwrap(String(data: metadata, encoding: .utf8))
-    XCTAssertTrue(serialized.contains("\"version\":2"))
-    XCTAssertTrue(serialized.contains("octo/research"))
-    XCTAssertFalse(serialized.contains("privateKey"))
-    XCTAssertFalse(serialized.contains("/private/"))
-    XCTAssertFalse(serialized.contains("Bearer "))
-    XCTAssertFalse(serialized.contains("jwt"))
-    XCTAssertFalse(serialized.contains("token"))
+    let document = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: metadata) as? [String: Any]
+    )
+    XCTAssertEqual(Set(document.keys), ["namespaces", "selectedID", "version"])
+    XCTAssertEqual((document["version"] as? NSNumber)?.intValue, 2)
+    let records = try XCTUnwrap(document["namespaces"] as? [[String: Any]])
+    let record = try XCTUnwrap(records.first)
+    XCTAssertEqual(Set(record.keys), ["id", "name", "platformConnection"])
+    let platform = try XCTUnwrap(record["platformConnection"] as? [String: Any])
+    XCTAssertEqual(Set(platform.keys), ["github", "kind"])
+    XCTAssertEqual(platform["kind"] as? String, "github")
+    let github = try XCTUnwrap(platform["github"] as? [String: Any])
+    XCTAssertEqual(
+      Set(github.keys),
+      [
+        "accountLogin", "appID", "installationID", "repositoryFullName", "repositoryID",
+        "repositoryURL",
+      ]
+    )
+    XCTAssertEqual(github["repositoryFullName"] as? String, "octo/research")
     let oldNamespaceID = UUID()
     let oldDirectory = repository.directoryURL(for: oldNamespaceID)
     try FileManager.default.createDirectory(at: oldDirectory, withIntermediateDirectories: true)
@@ -90,9 +102,9 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     XCTAssertNil(migrated.selectedNamespace?.platformConnection)
     try await repository.save(migrated)
     let rewritten = try XCTUnwrap(
-      String(data: Data(contentsOf: metadataURL), encoding: .utf8)
+      JSONSerialization.jsonObject(with: Data(contentsOf: metadataURL)) as? [String: Any]
     )
-    XCTAssertTrue(rewritten.contains("\"version\":2"))
+    XCTAssertEqual((rewritten["version"] as? NSNumber)?.intValue, 2)
   }
 
   func testDoesNotOverwriteCorruptMetadata() async throws {

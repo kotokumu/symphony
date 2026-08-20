@@ -161,8 +161,9 @@ final class GitHubConnectionControllerTests: XCTestCase {
 
   func testCancelWaitsForDiscoveryAndDoesNotPublishItsStaleResult() async throws {
     let namespaceID = UUID()
-    let broker = GatedGitHubConnectionBroker()
-    let cleanup = RecordingGitHubCredentialCleanup()
+    let events = LifecycleEventRecorder()
+    let broker = GatedGitHubConnectionBroker(events: events)
+    let cleanup = RecordingGitHubCredentialCleanup(events: events)
     let controller = GitHubConnectionController(broker: broker, credentialCleanup: cleanup)
     let begin = Task {
       await controller.beginConnection(
@@ -174,17 +175,18 @@ final class GitHubConnectionControllerTests: XCTestCase {
     await broker.waitUntilInstallationDiscoveryStarts()
 
     let cancel = Task { await controller.cancelSetup(namespaceID: namespaceID) }
-    await Task.yield()
-    var cleaned = await cleanup.cleaned
-    XCTAssertEqual(cleaned, [])
-
     await broker.finishInstallationDiscovery()
     _ = await begin.value
     let cancellationWarning = await cancel.value
     XCTAssertNil(cancellationWarning)
     XCTAssertEqual(controller.state(for: namespaceID), .idle)
-    cleaned = await cleanup.cleaned
+    let cleaned = await cleanup.cleaned
+    let recordedEvents = await events.values
     XCTAssertEqual(cleaned, [namespaceID])
+    XCTAssertEqual(
+      recordedEvents,
+      ["configuration-finished", "installations-started", "installations-finished", "cleanup"]
+    )
 
     await controller.beginConnection(
       namespaceID: namespaceID,
@@ -199,8 +201,9 @@ final class GitHubConnectionControllerTests: XCTestCase {
 
   func testCancelWaitsForPrivateKeyConfigurationBeforePurging() async {
     let namespaceID = UUID()
-    let broker = GatedGitHubConnectionBroker(gatePoint: .configuration)
-    let cleanup = RecordingGitHubCredentialCleanup()
+    let events = LifecycleEventRecorder()
+    let broker = GatedGitHubConnectionBroker(gatePoint: .configuration, events: events)
+    let cleanup = RecordingGitHubCredentialCleanup(events: events)
     let controller = GitHubConnectionController(broker: broker, credentialCleanup: cleanup)
     let begin = Task {
       await controller.beginConnection(
@@ -212,16 +215,51 @@ final class GitHubConnectionControllerTests: XCTestCase {
     await broker.waitUntilGateStarts()
 
     let cancel = Task { await controller.cancelSetup(namespaceID: namespaceID) }
-    await Task.yield()
-    var cleaned = await cleanup.cleaned
-    XCTAssertTrue(cleaned.isEmpty)
     await broker.finishGate()
     _ = await begin.value
     _ = await cancel.value
 
-    cleaned = await cleanup.cleaned
+    let cleaned = await cleanup.cleaned
+    let recordedEvents = await events.values
     XCTAssertEqual(cleaned, [namespaceID])
+    XCTAssertEqual(
+      recordedEvents,
+      ["configuration-started", "configuration-finished", "installations-finished", "cleanup"]
+    )
     XCTAssertEqual(controller.state(for: namespaceID), .idle)
+  }
+
+  func testConcurrentCancelCallsShareOneJoinAndOneCleanup() async {
+    let namespaceID = UUID()
+    let events = LifecycleEventRecorder()
+    let broker = GatedGitHubConnectionBroker(gatePoint: .configuration, events: events)
+    let cleanup = RecordingGitHubCredentialCleanup(events: events)
+    let controller = GitHubConnectionController(broker: broker, credentialCleanup: cleanup)
+    let begin = Task {
+      await controller.beginConnection(
+        namespaceID: namespaceID,
+        appIDText: "10",
+        privateKeyFileURL: URL(fileURLWithPath: "/private/key.pem")
+      )
+    }
+    await broker.waitUntilGateStarts()
+    let firstCancel = Task { await controller.cancelSetup(namespaceID: namespaceID) }
+    let secondCancel = Task { await controller.cancelSetup(namespaceID: namespaceID) }
+
+    await broker.finishGate()
+    _ = await begin.value
+    let firstWarning = await firstCancel.value
+    let secondWarning = await secondCancel.value
+    XCTAssertNil(firstWarning)
+    XCTAssertNil(secondWarning)
+
+    let cleaned = await cleanup.cleaned
+    let recordedEvents = await events.values
+    XCTAssertEqual(cleaned, [namespaceID])
+    XCTAssertEqual(
+      recordedEvents,
+      ["configuration-started", "configuration-finished", "installations-finished", "cleanup"]
+    )
   }
 
   func testCancelWaitsForRepositoryDiscoveryAndRejectsStaleSelection() async throws {
@@ -325,6 +363,46 @@ final class GitHubConnectionControllerTests: XCTestCase {
     XCTAssertEqual(controller.state(for: namespaceID), .idle)
     let cleaned = await cleanup.cleaned
     XCTAssertEqual(cleaned, [namespaceID])
+  }
+
+  func testQuiescenceClosesAdmissionUntilExplicitResume() async throws {
+    let first = UUID()
+    let second = UUID()
+    let broker = GatedGitHubConnectionBroker(gatePoint: .installations)
+    let controller = GitHubConnectionController(
+      broker: broker,
+      credentialCleanup: RecordingGitHubCredentialCleanup()
+    )
+    let begin = Task {
+      await controller.beginConnection(
+        namespaceID: first,
+        appIDText: "10",
+        privateKeyFileURL: URL(fileURLWithPath: "/private/first.pem")
+      )
+    }
+    await broker.waitUntilGateStarts()
+    let quiesce = Task { try await controller.quiesceAll() }
+    while !controller.isAdmissionSuspended { await Task.yield() }
+
+    await controller.beginConnection(
+      namespaceID: second,
+      appIDText: "11",
+      privateKeyFileURL: URL(fileURLWithPath: "/private/second.pem")
+    )
+    XCTAssertEqual(controller.state(for: second), .idle)
+    await broker.finishGate()
+    _ = await begin.value
+    try await quiesce.value
+
+    controller.resumeAfterSecurityOperation()
+    await controller.beginConnection(
+      namespaceID: second,
+      appIDText: "11",
+      privateKeyFileURL: URL(fileURLWithPath: "/private/second.pem")
+    )
+    guard case .choosingInstallation = controller.state(for: second) else {
+      return XCTFail("Expected admission to reopen")
+    }
   }
 
   func testSavedConnectionCheckCoversSuccessPermissionDriftAndRepositoryRevocation() async throws {
@@ -457,6 +535,107 @@ final class GitHubConnectionControllerTests: XCTestCase {
     XCTAssertTrue(message.contains("reconcile it after restart"))
   }
 
+  func testFailedSetupStagesCleanUpBeforeDirectRetry() async throws {
+    for stage in RetryingGitHubConnectionBroker.FailureStage.allCases {
+      let namespaceID = UUID()
+      let broker = RetryingGitHubConnectionBroker(failureStage: stage)
+      let cleanup = RecordingGitHubCredentialCleanup()
+      let controller = GitHubConnectionController(broker: broker, credentialCleanup: cleanup)
+
+      await controller.beginConnection(
+        namespaceID: namespaceID,
+        appIDText: "10",
+        privateKeyFileURL: URL(fileURLWithPath: "/private/key.pem")
+      )
+      if stage == .repositories {
+        guard case .choosingInstallation(_, let installations) = controller.state(for: namespaceID)
+        else { return XCTFail("Expected first installation selection") }
+        await controller.chooseInstallation(installations[0], namespaceID: namespaceID)
+      }
+      guard case .failed = controller.state(for: namespaceID) else {
+        return XCTFail("Expected first \(stage) attempt to fail")
+      }
+
+      await controller.beginConnection(
+        namespaceID: namespaceID,
+        appIDText: "10",
+        privateKeyFileURL: URL(fileURLWithPath: "/private/key.pem")
+      )
+      guard case .choosingInstallation(_, let installations) = controller.state(for: namespaceID)
+      else { return XCTFail("Expected retry to load installations") }
+      if stage == .repositories {
+        await controller.chooseInstallation(installations[0], namespaceID: namespaceID)
+        guard case .choosingRepository = controller.state(for: namespaceID) else {
+          return XCTFail("Expected repository retry to succeed")
+        }
+      }
+      let cleaned = await cleanup.cleaned
+      XCTAssertEqual(cleaned, [namespaceID])
+    }
+  }
+
+  func testSaveRollbackWarningAndErrorRemainRetryableThroughCleanup() async throws {
+    let cleanupFailures: [Result<String?, Error>] = [
+      .success("Purge pending."),
+      .failure(TestGitHubConnectionError.cleanupFailed),
+    ]
+    for failure in cleanupFailures {
+      let namespaceID = UUID()
+      let cleanup = RecordingGitHubCredentialCleanup(
+        cleanupResults: [failure, .success(nil)]
+      )
+      let controller = GitHubConnectionController(
+        broker: RecordingGitHubConnectionBroker(),
+        credentialCleanup: cleanup
+      )
+      await controller.beginConnection(
+        namespaceID: namespaceID,
+        appIDText: "10",
+        privateKeyFileURL: URL(fileURLWithPath: "/private/key.pem")
+      )
+      guard case .choosingInstallation(_, let installations) = controller.state(for: namespaceID)
+      else { return XCTFail("Expected installations") }
+      await controller.chooseInstallation(installations[0], namespaceID: namespaceID)
+      guard case .choosingRepository(_, _, let repositories) = controller.state(for: namespaceID)
+      else { return XCTFail("Expected repositories") }
+
+      do {
+        try await controller.connect(repositories[0], namespaceID: namespaceID) { _ in
+          throw TestGitHubConnectionError.saveFailed
+        }
+        XCTFail("Expected rollback failure")
+      } catch {
+        XCTAssertEqual(error.localizedDescription, GitHubConnectionSetupError.rollbackFailed.localizedDescription)
+      }
+      let retryWarning = await controller.cancelSetup(namespaceID: namespaceID)
+      XCTAssertNil(retryWarning)
+      XCTAssertEqual(controller.state(for: namespaceID), .idle)
+    }
+  }
+
+  func testDisconnectLedgerRollbackFailureCanBeRetried() async throws {
+    let namespaceID = UUID()
+    let cleanup = RecordingGitHubCredentialCleanup(
+      committedError: TestGitHubConnectionError.ledgerFailed
+    )
+    let controller = GitHubConnectionController(
+      broker: RecordingGitHubConnectionBroker(),
+      credentialCleanup: cleanup
+    )
+    do {
+      _ = try await controller.disconnect(namespaceID: namespaceID) {
+        throw TestGitHubConnectionError.saveFailed
+      }
+      XCTFail("Expected rollback bookkeeping failure")
+    } catch {
+      XCTAssertEqual(error.localizedDescription, GitHubConnectionSetupError.rollbackFailed.localizedDescription)
+    }
+
+    let warning = try await controller.disconnect(namespaceID: namespaceID) {}
+    XCTAssertNil(warning)
+    XCTAssertEqual(controller.state(for: namespaceID), .idle)
+  }
+
   func testSetupLedgerFailureDoesNotImportPrivateKey() async {
     let namespaceID = UUID()
     let broker = RecordingGitHubConnectionBroker()
@@ -587,17 +766,20 @@ private actor RecordingGitHubCredentialCleanup: GitHubCredentialCleaning {
   private let operations: MainActorOperationRecorder?
   private let setupError: Error?
   private let committedError: Error?
+  private let events: LifecycleEventRecorder?
   private var cleanupResults: [Result<String?, Error>]
 
   init(
     operations: MainActorOperationRecorder? = nil,
     setupError: Error? = nil,
     committedError: Error? = nil,
+    events: LifecycleEventRecorder? = nil,
     cleanupResults: [Result<String?, Error>] = []
   ) {
     self.operations = operations
     self.setupError = setupError
     self.committedError = committedError
+    self.events = events
     self.cleanupResults = cleanupResults
   }
 
@@ -609,6 +791,7 @@ private actor RecordingGitHubCredentialCleanup: GitHubCredentialCleaning {
 
   func cleanup(_ namespaceID: UUID) async throws -> String? {
     cleaned.append(namespaceID)
+    await events?.append("cleanup")
     await operations?.append("purge")
     if !cleanupResults.isEmpty { return try cleanupResults.removeFirst().get() }
     return nil
@@ -629,19 +812,29 @@ private actor GatedGitHubConnectionBroker: GitHubConnectionBrokering {
 
   private let gate = AsyncGate()
   private let gatePoint: GatePoint
+  private let events: LifecycleEventRecorder?
   private(set) var configured: [Configuration] = []
 
-  init(gatePoint: GatePoint = .installations) {
+  init(gatePoint: GatePoint = .installations, events: LifecycleEventRecorder? = nil) {
     self.gatePoint = gatePoint
+    self.events = events
   }
 
   func configureGitHubApp(appID: Int64, privateKeyFileURL: URL, namespaceID: UUID) async {
     configured.append(Configuration(namespaceID: namespaceID, appID: appID, keyURL: privateKeyFileURL))
-    if gatePoint == .configuration { await gate.wait() }
+    if gatePoint == .configuration {
+      await events?.append("configuration-started")
+      await gate.wait()
+    }
+    await events?.append("configuration-finished")
   }
 
   func discoverGitHubInstallations(namespaceID: UUID) async -> [GitHubInstallation] {
-    if gatePoint == .installations { await gate.wait() }
+    if gatePoint == .installations {
+      await events?.append("installations-started")
+      await gate.wait()
+    }
+    await events?.append("installations-finished")
     return [
       GitHubInstallation(
         id: 20,
@@ -674,6 +867,60 @@ private actor GatedGitHubConnectionBroker: GitHubConnectionBrokering {
   func finishGate() async { await gate.open() }
 }
 
+private actor RetryingGitHubConnectionBroker: GitHubConnectionBrokering {
+  enum FailureStage: CaseIterable, Equatable {
+    case configuration
+    case installations
+    case repositories
+  }
+
+  private let failureStage: FailureStage
+  private var configurationCalls = 0
+  private var installationCalls = 0
+  private var repositoryCalls = 0
+
+  init(failureStage: FailureStage) {
+    self.failureStage = failureStage
+  }
+
+  func configureGitHubApp(appID: Int64, privateKeyFileURL: URL, namespaceID: UUID) throws {
+    configurationCalls += 1
+    if failureStage == .configuration, configurationCalls == 1 {
+      throw TestGitHubConnectionError.serviceFailed
+    }
+  }
+
+  func discoverGitHubInstallations(namespaceID: UUID) -> [GitHubInstallation] {
+    installationCalls += 1
+    if failureStage == .installations, installationCalls == 1 { return [] }
+    return [
+      GitHubInstallation(
+        id: 20,
+        accountLogin: "octo",
+        accountType: "Organization",
+        permissions: ["issues": "read", "contents": "write"],
+        isSuspended: false
+      )
+    ]
+  }
+
+  func discoverGitHubRepositories(
+    installationID: Int64,
+    namespaceID: UUID
+  ) -> [GitHubRepository] {
+    repositoryCalls += 1
+    if failureStage == .repositories, repositoryCalls == 1 { return [] }
+    return [
+      GitHubRepository(
+        id: 30,
+        fullName: "octo/research",
+        htmlURL: URL(string: "https://github.com/octo/research")!,
+        isPrivate: true
+      )
+    ]
+  }
+}
+
 private actor AsyncGate {
   private var entered = false
   private var isOpen = false
@@ -700,6 +947,11 @@ private actor AsyncGate {
   }
 }
 
+private actor LifecycleEventRecorder {
+  private(set) var values: [String] = []
+  func append(_ value: String) { values.append(value) }
+}
+
 @MainActor
 private final class MainActorOperationRecorder: @unchecked Sendable {
   private(set) var values: [String] = []
@@ -709,10 +961,14 @@ private final class MainActorOperationRecorder: @unchecked Sendable {
 private enum TestGitHubConnectionError: LocalizedError {
   case saveFailed
   case ledgerFailed
+  case cleanupFailed
+  case serviceFailed
   var errorDescription: String? {
     switch self {
     case .saveFailed: "Connection save failed."
     case .ledgerFailed: "Cleanup ledger failed."
+    case .cleanupFailed: "Cleanup failed."
+    case .serviceFailed: "GitHub service failed."
     }
   }
 }

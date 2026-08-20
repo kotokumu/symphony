@@ -2,7 +2,12 @@ import Foundation
 import SymphonyCredentialBrokerProtocol
 
 public protocol GitHubHTTPTransporting: Sendable {
-  func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse)
+  /// Must stop reading and return no later than `deadline`.
+  func data(
+    for request: URLRequest,
+    maximumBytes: Int,
+    deadline: ContinuousClock.Instant
+  ) async throws -> (Data, HTTPURLResponse)
 }
 
 public struct URLSessionGitHubHTTPTransport: GitHubHTTPTransporting {
@@ -26,10 +31,36 @@ public struct URLSessionGitHubHTTPTransport: GitHubHTTPTransporting {
     URLSession(configuration: makeEphemeralConfiguration())
   }
 
-  public func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
-    let (data, response) = try await session.data(for: request)
+  public func data(
+    for request: URLRequest,
+    maximumBytes: Int,
+    deadline: ContinuousClock.Instant
+  ) async throws -> (Data, HTTPURLResponse) {
+    var boundedRequest = request
+    let remaining = ContinuousClock.now.duration(to: deadline)
+    guard remaining > .zero else { throw GitHubAppAPIError.requestTimedOut }
+    let components = remaining.components
+    boundedRequest.timeoutInterval = min(
+      boundedRequest.timeoutInterval,
+      Double(components.seconds) + Double(components.attoseconds) / 1e18
+    )
+    let (bytes, response) = try await session.bytes(for: boundedRequest)
     guard let response = response as? HTTPURLResponse else {
       throw GitHubAppAPIError.invalidResponse
+    }
+    guard response.expectedContentLength < 0 || response.expectedContentLength <= maximumBytes else {
+      throw GitHubAppAPIError.responseTooLarge
+    }
+    var data = Data()
+    data.reserveCapacity(min(maximumBytes, 64 * 1_024))
+    for try await byte in bytes {
+      guard ContinuousClock.now < deadline else {
+        throw GitHubAppAPIError.requestTimedOut
+      }
+      guard data.count < maximumBytes else {
+        throw GitHubAppAPIError.responseTooLarge
+      }
+      data.append(byte)
     }
     return (data, response)
   }
@@ -46,17 +77,20 @@ public protocol GitHubAppAPIRequesting: Sendable {
 public struct GitHubAppAPIClient: GitHubAppAPIRequesting {
   private let baseURL: URL
   private let transport: any GitHubHTTPTransporting
+  private let operationTimeout: Duration
 
   public init(
     baseURL: URL = URL(string: "https://api.github.com")!,
-    transport: any GitHubHTTPTransporting = URLSessionGitHubHTTPTransport()
+    transport: any GitHubHTTPTransporting = URLSessionGitHubHTTPTransport(),
+    operationTimeout: Duration = CredentialBrokerProtocolLimits.defaultGitHubOperationTimeout
   ) {
     self.baseURL = baseURL
     self.transport = transport
+    self.operationTimeout = operationTimeout
   }
 
   public func listInstallations(jwt: String) async throws -> [GitHubInstallationDescriptor] {
-    let deadline = Date().addingTimeInterval(50)
+    let deadline = ContinuousClock.now.advanced(by: operationTimeout)
     var all: [GitHubInstallationDescriptor] = []
     for page in 1...10 {
       let request = try makeRequest(
@@ -81,14 +115,14 @@ public struct GitHubAppAPIClient: GitHubAppAPIRequesting {
     guard installationID > 0 else {
       throw GitHubAppAPIError.installationRevoked
     }
-    let deadline = Date().addingTimeInterval(50)
+    let deadline = ContinuousClock.now.advanced(by: operationTimeout)
     var tokenRequest = try makeRequest(
       path: "/app/installations/\(installationID)/access_tokens",
       bearer: jwt,
       deadline: deadline
     )
     tokenRequest.httpMethod = "POST"
-    tokenRequest.httpBody = Data("{}".utf8)
+    tokenRequest.httpBody = Data("{\"permissions\":{\"metadata\":\"read\"}}".utf8)
     let tokenData = try await send(
       tokenRequest,
       authentication: .installation(installationID),
@@ -125,7 +159,7 @@ public struct GitHubAppAPIClient: GitHubAppAPIRequesting {
     path: String,
     bearer: String,
     queryItems: [URLQueryItem] = [],
-    deadline: Date
+    deadline: ContinuousClock.Instant
   ) throws -> URLRequest {
     guard baseURL.scheme?.lowercased() == "https" else {
       throw GitHubAppAPIError.insecureBaseURL
@@ -138,9 +172,13 @@ public struct GitHubAppAPIClient: GitHubAppAPIRequesting {
       throw GitHubAppAPIError.invalidResponse
     }
     var request = URLRequest(url: url)
-    let remaining = deadline.timeIntervalSinceNow
-    guard remaining > 0 else { throw GitHubAppAPIError.requestTimedOut }
-    request.timeoutInterval = min(30, remaining)
+    let remaining = ContinuousClock.now.duration(to: deadline)
+    guard remaining > .zero else { throw GitHubAppAPIError.requestTimedOut }
+    let durationComponents = remaining.components
+    request.timeoutInterval = min(
+      30,
+      Double(durationComponents.seconds) + Double(durationComponents.attoseconds) / 1e18
+    )
     request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
     request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
     request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
@@ -151,18 +189,22 @@ public struct GitHubAppAPIClient: GitHubAppAPIRequesting {
   private func send(
     _ request: URLRequest,
     authentication: Authentication,
-    deadline: Date
+    deadline: ContinuousClock.Instant
   ) async throws -> Data {
     let data: Data
     let response: HTTPURLResponse
     do {
-      (data, response) = try await transport.data(for: request)
+      (data, response) = try await transport.data(
+        for: request,
+        maximumBytes: 2 * 1_024 * 1_024,
+        deadline: deadline
+      )
     } catch let error as GitHubAppAPIError {
       throw error
     } catch {
       throw GitHubAppAPIError.transport(error.localizedDescription)
     }
-    guard Date() < deadline else { throw GitHubAppAPIError.requestTimedOut }
+    guard ContinuousClock.now < deadline else { throw GitHubAppAPIError.requestTimedOut }
     guard data.count <= 2 * 1_024 * 1_024 else {
       throw GitHubAppAPIError.responseTooLarge
     }
