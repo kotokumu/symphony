@@ -633,21 +633,15 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
         (require-not (remote tcp "localhost:\(proxyPort)"))
         (require-not (socket-domain AF_UNIX))))
     (deny file-write-create file-write-unlink file-write-mode file-write-owner
-      file-write-flags file-write-xattr file-write-setugid file-write-times
-      (require-all
-        (require-not (subpath (param "WRITE_ROOT")))
-        (require-not (subpath (param "WRITE_ROOT_REAL")))
-        (require-not (subpath (param "TEMP_ROOT")))
-        (require-not (subpath (param "TEMP_ROOT_REAL")))
-        (require-not (literal "/dev/null"))))
-    (deny file-write-data
-      (require-all
-        (vnode-type REGULAR-FILE)
-        (require-not (subpath (param "WRITE_ROOT")))
-        (require-not (subpath (param "WRITE_ROOT_REAL")))
-        (require-not (subpath (param "TEMP_ROOT")))
-        (require-not (subpath (param "TEMP_ROOT_REAL")))
-        (require-not (literal "/dev/null"))))
+      file-write-flags file-write-xattr file-write-setugid file-write-times)
+    (deny file-write-data (vnode-type REGULAR-FILE))
+    (allow file-write*
+      (require-any
+        (subpath (param "WRITE_ROOT"))
+        (subpath (param "WRITE_ROOT_REAL"))
+        (subpath (param "TEMP_ROOT"))
+        (subpath (param "TEMP_ROOT_REAL"))
+        (literal "/dev/null")))
     """
   }
 

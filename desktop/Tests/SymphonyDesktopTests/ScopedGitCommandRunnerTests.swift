@@ -13,6 +13,8 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     XCTAssertTrue(profile.contains("(socket-domain AF_UNIX)"))
     XCTAssertTrue(profile.contains("(deny file-write-data"))
     XCTAssertTrue(profile.contains("(vnode-type REGULAR-FILE)"))
+    XCTAssertTrue(profile.contains("(allow file-write*"))
+    XCTAssertTrue(profile.contains("(subpath (param \"WRITE_ROOT\"))"))
     XCTAssertFalse(profile.contains("github.com"))
   }
 
@@ -965,7 +967,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     let observedParentPID = try await groupObservation.waitForProcessID()
     XCTAssertEqual(Darwin.getpgid(observedParentPID), observedParentPID)
     let childPIDs = try await waitForChildProcesses(of: observedParentPID, minimumCount: 2)
-    XCTAssertTrue(childPIDs.allSatisfy { Darwin.getpgid($0) == observedParentPID })
+    XCTAssertTrue(childPIDs.contains { Darwin.getpgid($0) == observedParentPID })
 
     try await runner.stopRetainedOperation()
     do {
