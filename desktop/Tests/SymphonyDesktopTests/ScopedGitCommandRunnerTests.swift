@@ -36,8 +36,8 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     XCTAssertTrue(profile.contains("(allow file-write-data"))
     XCTAssertTrue(profile.contains("(vnode-type REGULAR-FILE)"))
     XCTAssertTrue(profile.contains("(allow file-write*"))
+    XCTAssertTrue(profile.contains("(literal (param \"WRITE_ROOT\"))"))
     XCTAssertTrue(profile.contains("(subpath (param \"WRITE_ROOT\"))"))
-    XCTAssertTrue(profile.contains("(subpath \"/dev/fd/4\")"))
     XCTAssertFalse(profile.contains("(allow default)"))
     XCTAssertFalse(profile.contains("github.com"))
   }
@@ -864,8 +864,8 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       credential_output=$(printf 'protocol=https\nhost=github.com\npath=octo/repo\n\n' | \
         "\(systemGit.path)" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" credential fill)
       printf 'STEP=credential\n'
-      "\(systemGit.path)" -C /dev/fd/4 init --quiet .
-      touch /dev/fd/4/sandbox-write-probe
+      "\(systemGit.path)" init --quiet .
+      touch sandbox-write-probe
       printf 'STEP=workspace-write\n'
       if touch "$HOME/../sandbox-escape-$$" 2>/dev/null; then exit 91; fi
       printf 'STEP=escape-denied\n'

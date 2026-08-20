@@ -555,14 +555,15 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       guard descriptor >= 0 else { throw GitCommandRunnerError.launchFailed }
       return GitExecutionAuthority(
         descriptor: descriptor,
-        writeRoot: plan.targetURL.deletingLastPathComponent(),
-        arguments: ["-C", "/dev/fd/4", "clone", "--", plan.repositoryURL.absoluteString, "."]
+        writeRoot: plan.targetURL.deletingLastPathComponent()
+          .appendingPathComponent(cloneTarget.currentEntryName, isDirectory: true),
+        arguments: ["clone", "--", plan.repositoryURL.absoluteString, "."]
       )
     case .fetch:
       return try existingRepositoryAuthority(
         plan,
         arguments: [
-          "-C", "/dev/fd/4", "fetch", "--prune", "--", plan.repositoryURL.absoluteString,
+          "fetch", "--prune", "--", plan.repositoryURL.absoluteString,
           "+refs/heads/*:refs/remotes/origin/*",
         ]
       )
@@ -570,7 +571,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       return try existingRepositoryAuthority(
         plan,
         arguments: [
-          "-C", "/dev/fd/4", "push", "--porcelain", "--", plan.repositoryURL.absoluteString,
+          "push", "--porcelain", "--", plan.repositoryURL.absoluteString,
           "HEAD:refs/heads/\(branch)",
         ]
       )
@@ -639,11 +640,14 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     (allow file-ioctl)
     (allow file-write-data (require-not (vnode-type REGULAR-FILE)))
     (allow file-write*
+      (literal (param "WRITE_ROOT"))
       (subpath (param "WRITE_ROOT"))
+      (literal (param "WRITE_ROOT_REAL"))
       (subpath (param "WRITE_ROOT_REAL"))
+      (literal (param "TEMP_ROOT"))
       (subpath (param "TEMP_ROOT"))
+      (literal (param "TEMP_ROOT_REAL"))
       (subpath (param "TEMP_ROOT_REAL"))
-      (subpath "/dev/fd/4")
       (literal "/dev/null"))
     (allow network* (socket-domain AF_UNIX))
     (allow network-outbound (remote tcp "localhost:\(proxyPort)"))
