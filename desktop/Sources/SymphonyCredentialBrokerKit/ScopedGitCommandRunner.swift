@@ -621,8 +621,15 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     (allow default)
     (deny network-outbound
       (require-not (remote tcp "localhost:\(proxyPort)")))
-    (deny file-write*
+    (deny file-write-create file-write-unlink file-write-mode file-write-owner
+      file-write-flags file-write-xattr file-write-setugid file-write-times
       (require-all
+        (require-not (subpath (param "WRITE_ROOT")))
+        (require-not (subpath (param "TEMP_ROOT")))
+        (require-not (literal "/dev/null"))))
+    (deny file-write-data
+      (require-all
+        (vnode-type REGULAR-FILE)
         (require-not (subpath (param "WRITE_ROOT")))
         (require-not (subpath (param "TEMP_ROOT")))
         (require-not (literal "/dev/null"))))

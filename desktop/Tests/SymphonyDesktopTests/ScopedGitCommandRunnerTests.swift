@@ -10,6 +10,8 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     let profile = ScopedGitCommandRunner.sandboxProfile(proxyPort: 43_123)
     XCTAssertTrue(profile.contains("(deny network-outbound"))
     XCTAssertTrue(profile.contains("(remote tcp \"localhost:43123\")"))
+    XCTAssertTrue(profile.contains("(deny file-write-data"))
+    XCTAssertTrue(profile.contains("(vnode-type REGULAR-FILE)"))
     XCTAssertFalse(profile.contains("github.com"))
   }
 
