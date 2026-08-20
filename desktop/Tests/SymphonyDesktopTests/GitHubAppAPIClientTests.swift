@@ -348,6 +348,7 @@ final class GitHubAppAPIClientTests: XCTestCase {
     }
 
     XCTAssertLessThan(started.duration(to: .now), .seconds(1))
+    await waitForStreamingProtocolStop()
     XCTAssertTrue(StreamingGitHubURLProtocol.wasStopped)
   }
 
@@ -381,7 +382,15 @@ final class GitHubAppAPIClientTests: XCTestCase {
     }
 
     XCTAssertLessThan(started.duration(to: .now), .seconds(1))
+    await waitForStreamingProtocolStop()
     XCTAssertTrue(StreamingGitHubURLProtocol.wasStopped)
+  }
+
+  private func waitForStreamingProtocolStop() async {
+    let deadline = ContinuousClock.now.advanced(by: .seconds(1))
+    while !StreamingGitHubURLProtocol.wasStopped, ContinuousClock.now < deadline {
+      try? await Task.sleep(for: .milliseconds(10))
+    }
   }
 
   private func installationPage(count: Int, startingAt firstID: Int) -> String {
