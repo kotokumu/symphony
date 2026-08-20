@@ -1379,7 +1379,7 @@ enum TrustedSystemGitExecutable {
   private static func validatedExecutable(at path: String) -> URL? {
     let candidate = URL(fileURLWithPath: path).resolvingSymlinksInPath()
     var information = stat()
-    guard Darwin.stat(candidate.path, &information) == 0,
+    guard lstat(candidate.path, &information) == 0,
       information.st_mode & S_IFMT == S_IFREG,
       information.st_uid == 0,
       information.st_mode & (S_IWGRP | S_IWOTH) == 0,
