@@ -391,8 +391,16 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     proxy?.stop()
     server.stop()
     _ = await serverTask.value
+    let outputDeadline = ContinuousClock.now.advanced(by: .milliseconds(200))
+    while !collector.finished, ContinuousClock.now < outputDeadline {
+      try? await Task.sleep(for: .milliseconds(5))
+    }
     output.fileHandleForReading.closeFile()
-    _ = await reader.value
+    if collector.finished {
+      _ = await reader.value
+    } else {
+      reader.cancel()
+    }
     let rawOutput = collector.prefix
     let sanitized = credential.redact(String(decoding: rawOutput, as: UTF8.self))
     let status = processReference.terminationStatus
@@ -543,8 +551,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       guard descriptor >= 0 else { throw GitCommandRunnerError.launchFailed }
       return GitExecutionAuthority(
         descriptor: descriptor,
-        writeRoot: plan.targetURL.deletingLastPathComponent()
-          .appendingPathComponent(cloneTarget.currentEntryName, isDirectory: true),
+        writeRoot: plan.targetURL.deletingLastPathComponent(),
         arguments: ["clone", "--", plan.repositoryURL.absoluteString, "."]
       )
     case .fetch:
@@ -598,7 +605,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     close(metadataDescriptor)
     return GitExecutionAuthority(
       descriptor: descriptor,
-      writeRoot: plan.targetURL.appendingPathComponent(".git", isDirectory: true),
+      writeRoot: plan.targetURL,
       arguments: arguments
     )
   }
@@ -622,7 +629,9 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     (version 1)
     (allow default)
     (deny network-outbound
-      (require-not (remote tcp "localhost:\(proxyPort)")))
+      (require-all
+        (require-not (remote tcp "localhost:\(proxyPort)"))
+        (require-not (socket-domain AF_UNIX))))
     (deny file-write-create file-write-unlink file-write-mode file-write-owner
       file-write-flags file-write-xattr file-write-setugid file-write-times
       (require-all
@@ -1358,6 +1367,7 @@ private final class GitOutputCollector: @unchecked Sendable {
   private let lock = NSLock()
   private var data = Data()
   private var exceeded = false
+  private var didFinish = false
 
   init(handle: FileHandle, maximumBytes: Int) {
     self.handle = handle
@@ -1366,8 +1376,10 @@ private final class GitOutputCollector: @unchecked Sendable {
 
   var exceededLimit: Bool { lock.withLock { exceeded } }
   var prefix: Data { lock.withLock { data } }
+  var finished: Bool { lock.withLock { didFinish } }
 
   func readToEnd() {
+    defer { lock.withLock { didFinish = true } }
     while let chunk = try? handle.read(upToCount: 4_096), !chunk.isEmpty {
       lock.withLock {
         let originalCount = data.count
