@@ -8,13 +8,15 @@ import XCTest
 final class ScopedGitCommandRunnerTests: XCTestCase {
   func testSandboxProfileAllowsOnlyTheBrokerOwnedLoopbackTunnel() {
     let profile = ScopedGitCommandRunner.sandboxProfile(proxyPort: 43_123)
-    XCTAssertTrue(profile.contains("(deny network-outbound"))
+    XCTAssertTrue(profile.contains("(deny default)"))
+    XCTAssertTrue(profile.contains("(allow network-outbound"))
     XCTAssertTrue(profile.contains("(remote tcp \"localhost:43123\")"))
     XCTAssertTrue(profile.contains("(socket-domain AF_UNIX)"))
-    XCTAssertTrue(profile.contains("(deny file-write-data"))
+    XCTAssertTrue(profile.contains("(allow file-write-data"))
     XCTAssertTrue(profile.contains("(vnode-type REGULAR-FILE)"))
-    XCTAssertTrue(profile.contains("(require-not"))
+    XCTAssertTrue(profile.contains("(allow file-write*"))
     XCTAssertTrue(profile.contains("(subpath (param \"WRITE_ROOT\"))"))
+    XCTAssertFalse(profile.contains("(allow default)"))
     XCTAssertFalse(profile.contains("github.com"))
   }
 
@@ -838,6 +840,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       credential_output=$(printf 'protocol=https\nhost=github.com\npath=octo/repo\n\n' | \
         /usr/bin/git "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" credential fill)
       touch sandbox-write-probe
+      if touch "$HOME/../sandbox-escape-$$" 2>/dev/null; then exit 91; fi
       sleep 0.5
       printf 'TEMP_HOME=%s\n%s\n' "$HOME" "$credential_output"
       """

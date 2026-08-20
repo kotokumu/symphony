@@ -627,30 +627,33 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
   static func sandboxProfile(proxyPort: UInt16) -> String {
     """
     (version 1)
-    (allow default)
-    (deny network-outbound
-      (require-all
-        (require-not (remote tcp "localhost:\(proxyPort)"))
-        (require-not (socket-domain AF_UNIX))))
-    (deny file-write-create file-write-unlink file-write-mode file-write-owner
-      file-write-flags file-write-xattr file-write-setugid file-write-times
-      (require-not
-        (require-any
-          (subpath (param "WRITE_ROOT"))
-          (subpath (param "WRITE_ROOT_REAL"))
-          (subpath (param "TEMP_ROOT"))
-          (subpath (param "TEMP_ROOT_REAL"))
-          (literal "/dev/null"))))
-    (deny file-write-data
-      (require-all
-        (vnode-type REGULAR-FILE)
-        (require-not
-          (require-any
-            (subpath (param "WRITE_ROOT"))
-            (subpath (param "WRITE_ROOT_REAL"))
-            (subpath (param "TEMP_ROOT"))
-            (subpath (param "TEMP_ROOT_REAL"))
-            (literal "/dev/null")))))
+    (deny default)
+    (allow process-exec process-fork)
+    (allow signal (target same-sandbox))
+    (allow process-info* (target same-sandbox))
+    (allow file-read*)
+    (allow file-ioctl)
+    (allow file-write-data (require-not (vnode-type REGULAR-FILE)))
+    (allow file-write*
+      (subpath (param "WRITE_ROOT"))
+      (subpath (param "WRITE_ROOT_REAL"))
+      (subpath (param "TEMP_ROOT"))
+      (subpath (param "TEMP_ROOT_REAL"))
+      (literal "/dev/null"))
+    (allow network-outbound
+      (remote tcp "localhost:\(proxyPort)")
+      (socket-domain AF_UNIX))
+    (allow sysctl-read)
+    (allow iokit-open (iokit-registry-entry-class "RootDomainUserClient"))
+    (allow ipc-posix-sem)
+    (allow ipc-posix-shm-read* (ipc-posix-name-prefix "apple.cfprefs."))
+    (allow mach-lookup
+      (global-name "com.apple.system.opendirectoryd.libinfo")
+      (global-name "com.apple.PowerManagement.control")
+      (global-name "com.apple.cfprefsd.daemon")
+      (global-name "com.apple.cfprefsd.agent")
+      (local-name "com.apple.cfprefsd.agent"))
+    (allow user-preference-read)
     """
   }
 
