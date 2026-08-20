@@ -20,8 +20,14 @@ final class CodexAuthenticationManagerTests: XCTestCase {
 
     let invocations = await executor.recordedInvocations()
     XCTAssertEqual(invocations.map(\.arguments), [["login", "status"], ["login", "status"]])
-    XCTAssertEqual(invocations[0].codexHome, firstDirectory.appendingPathComponent("CodexHome"))
-    XCTAssertEqual(invocations[1].codexHome, secondDirectory.appendingPathComponent("CodexHome"))
+    XCTAssertEqual(
+      invocations[0].codexHome,
+      firstDirectory.appendingPathComponent("CodexHome", isDirectory: true)
+    )
+    XCTAssertEqual(
+      invocations[1].codexHome,
+      secondDirectory.appendingPathComponent("CodexHome", isDirectory: true)
+    )
     XCTAssertNotEqual(invocations[0].codexHome, invocations[1].codexHome)
     let firstState = await manager.state(for: firstID)
     let secondState = await manager.state(for: secondID)
@@ -139,7 +145,7 @@ final class CodexAuthenticationManagerTests: XCTestCase {
     let invocation = try XCTUnwrap(invocations.first)
     XCTAssertEqual(
       invocation.codexHome,
-      namespaceDirectory.appendingPathComponent("CodexHome")
+      namespaceDirectory.appendingPathComponent("CodexHome", isDirectory: true)
     )
     let state = await recreatedManager.state(for: namespaceID)
     XCTAssertEqual(state, .signedIn)
