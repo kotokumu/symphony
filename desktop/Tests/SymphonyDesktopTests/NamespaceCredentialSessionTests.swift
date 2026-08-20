@@ -350,8 +350,8 @@ final class NamespaceCredentialSessionTests: XCTestCase {
     try await initialSecond.unlock(reason: "Second")
     try await initialFirst.configureGitHubApp(appID: 10, privateKeyFilePath: firstKey.url.path)
     try await initialSecond.configureGitHubApp(appID: 11, privateKeyFilePath: secondKey.url.path)
-    await initialFirst.lock()
-    await initialSecond.lock()
+    try await initialFirst.lock()
+    try await initialSecond.lock()
 
     let firstAPI = RecordingGitHubAppAPI()
     let secondAPI = RecordingGitHubAppAPI()
