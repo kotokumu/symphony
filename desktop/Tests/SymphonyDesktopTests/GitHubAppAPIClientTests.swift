@@ -274,14 +274,14 @@ final class GitHubAppAPIClientTests: XCTestCase {
   func testURLSessionTransportStopsAtStreamingBodyLimit() async throws {
     let configuration = URLSessionGitHubHTTPTransport.makeEphemeralConfiguration()
     configuration.protocolClasses = [StreamingGitHubURLProtocol.self]
-    StreamingGitHubURLProtocol.configure(
+    let fixture = StreamingGitHubURLProtocol.configure(
       responseData: Data(repeating: 0x61, count: 17),
       contentLength: nil
     )
     let transport = URLSessionGitHubHTTPTransport(
       session: URLSession(configuration: configuration)
     )
-    let request = URLRequest(url: URL(string: "https://api.github.test/data")!)
+    let request = URLRequest(url: fixture.url)
 
     do {
       _ = try await transport.data(
@@ -298,11 +298,11 @@ final class GitHubAppAPIClientTests: XCTestCase {
   func testURLSessionTransportRejectsOversizedContentLengthBeforeBody() async throws {
     let configuration = URLSessionGitHubHTTPTransport.makeEphemeralConfiguration()
     configuration.protocolClasses = [StreamingGitHubURLProtocol.self]
-    StreamingGitHubURLProtocol.configure(responseData: Data(), contentLength: 17)
+    let fixture = StreamingGitHubURLProtocol.configure(responseData: Data(), contentLength: 17)
     let transport = URLSessionGitHubHTTPTransport(
       session: URLSession(configuration: configuration)
     )
-    let request = URLRequest(url: URL(string: "https://api.github.test/data")!)
+    let request = URLRequest(url: fixture.url)
 
     do {
       _ = try await transport.data(
@@ -319,7 +319,7 @@ final class GitHubAppAPIClientTests: XCTestCase {
   func testURLSessionTransportCancelsStalledResponseAtMonotonicDeadline() async throws {
     let configuration = URLSessionGitHubHTTPTransport.makeEphemeralConfiguration()
     configuration.protocolClasses = [StreamingGitHubURLProtocol.self]
-    StreamingGitHubURLProtocol.configure(
+    let fixture = StreamingGitHubURLProtocol.configure(
       responseData: Data([0x61]),
       contentLength: nil,
       withholdCompletion: true
@@ -327,7 +327,7 @@ final class GitHubAppAPIClientTests: XCTestCase {
     let transport = URLSessionGitHubHTTPTransport(
       session: URLSession(configuration: configuration)
     )
-    let request = URLRequest(url: URL(string: "https://api.github.test/data")!)
+    let request = URLRequest(url: fixture.url)
     let started = ContinuousClock.now
 
     do {
@@ -342,14 +342,14 @@ final class GitHubAppAPIClientTests: XCTestCase {
     }
 
     XCTAssertLessThan(started.duration(to: .now), .seconds(1))
-    await waitForStreamingProtocolStop()
-    XCTAssertTrue(StreamingGitHubURLProtocol.wasStopped)
+    await waitForStreamingProtocolStop(fixture.stopSignal)
+    XCTAssertTrue(fixture.stopSignal.wasStopped)
   }
 
   func testURLSessionTransportCancelsRequestWithoutResponseAtMonotonicDeadline() async throws {
     let configuration = URLSessionGitHubHTTPTransport.makeEphemeralConfiguration()
     configuration.protocolClasses = [StreamingGitHubURLProtocol.self]
-    StreamingGitHubURLProtocol.configure(
+    let fixture = StreamingGitHubURLProtocol.configure(
       responseData: Data(),
       contentLength: nil,
       withholdCompletion: true,
@@ -358,7 +358,7 @@ final class GitHubAppAPIClientTests: XCTestCase {
     let transport = URLSessionGitHubHTTPTransport(
       session: URLSession(configuration: configuration)
     )
-    let request = URLRequest(url: URL(string: "https://api.github.test/data")!)
+    let request = URLRequest(url: fixture.url)
     let started = ContinuousClock.now
 
     do {
@@ -373,13 +373,13 @@ final class GitHubAppAPIClientTests: XCTestCase {
     }
 
     XCTAssertLessThan(started.duration(to: .now), .seconds(1))
-    await waitForStreamingProtocolStop()
-    XCTAssertTrue(StreamingGitHubURLProtocol.wasStopped)
+    await waitForStreamingProtocolStop(fixture.stopSignal)
+    XCTAssertTrue(fixture.stopSignal.wasStopped)
   }
 
-  private func waitForStreamingProtocolStop() async {
+  private func waitForStreamingProtocolStop(_ signal: StreamingProtocolStopSignal) async {
     let deadline = ContinuousClock.now.advanced(by: .seconds(1))
-    while !StreamingGitHubURLProtocol.wasStopped, ContinuousClock.now < deadline {
+    while !signal.wasStopped, ContinuousClock.now < deadline {
       try? await Task.sleep(for: .milliseconds(10))
     }
   }
@@ -400,43 +400,57 @@ final class GitHubAppAPIClientTests: XCTestCase {
 }
 
 private final class StreamingGitHubURLProtocol: URLProtocol, @unchecked Sendable {
+  struct Fixture {
+    let url: URL
+    let stopSignal: StreamingProtocolStopSignal
+  }
+
   private struct FixtureState {
-    var responseData = Data()
-    var contentLength: Int?
-    var withholdCompletion = false
-    var withholdResponse = false
-    var wasStopped = false
+    let responseData: Data
+    let contentLength: Int?
+    let withholdCompletion: Bool
+    let withholdResponse: Bool
+    let stopSignal: StreamingProtocolStopSignal
   }
 
   private static let stateLock = NSLock()
-  nonisolated(unsafe) private static var state = FixtureState()
-
-  static var wasStopped: Bool {
-    stateLock.withLock { state.wasStopped }
-  }
+  nonisolated(unsafe) private static var fixtures: [String: FixtureState] = [:]
+  private let signalLock = NSLock()
+  private var stopSignal: StreamingProtocolStopSignal?
 
   static func configure(
     responseData: Data,
     contentLength: Int?,
     withholdCompletion: Bool = false,
     withholdResponse: Bool = false
-  ) {
+  ) -> Fixture {
+    let url = URL(string: "https://api.github.test/fixture/\(UUID().uuidString)")!
+    let stopSignal = StreamingProtocolStopSignal()
     stateLock.withLock {
-      state = FixtureState(
+      fixtures[url.absoluteString] = FixtureState(
         responseData: responseData,
         contentLength: contentLength,
         withholdCompletion: withholdCompletion,
         withholdResponse: withholdResponse,
-        wasStopped: false
+        stopSignal: stopSignal
       )
     }
+    return Fixture(url: url, stopSignal: stopSignal)
   }
 
   override class func canInit(with request: URLRequest) -> Bool { true }
   override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
   override func startLoading() {
-    let fixture = Self.stateLock.withLock { Self.state }
+    guard let url = request.url else {
+      client?.urlProtocol(self, didFailWithError: URLError(.badURL))
+      return
+    }
+    guard let fixture = Self.stateLock.withLock({ Self.fixtures.removeValue(forKey: url.absoluteString) }) else {
+      client?.urlProtocol(self, didFailWithError: URLError(.resourceUnavailable))
+      return
+    }
+    signalLock.withLock { stopSignal = fixture.stopSignal }
     if fixture.withholdResponse { return }
     var headers: [String: String] = ["Content-Type": "application/json"]
     if let contentLength = fixture.contentLength {
@@ -458,7 +472,18 @@ private final class StreamingGitHubURLProtocol: URLProtocol, @unchecked Sendable
   }
 
   override func stopLoading() {
-    Self.stateLock.withLock { Self.state.wasStopped = true }
+    signalLock.withLock { stopSignal }?.markStopped()
+  }
+}
+
+private final class StreamingProtocolStopSignal: @unchecked Sendable {
+  private let lock = NSLock()
+  private var stopped = false
+
+  var wasStopped: Bool { lock.withLock { stopped } }
+
+  func markStopped() {
+    lock.withLock { stopped = true }
   }
 }
 
