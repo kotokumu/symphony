@@ -18,7 +18,6 @@ public protocol CredentialBrokerSessionLaunching: Sendable {
 
 public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
   public typealias ForceKill = @Sendable (Int32) -> Int32
-  public typealias CommandWaitObserver = @Sendable (Namespace.ID) -> Void
 
   private struct Runtime {
     let generation: UUID
@@ -33,9 +32,8 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
   private let stopTimeout: TimeInterval
   private let environment: [String: String]
   private let forceKill: ForceKill
-  private let commandWaitObserver: CommandWaitObserver
+  private let commandGate: NamespaceCommandGate
   private var runtimes: [Namespace.ID: Runtime] = [:]
-  private var commandOwners: Set<Namespace.ID> = []
   private var stopTasks: [Namespace.ID: Task<Void, Error>] = [:]
 
   public init(
@@ -43,15 +41,30 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
     handshakeTimeout: TimeInterval = 60,
     stopTimeout: TimeInterval = 2,
     environment: [String: String] = ProcessInfo.processInfo.environment,
-    forceKill: @escaping ForceKill = { Darwin.kill($0, SIGKILL) },
-    commandWaitObserver: @escaping CommandWaitObserver = { _ in }
+    forceKill: @escaping ForceKill = { Darwin.kill($0, SIGKILL) }
   ) {
     self.executableURL = executableURL
     self.handshakeTimeout = handshakeTimeout
     self.stopTimeout = stopTimeout
     self.environment = NamespaceProcessEnvironment.sanitized(environment)
     self.forceKill = forceKill
-    self.commandWaitObserver = commandWaitObserver
+    commandGate = NamespaceCommandGate()
+  }
+
+  init(
+    executableURL: URL?,
+    handshakeTimeout: TimeInterval,
+    stopTimeout: TimeInterval,
+    environment: [String: String],
+    forceKill: @escaping ForceKill,
+    commandGate: NamespaceCommandGate
+  ) {
+    self.executableURL = executableURL
+    self.handshakeTimeout = handshakeTimeout
+    self.stopTimeout = stopTimeout
+    self.environment = NamespaceProcessEnvironment.sanitized(environment)
+    self.forceKill = forceKill
+    self.commandGate = commandGate
   }
 
   public func unlock(namespaceID: Namespace.ID) async throws -> any CredentialBrokerSessionHandle {
@@ -135,7 +148,7 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
       throw CredentialBrokerProcessError.requestTooLarge
     }
     try await acquireCommand(for: namespaceID)
-    defer { releaseCommand(for: namespaceID) }
+    defer { commandGate.release(namespaceID) }
     guard let runtime = runtimes[namespaceID], runtime.generation == generation else {
       throw CredentialBrokerProcessError.sessionNotRunning
     }
@@ -257,21 +270,7 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
   }
 
   private func acquireCommand(for namespaceID: Namespace.ID) async throws {
-    var reportedWaiting = false
-    while commandOwners.contains(namespaceID) {
-      if !reportedWaiting {
-        commandWaitObserver(namespaceID)
-        reportedWaiting = true
-      }
-      try Task.checkCancellation()
-      try await Task.sleep(for: .milliseconds(10))
-    }
-    try Task.checkCancellation()
-    commandOwners.insert(namespaceID)
-  }
-
-  private func releaseCommand(for namespaceID: Namespace.ID) {
-    commandOwners.remove(namespaceID)
+    try await commandGate.acquire(namespaceID)
   }
 
   private static func stopProcess(
@@ -313,6 +312,63 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
       try? await Task.sleep(for: .milliseconds(20))
     }
     return !process.isRunning
+  }
+}
+
+final class NamespaceCommandGate: @unchecked Sendable {
+  private let lock = NSLock()
+  private var owners: Set<Namespace.ID> = []
+  private var queued: [Namespace.ID: Int] = [:]
+
+  func acquire(_ namespaceID: Namespace.ID) async throws {
+    var isQueued = false
+    defer {
+      if isQueued {
+        lock.withLock {
+          let remaining = (queued[namespaceID] ?? 1) - 1
+          queued[namespaceID] = remaining == 0 ? nil : remaining
+        }
+      }
+    }
+
+    while true {
+      try Task.checkCancellation()
+      let acquired = lock.withLock {
+        if !owners.contains(namespaceID) {
+          owners.insert(namespaceID)
+          return true
+        }
+        if !isQueued {
+          queued[namespaceID, default: 0] += 1
+          isQueued = true
+        }
+        return false
+      }
+      if acquired {
+        return
+      }
+      try await Task.sleep(for: .milliseconds(10))
+    }
+  }
+
+  func release(_ namespaceID: Namespace.ID) {
+    _ = lock.withLock {
+      owners.remove(namespaceID)
+    }
+  }
+
+  func waitUntilQueued(
+    _ namespaceID: Namespace.ID,
+    timeout: Duration
+  ) async -> Bool {
+    let deadline = ContinuousClock.now.advanced(by: timeout)
+    while ContinuousClock.now < deadline {
+      if lock.withLock({ (queued[namespaceID] ?? 0) > 0 }) {
+        return true
+      }
+      try? await Task.sleep(for: .milliseconds(5))
+    }
+    return false
   }
 }
 

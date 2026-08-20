@@ -298,7 +298,7 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
         """
     )
     let namespaceID = UUID()
-    let waitSignal = CommandWaitSignal()
+    let commandGate = NamespaceCommandGate()
     let launcher = CredentialBrokerProcessLauncher(
       executableURL: script,
       handshakeTimeout: 60,
@@ -308,17 +308,18 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
         "BROKER_FIRST_RECEIVED_FILE": firstReceivedURL.path,
         "BROKER_SECOND_RECEIVED_FILE": secondReceivedURL.path,
       ],
-      commandWaitObserver: { id in
-        if id == namespaceID {
-          waitSignal.signal()
-        }
-      }
+      forceKill: { Darwin.kill($0, SIGKILL) },
+      commandGate: commandGate
     )
     let session = try await launcher.unlock(namespaceID: namespaceID)
     let first = Task { try await session.signChallenge(Data([1])) }
     await eventually { FileManager.default.fileExists(atPath: firstReceivedURL.path) }
     let second = Task { try await session.signChallenge(Data([2])) }
-    await waitSignal.wait()
+    let secondIsQueued = await commandGate.waitUntilQueued(
+      namespaceID,
+      timeout: .seconds(1)
+    )
+    XCTAssertTrue(secondIsQueued)
     second.cancel()
 
     try await session.lock()
@@ -370,21 +371,6 @@ private final class RetryingForceKill: @unchecked Sendable {
   func call(_ processID: Int32) -> Int32 {
     lock.withLock {
       isAllowed ? Darwin.kill(processID, SIGKILL) : -1
-    }
-  }
-}
-
-private final class CommandWaitSignal: @unchecked Sendable {
-  private let lock = NSLock()
-  private var signaled = false
-
-  func signal() {
-    lock.withLock { signaled = true }
-  }
-
-  func wait() async {
-    while !lock.withLock({ signaled }) {
-      try? await Task.sleep(for: .milliseconds(5))
     }
   }
 }
