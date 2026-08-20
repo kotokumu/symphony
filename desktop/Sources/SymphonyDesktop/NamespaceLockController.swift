@@ -17,9 +17,14 @@ final class NamespaceLockController: ObservableObject {
   @Published private(set) var states: [Namespace.ID: NamespaceLockState] = [:]
 
   private let broker: any NamespaceCredentialBrokering
+  private var sleepProtectionAvailable: Bool
 
-  init(broker: any NamespaceCredentialBrokering) {
+  init(
+    broker: any NamespaceCredentialBrokering,
+    sleepProtectionAvailable: Bool = true
+  ) {
     self.broker = broker
+    self.sleepProtectionAvailable = sleepProtectionAvailable
   }
 
   func state(for namespaceID: Namespace.ID) -> NamespaceLockState {
@@ -27,6 +32,12 @@ final class NamespaceLockController: ObservableObject {
   }
 
   func unlock(_ namespaceID: Namespace.ID) async {
+    guard sleepProtectionAvailable else {
+      states[namespaceID] = .locked(
+        message: "Credentials cannot be unlocked because system sleep protection is unavailable."
+      )
+      return
+    }
     switch state(for: namespaceID) {
     case .unlocking, .unlocked:
       return
@@ -41,6 +52,10 @@ final class NamespaceLockController: ObservableObject {
     } catch {
       states[namespaceID] = .locked(message: error.localizedDescription)
     }
+  }
+
+  func setSleepProtectionAvailable(_ available: Bool) {
+    sleepProtectionAvailable = available
   }
 
   func lock(_ namespaceID: Namespace.ID) async throws {

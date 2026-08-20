@@ -108,6 +108,8 @@ A namespace can be locked manually. Its protected credential access is also clea
 stops or fails, before the Mac acknowledges sleep, when the namespace is deleted, when the main
 window closes, and before the application terminates. If protected credential access cannot be
 cleared safely before deletion or application termination, Symphony reports the failure and does
-not continue the destructive lifecycle operation. Stored credential deletion occurs only after the
-namespace deletion commits. A failed stored-credential cleanup is reported and retried without
-restoring the deleted namespace.
+not continue the destructive lifecycle operation. If system sleep protection cannot be established,
+Symphony reports the failure and does not allow protected credentials to be unlocked. A failed
+window-close cleanup remains visible and can be retried when the window is shown again. Stored
+credential deletion occurs only after the namespace deletion commits. A failed stored-credential
+cleanup is reported and retried without restoring the deleted namespace.

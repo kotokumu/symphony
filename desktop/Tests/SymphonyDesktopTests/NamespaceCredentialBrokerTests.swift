@@ -162,6 +162,30 @@ final class NamespaceCredentialBrokerTests: XCTestCase {
     XCTAssertFalse(ownsSession)
     try await broker.unlock(namespaceID: namespaceID)
   }
+
+  func testLockAdmissionRejectsNewCapabilitiesBeforeSessionStopCompletes() async throws {
+    let namespaceID = UUID()
+    let launcher = GatedCapabilityBrokerLauncher()
+    let broker = NamespaceCredentialBroker(launcher: launcher)
+    try await broker.unlock(namespaceID: namespaceID)
+
+    let lock = Task {
+      try await broker.lock(namespaceID: namespaceID)
+    }
+    await launcher.waitUntilLockStarted()
+
+    do {
+      _ = try await broker.signChallenge(Data([1]), namespaceID: namespaceID)
+      XCTFail("Expected capability admission to close while locking")
+    } catch {
+      XCTAssertEqual(error.localizedDescription, "Protected namespace credentials are locked.")
+    }
+    let capabilityCount = await launcher.capabilityCount
+    XCTAssertEqual(capabilityCount, 0)
+
+    await launcher.completeLock()
+    try await lock.value
+  }
 }
 
 private actor RecordingBrokerLauncher: CredentialBrokerSessionLaunching {
@@ -306,5 +330,58 @@ private enum TestPendingBrokerError: LocalizedError {
     case .handshakeFailed: "Handshake failed."
     case .stopFailed: "Stop failed."
     }
+  }
+}
+
+private actor GatedCapabilityBrokerLauncher: CredentialBrokerSessionLaunching {
+  private var lockStarted = false
+  private var lockStartWaiters: [CheckedContinuation<Void, Never>] = []
+  private var lockContinuation: CheckedContinuation<Void, Never>?
+  private(set) var capabilityCount = 0
+
+  func unlock(namespaceID: UUID) -> any CredentialBrokerSessionHandle {
+    GatedCapabilityBrokerSession(namespaceID: namespaceID, launcher: self)
+  }
+
+  func stop(namespaceID: UUID) {}
+  func purge(namespaceID: UUID) {}
+
+  func beginLock() async {
+    lockStarted = true
+    lockStartWaiters.forEach { $0.resume() }
+    lockStartWaiters.removeAll()
+    await withCheckedContinuation { continuation in
+      lockContinuation = continuation
+    }
+  }
+
+  func recordCapability() {
+    capabilityCount += 1
+  }
+
+  func waitUntilLockStarted() async {
+    if lockStarted { return }
+    await withCheckedContinuation { continuation in
+      lockStartWaiters.append(continuation)
+    }
+  }
+
+  func completeLock() {
+    lockContinuation?.resume()
+    lockContinuation = nil
+  }
+}
+
+private struct GatedCapabilityBrokerSession: CredentialBrokerSessionHandle {
+  let namespaceID: UUID
+  let launcher: GatedCapabilityBrokerLauncher
+
+  func lock() async throws {
+    await launcher.beginLock()
+  }
+
+  func signChallenge(_ challenge: Data) async throws -> Data {
+    await launcher.recordCapability()
+    return challenge
   }
 }

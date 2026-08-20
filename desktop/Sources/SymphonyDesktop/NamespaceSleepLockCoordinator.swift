@@ -18,6 +18,8 @@ protocol SystemSleepEventSource: Sendable {
 
 @MainActor
 final class NamespaceSleepLockCoordinator: ObservableObject {
+  @Published private(set) var isProtectingSleep = false
+
   private let eventSource: any SystemSleepEventSource
   private let lockAll: () async throws -> Void
   private var started = false
@@ -32,27 +34,34 @@ final class NamespaceSleepLockCoordinator: ObservableObject {
 
   func start() throws {
     guard !started else { return }
-    try eventSource.start { [weak self] request in
-      Task { @MainActor [weak self] in
-        guard let self else {
-          request.fail()
-          return
-        }
-        do {
-          try await self.lockAll()
-          request.allow()
-        } catch {
-          request.fail()
+    do {
+      try eventSource.start { [weak self] request in
+        Task { @MainActor [weak self] in
+          guard let self else {
+            request.fail()
+            return
+          }
+          do {
+            try await self.lockAll()
+            request.allow()
+          } catch {
+            request.fail()
+          }
         }
       }
+      started = true
+      isProtectingSleep = true
+    } catch {
+      isProtectingSleep = false
+      throw error
     }
-    started = true
   }
 
   func stop() {
     guard started else { return }
     eventSource.stop()
     started = false
+    isProtectingSleep = false
   }
 }
 

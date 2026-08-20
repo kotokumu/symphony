@@ -83,7 +83,12 @@ public actor NamespaceCredentialBroker {
   }
 
   public func signChallenge(_ challenge: Data, namespaceID: Namespace.ID) async throws -> Data {
-    guard let session = sessions[namespaceID] else {
+    guard
+      let session = sessions[namespaceID],
+      !lockingNamespaces.contains(namespaceID),
+      startSuspensionCount == 0,
+      !applicationTerminationRequested
+    else {
       throw NamespaceCredentialBrokerError.locked
     }
     return try await session.signChallenge(challenge)

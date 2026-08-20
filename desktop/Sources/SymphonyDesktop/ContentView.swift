@@ -6,7 +6,7 @@ struct ContentView: View {
   @ObservedObject var daemonController: NamespaceDaemonController
   @ObservedObject var authenticationController: CodexAuthenticationController
   @ObservedObject var lockController: NamespaceLockController
-  @ObservedObject var sleepLockCoordinator: NamespaceSleepLockCoordinator
+  @ObservedObject var windowSecurityCoordinator: NamespaceWindowSecurityCoordinator
 
   @State private var editor: NamespaceEditorContext?
   @State private var namespaceToDelete: DesktopNamespace?
@@ -27,7 +27,6 @@ struct ContentView: View {
     .task {
       await daemonController.startObserving()
       await authenticationController.startObserving()
-      try? sleepLockCoordinator.start()
       if controller.loadState == .loading {
         await controller.load()
       }
@@ -39,12 +38,7 @@ struct ContentView: View {
       await authenticationController.refresh(namespaceID)
     }
     .onDisappear {
-      sleepLockCoordinator.stop()
-      Task {
-        try? await authenticationController.cancelAll()
-        try? await daemonController.stopAll()
-        try? await lockController.lockAll()
-      }
+      windowSecurityCoordinator.secureAfterWindowCloses()
     }
     .sheet(item: $editor) { context in
       NamespaceEditorSheet(context: context) { name in
@@ -83,6 +77,34 @@ struct ContentView: View {
         message: Text(notice.message),
         dismissButton: .default(Text("OK"))
       )
+    }
+    .safeAreaInset(edge: .top) {
+      windowSecurityBanner
+    }
+  }
+
+  @ViewBuilder
+  private var windowSecurityBanner: some View {
+    switch windowSecurityCoordinator.state {
+    case .idle:
+      EmptyView()
+    case .securing:
+      HStack {
+        ProgressView()
+        Text("Securing namespace credentials…")
+      }
+      .padding(8)
+    case .failed(let message):
+      HStack {
+        Text("Window security cleanup failed: \(message)")
+          .lineLimit(2)
+        Spacer()
+        Button("Retry") {
+          windowSecurityCoordinator.retry()
+        }
+      }
+      .padding(8)
+      .background(.red.opacity(0.12))
     }
   }
 
@@ -172,7 +194,7 @@ struct ContentView: View {
       }
     }
     .frame(minWidth: 760, minHeight: 520)
-    .disabled(controller.isChanging)
+    .disabled(controller.isChanging || windowSecurityCoordinator.state == .securing)
   }
 
   private var selectedNamespaceID: Binding<DesktopNamespace.ID?> {

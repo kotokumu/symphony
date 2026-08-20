@@ -33,6 +33,8 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
   private let environment: [String: String]
   private let forceKill: ForceKill
   private var runtimes: [Namespace.ID: Runtime] = [:]
+  private var commandOwners: Set<Namespace.ID> = []
+  private var commandWaiters: [Namespace.ID: [CheckedContinuation<Void, Never>]] = [:]
 
   public init(
     executableURL: URL?,
@@ -125,6 +127,8 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
     guard challenge.count <= 32_768 else {
       throw CredentialBrokerProcessError.requestTooLarge
     }
+    await acquireCommand(for: namespaceID)
+    defer { releaseCommand(for: namespaceID) }
     guard let runtime = runtimes[namespaceID], runtime.generation == generation else {
       throw CredentialBrokerProcessError.sessionNotRunning
     }
@@ -154,7 +158,11 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
       }
     } catch {
       do {
-        try await stop(namespaceID: namespaceID, generation: generation)
+        try await stopOwnedRuntime(
+          namespaceID: namespaceID,
+          generation: generation,
+          runtime: runtime
+        )
       } catch {
         throw error
       }
@@ -211,9 +219,23 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
   }
 
   fileprivate func stop(namespaceID: Namespace.ID, generation: UUID) async throws {
+    await acquireCommand(for: namespaceID)
+    defer { releaseCommand(for: namespaceID) }
     guard let runtime = runtimes[namespaceID], runtime.generation == generation else {
       return
     }
+    try await stopOwnedRuntime(
+      namespaceID: namespaceID,
+      generation: generation,
+      runtime: runtime
+    )
+  }
+
+  private func stopOwnedRuntime(
+    namespaceID: Namespace.ID,
+    generation: UUID,
+    runtime: Runtime
+  ) async throws {
     try await Self.stopProcess(
       runtime.process,
       input: runtime.input,
@@ -226,6 +248,31 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
     runtimes.removeValue(forKey: namespaceID)
     runtime.output?.closeFile()
     runtime.errorOutput?.closeFile()
+  }
+
+  private func acquireCommand(for namespaceID: Namespace.ID) async {
+    guard commandOwners.contains(namespaceID) else {
+      commandOwners.insert(namespaceID)
+      return
+    }
+    await withCheckedContinuation { continuation in
+      commandWaiters[namespaceID, default: []].append(continuation)
+    }
+  }
+
+  private func releaseCommand(for namespaceID: Namespace.ID) {
+    guard var waiters = commandWaiters[namespaceID], !waiters.isEmpty else {
+      commandOwners.remove(namespaceID)
+      commandWaiters.removeValue(forKey: namespaceID)
+      return
+    }
+    let next = waiters.removeFirst()
+    if waiters.isEmpty {
+      commandWaiters.removeValue(forKey: namespaceID)
+    } else {
+      commandWaiters[namespaceID] = waiters
+    }
+    next.resume()
   }
 
   private static func stopProcess(

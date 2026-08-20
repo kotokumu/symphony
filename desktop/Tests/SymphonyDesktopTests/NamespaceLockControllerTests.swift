@@ -66,6 +66,26 @@ final class NamespaceLockControllerTests: XCTestCase {
     try await controller.lock(namespaceID)
     XCTAssertEqual(controller.state(for: namespaceID), .locked())
   }
+
+  func testUnavailableSleepProtectionPreventsCredentialUnlock() async {
+    let namespaceID = UUID()
+    let broker = RecordingCredentialBroker()
+    let controller = NamespaceLockController(
+      broker: broker,
+      sleepProtectionAvailable: false
+    )
+
+    await controller.unlock(namespaceID)
+
+    XCTAssertEqual(
+      controller.state(for: namespaceID),
+      .locked(
+        message: "Credentials cannot be unlocked because system sleep protection is unavailable."
+      )
+    )
+    let isUnlocked = await broker.isUnlocked(namespaceID)
+    XCTAssertFalse(isUnlocked)
+  }
 }
 
 private actor RecordingCredentialBroker: NamespaceCredentialBrokering {

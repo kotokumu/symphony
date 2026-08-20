@@ -20,7 +20,18 @@ final class BrokerClientAuthorizerTests: XCTestCase {
 
     try authorizer.authorizeCaller()
 
-    XCTAssertEqual(signatureChecker.checks, [.init(processID: 42, executableURL: desktop)])
+    XCTAssertEqual(
+      signatureChecker.checks,
+      [
+        .init(
+          processID: 42,
+          desktopIdentifier: ParentCodeSignatureBrokerClientAuthorizer.desktopSigningIdentifier,
+          desktopExecutableURL: desktop,
+          helperExecutableURL: helper,
+          containingAppURL: URL(fileURLWithPath: "/Applications/Symphony.app")
+        )
+      ]
+    )
   }
 
   func testRejectsCallerAtDifferentExecutablePathBeforeCodeCheck() {
@@ -45,8 +56,8 @@ final class BrokerClientAuthorizerTests: XCTestCase {
   }
 
   func testRejectsExpectedPathWhenRunningCodeDoesNotMatchDesignatedRequirement() {
-    let helper = URL(fileURLWithPath: "/build/SymphonyCredentialBroker")
-    let desktop = URL(fileURLWithPath: "/build/SymphonyDesktop")
+    let helper = URL(fileURLWithPath: "/Applications/Symphony.app/Contents/Helpers/SymphonyCredentialBroker")
+    let desktop = URL(fileURLWithPath: "/Applications/Symphony.app/Contents/MacOS/SymphonyDesktop")
     let authorizer = ParentCodeSignatureBrokerClientAuthorizer(
       processInspector: StubBrokerParentProcessInspector(
         processID: 42,
@@ -57,6 +68,23 @@ final class BrokerClientAuthorizerTests: XCTestCase {
     )
 
     XCTAssertThrowsError(try authorizer.authorizeCaller())
+  }
+
+  func testRejectsRelocatedHelperBeforeInspectingNeighborSignature() {
+    let helper = URL(fileURLWithPath: "/tmp/SymphonyCredentialBroker")
+    let desktop = URL(fileURLWithPath: "/tmp/SymphonyDesktop")
+    let signatureChecker = RecordingBrokerCodeSignatureChecker(result: true)
+    let authorizer = ParentCodeSignatureBrokerClientAuthorizer(
+      processInspector: StubBrokerParentProcessInspector(
+        processID: 42,
+        executableURL: desktop
+      ),
+      codeSignatureChecker: signatureChecker,
+      helperExecutableURL: helper
+    )
+
+    XCTAssertThrowsError(try authorizer.authorizeCaller())
+    XCTAssertTrue(signatureChecker.checks.isEmpty)
   }
 }
 
@@ -73,7 +101,10 @@ private final class RecordingBrokerCodeSignatureChecker: BrokerCodeSignatureChec
 {
   struct Check: Equatable {
     let processID: pid_t
-    let executableURL: URL
+    let desktopIdentifier: String
+    let desktopExecutableURL: URL
+    let helperExecutableURL: URL
+    let containingAppURL: URL
   }
 
   private let result: Bool
@@ -83,8 +114,22 @@ private final class RecordingBrokerCodeSignatureChecker: BrokerCodeSignatureChec
     self.result = result
   }
 
-  func process(_ processID: pid_t, satisfiesCodeAt executableURL: URL) throws -> Bool {
-    checks.append(.init(processID: processID, executableURL: executableURL))
+  func process(
+    _ processID: pid_t,
+    satisfiesDesktopIdentifier desktopIdentifier: String,
+    desktopExecutableURL: URL,
+    helperExecutableURL: URL,
+    containingAppURL: URL
+  ) throws -> Bool {
+    checks.append(
+      .init(
+        processID: processID,
+        desktopIdentifier: desktopIdentifier,
+        desktopExecutableURL: desktopExecutableURL,
+        helperExecutableURL: helperExecutableURL,
+        containingAppURL: containingAppURL
+      )
+    )
     return result
   }
 }

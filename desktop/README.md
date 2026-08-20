@@ -73,11 +73,13 @@ standard-output pipes. The process receives only a namespace identifier on its c
 desktop application, namespace daemon, and Codex processes do not link the Keychain implementation
 or receive raw stored credential values.
 
-Before accepting an operation, the helper verifies that its parent is the expected desktop
-executable and that the running parent satisfies that executable's designated code-signing
-requirement. This applies to unlock, purge, and capability operations. Unknown operations are
-rejected. The initial opaque capability signs a bounded challenge and returns the HMAC result; no
-protocol response can return the stored credential.
+Before accepting an operation, the helper requires its packaged location inside a valid sealed
+application and verifies both the on-disk desktop executable and its running parent against a fixed
+desktop signing identifier and the helper's own trusted signing team. This applies to unlock, purge,
+and capability operations. Unknown operations are rejected. The initial opaque capability signs a
+bounded challenge and returns the HMAC result; no protocol response can return the stored
+credential. Each namespace pipe admits one complete request-response transaction at a time, and
+locking closes capability admission before waiting for an in-flight transaction.
 
 The helper uses LocalAuthentication for device owner approval and protects its namespace credential
 with a Data Protection Keychain user-presence policy and `ThisDeviceOnly` accessibility. It copies
@@ -89,5 +91,7 @@ replacement.
 Namespace deletion records only the namespace UUID in an owner-only cleanup ledger before the local
 repository transaction. A rollback removes that marker without purging Keychain material. After a
 commit, failed Keychain cleanup remains pending and is retried at the next catalog load. System sleep
-uses IOKit's power acknowledgement so the Mac does not proceed with cancellable sleep until broker
-locking completes successfully.
+protection is registered for the application lifetime and uses IOKit's power acknowledgement so the
+Mac does not proceed with cancellable sleep until broker locking completes successfully. A
+registration failure keeps credential unlock disabled. Window-close cleanup remains tracked after
+the view disappears and exposes failures for retry without unregistering sleep protection.

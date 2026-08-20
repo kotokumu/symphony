@@ -44,6 +44,34 @@ final class NamespaceSleepLockCoordinatorTests: XCTestCase {
     coordinator.stop()
 
     XCTAssertEqual(source.stopCount, 1)
+    XCTAssertFalse(coordinator.isProtectingSleep)
+  }
+
+  func testRegistrationFailureIsObservableAndLeavesProtectionUnavailable() {
+    let source = RecordingSleepEventSource(startError: TestSleepLockError.failed)
+    let coordinator = NamespaceSleepLockCoordinator(eventSource: source) {}
+
+    XCTAssertThrowsError(try coordinator.start())
+    XCTAssertFalse(coordinator.isProtectingSleep)
+  }
+
+  func testFailedWindowCleanupDoesNotStopApplicationSleepProtection() async throws {
+    let sleepCoordinator = NamespaceSleepLockCoordinator(
+      eventSource: RecordingSleepEventSource()
+    ) {}
+    try sleepCoordinator.start()
+    let windowCoordinator = NamespaceWindowSecurityCoordinator(
+      lockCredentials: {
+        throw TestSleepLockError.failed
+      },
+      cancelAuthentication: {},
+      stopDaemons: {}
+    )
+
+    windowCoordinator.secureAfterWindowCloses()
+    await windowCoordinator.waitForCurrentOperation()
+
+    XCTAssertTrue(sleepCoordinator.isProtectingSleep)
   }
 
   private func eventually(
@@ -64,8 +92,16 @@ private final class RecordingSleepEventSource: SystemSleepEventSource, @unchecke
   private let lock = NSLock()
   private var handler: (@Sendable (any SystemSleepPowerChange) -> Void)?
   private(set) var stopCount = 0
+  private let startError: Error?
 
-  func start(handler: @escaping @Sendable (any SystemSleepPowerChange) -> Void) {
+  init(startError: Error? = nil) {
+    self.startError = startError
+  }
+
+  func start(handler: @escaping @Sendable (any SystemSleepPowerChange) -> Void) throws {
+    if let startError {
+      throw startError
+    }
     lock.withLock { self.handler = handler }
   }
 

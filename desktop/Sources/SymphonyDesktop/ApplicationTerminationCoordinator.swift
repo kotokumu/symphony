@@ -35,9 +35,22 @@ final class ApplicationTerminationCoordinator {
 @MainActor
 final class SymphonyApplicationDelegate: NSObject, NSApplicationDelegate {
   private var terminationCoordinator: ApplicationTerminationCoordinator?
+  private var startSleepProtection: (() throws -> Void)?
 
-  func configure(stopAll: @escaping ApplicationTerminationCoordinator.StopAll) {
+  func configure(
+    startSleepProtection: @escaping () throws -> Void,
+    stopAll: @escaping ApplicationTerminationCoordinator.StopAll
+  ) {
+    self.startSleepProtection = startSleepProtection
     terminationCoordinator = ApplicationTerminationCoordinator(stopAll: stopAll)
+  }
+
+  func applicationDidFinishLaunching(_ notification: Notification) {
+    do {
+      try startSleepProtection?()
+    } catch {
+      NSAlert(error: error).runModal()
+    }
   }
 
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {

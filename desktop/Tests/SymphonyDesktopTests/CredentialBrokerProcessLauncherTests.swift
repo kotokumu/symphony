@@ -144,6 +144,94 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
     try await replacement.lock()
   }
 
+  func testConcurrentCapabilitiesKeepEachResponseBoundToItsRequest() async throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let script = try executableScript(
+      in: directory,
+      contents: """
+        #!/bin/sh
+        printf '{"status":"unlocked"}\\n'
+        while IFS= read -r command; do
+          case "$command" in
+            *'"operation":"lock"'*) exit 0 ;;
+            *'AQ=='*) sleep 0.1; printf '{"status":"signature","payload":"AQ=="}\\n' ;;
+            *'Ag=='*) printf '{"status":"signature","payload":"Ag=="}\\n' ;;
+            *) exit 2 ;;
+          esac
+        done
+        """
+    )
+    let namespaceID = UUID()
+    let launcher = CredentialBrokerProcessLauncher(
+      executableURL: script,
+      handshakeTimeout: 1,
+      stopTimeout: 1,
+      environment: ["PATH": "/usr/bin:/bin"]
+    )
+    let session = try await launcher.unlock(namespaceID: namespaceID)
+
+    async let first = session.signChallenge(Data([1]))
+    async let second = session.signChallenge(Data([2]))
+    let results = try await (first, second)
+
+    XCTAssertEqual(results.0, Data([1]))
+    XCTAssertEqual(results.1, Data([2]))
+    try await session.lock()
+  }
+
+  func testLockWaitsForInFlightCapabilityBeforeCompleting() async throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let requestStartedURL = directory.appendingPathComponent("request-started")
+    let script = try executableScript(
+      in: directory,
+      contents: """
+        #!/bin/sh
+        printf '{"status":"unlocked"}\\n'
+        while IFS= read -r command; do
+          case "$command" in
+            *'"operation":"lock"'*) exit 0 ;;
+            *)
+              : > "$BROKER_REQUEST_STARTED_FILE"
+              sleep 0.15
+              printf '{"status":"signature","payload":"AQ=="}\\n'
+              ;;
+          esac
+        done
+        """
+    )
+    let namespaceID = UUID()
+    let launcher = CredentialBrokerProcessLauncher(
+      executableURL: script,
+      handshakeTimeout: 1,
+      stopTimeout: 1,
+      environment: [
+        "PATH": "/usr/bin:/bin",
+        "BROKER_REQUEST_STARTED_FILE": requestStartedURL.path,
+      ]
+    )
+    let session = try await launcher.unlock(namespaceID: namespaceID)
+    let capability = Task {
+      try await session.signChallenge(Data([1]))
+    }
+    await eventually { FileManager.default.fileExists(atPath: requestStartedURL.path) }
+    let lockFinished = LockedFlag()
+    let lock = Task {
+      try await session.lock()
+      await lockFinished.mark()
+    }
+    try await Task.sleep(for: .milliseconds(30))
+    let finishedEarly = await lockFinished.value
+    XCTAssertFalse(finishedEarly)
+
+    let capabilityResult = try await capability.value
+    XCTAssertEqual(capabilityResult, Data([1]))
+    try await lock.value
+    let finished = await lockFinished.value
+    XCTAssertTrue(finished)
+  }
+
   private func temporaryDirectory() throws -> URL {
     let url = FileManager.default.temporaryDirectory
       .appendingPathComponent("CredentialBrokerProcessLauncherTests-\(UUID().uuidString)")
@@ -156,6 +244,19 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
     try Data(contents.utf8).write(to: url)
     try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
     return url
+  }
+
+  private func eventually(
+    _ condition: @escaping () -> Bool,
+    file: StaticString = #filePath,
+    line: UInt = #line
+  ) async {
+    let deadline = Date().addingTimeInterval(1)
+    while Date() < deadline {
+      if condition() { return }
+      try? await Task.sleep(for: .milliseconds(10))
+    }
+    XCTFail("Condition was not satisfied", file: file, line: line)
   }
 }
 
@@ -171,5 +272,13 @@ private final class RetryingForceKill: @unchecked Sendable {
     lock.withLock {
       isAllowed ? Darwin.kill(processID, SIGKILL) : -1
     }
+  }
+}
+
+private actor LockedFlag {
+  private(set) var value = false
+
+  func mark() {
+    value = true
   }
 }

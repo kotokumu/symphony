@@ -13,6 +13,7 @@ struct SymphonyDesktopApp: App {
   @StateObject private var authenticationController: CodexAuthenticationController
   @StateObject private var lockController: NamespaceLockController
   @StateObject private var sleepLockCoordinator: NamespaceSleepLockCoordinator
+  @StateObject private var windowSecurityCoordinator: NamespaceWindowSecurityCoordinator
 
   init() {
     let command = SymphonyExecutableLocator().locate()
@@ -31,7 +32,10 @@ struct SymphonyDesktopApp: App {
         executableURL: CredentialBrokerExecutableLocator().locate()
       )
     )
-    let namespaceLockController = NamespaceLockController(broker: credentialBroker)
+    let namespaceLockController = NamespaceLockController(
+      broker: credentialBroker,
+      sleepProtectionAvailable: false
+    )
     let namespaceSleepLockCoordinator = NamespaceSleepLockCoordinator {
       try await namespaceLockController.lockAll()
     }
@@ -51,20 +55,19 @@ struct SymphonyDesktopApp: App {
           repository.directoryURL(for: id)
         }
       )
-      _daemonController = StateObject(
-        wrappedValue: NamespaceDaemonController(
-          supervisor: supervisor,
-          directoryURL: { id in
-            repository.directoryURL(for: id)
-          },
-          afterStop: { id in
-            try await namespaceLockController.lock(id)
-          },
-          afterStopAll: {
-            try await namespaceLockController.lockAll()
-          }
-        )
+      let namespaceDaemonController = NamespaceDaemonController(
+        supervisor: supervisor,
+        directoryURL: { id in
+          repository.directoryURL(for: id)
+        },
+        afterStop: { id in
+          try await namespaceLockController.lock(id)
+        },
+        afterStopAll: {
+          try await namespaceLockController.lockAll()
+        }
       )
+      _daemonController = StateObject(wrappedValue: namespaceDaemonController)
       _controller = StateObject(
         wrappedValue: NamespaceController(
           repository: repository,
@@ -99,6 +102,19 @@ struct SymphonyDesktopApp: App {
       _authenticationController = StateObject(
         wrappedValue: codexAuthenticationController
       )
+      _windowSecurityCoordinator = StateObject(
+        wrappedValue: NamespaceWindowSecurityCoordinator(
+          lockCredentials: {
+            try await namespaceLockController.lockAll()
+          },
+          cancelAuthentication: {
+            try await codexAuthenticationController.cancelAll()
+          },
+          stopDaemons: {
+            try await namespaceDaemonController.stopAll()
+          }
+        )
+      )
     } catch {
       let repository = UnavailableNamespaceRepository(message: error.localizedDescription)
       let codexAuthenticationController = CodexAuthenticationController(
@@ -107,31 +123,54 @@ struct SymphonyDesktopApp: App {
           FileManager.default.temporaryDirectory.appendingPathComponent(id.uuidString)
         }
       )
-      _daemonController = StateObject(
-        wrappedValue: NamespaceDaemonController(
-          supervisor: supervisor,
-          directoryURL: { id in
-            FileManager.default.temporaryDirectory.appendingPathComponent(id.uuidString)
-          },
-          afterStop: { id in
-            try await namespaceLockController.lock(id)
-          },
-          afterStopAll: {
-            try await namespaceLockController.lockAll()
-          }
-        )
+      let namespaceDaemonController = NamespaceDaemonController(
+        supervisor: supervisor,
+        directoryURL: { id in
+          FileManager.default.temporaryDirectory.appendingPathComponent(id.uuidString)
+        },
+        afterStop: { id in
+          try await namespaceLockController.lock(id)
+        },
+        afterStopAll: {
+          try await namespaceLockController.lockAll()
+        }
       )
+      _daemonController = StateObject(wrappedValue: namespaceDaemonController)
       _controller = StateObject(wrappedValue: NamespaceController(repository: repository))
       _authenticationController = StateObject(
         wrappedValue: codexAuthenticationController
       )
+      _windowSecurityCoordinator = StateObject(
+        wrappedValue: NamespaceWindowSecurityCoordinator(
+          lockCredentials: {
+            try await namespaceLockController.lockAll()
+          },
+          cancelAuthentication: {
+            try await codexAuthenticationController.cancelAll()
+          },
+          stopDaemons: {
+            try await namespaceDaemonController.stopAll()
+          }
+        )
+      )
     }
 
-    applicationDelegate.configure {
+    applicationDelegate.configure(
+      startSleepProtection: {
+        do {
+          try namespaceSleepLockCoordinator.start()
+          namespaceLockController.setSleepProtectionAvailable(true)
+        } catch {
+          namespaceLockController.setSleepProtectionAvailable(false)
+          throw error
+        }
+      }
+    ) {
       do {
         try await namespaceLockController.shutdownForApplicationTermination()
         try await authenticationManager.shutdownForApplicationTermination()
         try await supervisor.shutdownForApplicationTermination()
+        namespaceSleepLockCoordinator.stop()
       } catch {
         await authenticationManager.resumeAfterApplicationTerminationFailure()
         await namespaceLockController.resumeAfterApplicationTerminationFailure()
@@ -147,7 +186,7 @@ struct SymphonyDesktopApp: App {
         daemonController: daemonController,
         authenticationController: authenticationController,
         lockController: lockController,
-        sleepLockCoordinator: sleepLockCoordinator
+        windowSecurityCoordinator: windowSecurityCoordinator
       )
     }
     .defaultSize(width: 760, height: 520)
