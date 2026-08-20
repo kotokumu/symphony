@@ -1,8 +1,9 @@
 import Foundation
+import CryptoKit
 import Security
 
 public actor NamespaceCredentialSession {
-  public typealias CredentialGenerator = @Sendable () throws -> Data
+  public typealias CredentialGenerator = @Sendable () throws -> SecureSecretBuffer
 
   private let namespaceID: UUID
   private let authorizer: any NamespaceUnlockAuthorizing
@@ -35,15 +36,28 @@ public actor NamespaceCredentialSession {
 
     let authorization = try await authorizer.authorize(reason: reason)
     do {
-      var material: Data
-      if let stored = try storage.load(namespaceID: namespaceID, authorization: authorization) {
-        material = stored
+      if var stored = try storage.load(
+        namespaceID: namespaceID,
+        authorization: authorization
+      ) {
+        defer { stored.resetBytes(in: stored.startIndex..<stored.endIndex) }
+        credential = SecureSecretBuffer(copying: stored)
       } else {
-        material = try credentialGenerator()
-        try storage.store(material, namespaceID: namespaceID, authorization: authorization)
+        let generated = try credentialGenerator()
+        do {
+          try generated.withTemporaryData { material in
+            try storage.store(
+              material,
+              namespaceID: namespaceID,
+              authorization: authorization
+            )
+          }
+          credential = generated
+        } catch {
+          generated.clear()
+          throw error
+        }
       }
-      credential = SecureSecretBuffer(copying: material)
-      material.resetBytes(in: material.startIndex..<material.endIndex)
       self.authorization = authorization
     } catch {
       authorization.invalidate()
@@ -63,18 +77,41 @@ public actor NamespaceCredentialSession {
     try storage.removeAll(namespaceID: namespaceID)
   }
 
+  public func signChallenge(_ challenge: Data) throws -> Data {
+    guard let credential else {
+      throw NamespaceCredentialSessionError.locked
+    }
+    return credential.withUnsafeBytes { credentialBytes in
+      let key = SymmetricKey(data: credentialBytes)
+      let authenticationCode = HMAC<SHA256>.authenticationCode(
+        for: challenge,
+        using: key
+      )
+      return Data(authenticationCode)
+    }
+  }
+
   var retainedByteCount: Int {
     credential?.retainedByteCount ?? 0
   }
 
-  public static func randomCredential() throws -> Data {
+  public static func randomCredential() throws -> SecureSecretBuffer {
     var data = Data(count: 32)
+    defer { data.resetBytes(in: data.startIndex..<data.endIndex) }
     let status = data.withUnsafeMutableBytes { bytes in
       SecRandomCopyBytes(kSecRandomDefault, bytes.count, bytes.baseAddress!)
     }
     guard status == errSecSuccess else {
       throw NamespaceCredentialStorageError.keychain(status)
     }
-    return data
+    return SecureSecretBuffer(copying: data)
+  }
+}
+
+public enum NamespaceCredentialSessionError: LocalizedError, Sendable {
+  case locked
+
+  public var errorDescription: String? {
+    "Protected namespace credentials are locked."
   }
 }

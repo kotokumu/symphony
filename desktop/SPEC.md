@@ -99,11 +99,15 @@ not change the lock state of another namespace.
 
 Long-lived namespace credentials are stored through macOS protected credential storage. They are
 not written to Symphony application files, logs, command-line arguments, or environment variables.
-Only the native credential broker can unlock stored credential material, and it exposes operations
-for a credential's purpose instead of returning the stored value to Symphony, its daemons, or Codex.
+Only a broker session started by the trusted desktop application can unlock stored credential
+material. The broker exposes operations for a credential's purpose and returns only their results,
+not the stored value, to Symphony. Its daemons and Codex cannot start an authorized broker session
+or read stored credentials directly.
 
 A namespace can be locked manually. Its protected credential access is also cleared when its daemon
-stops or fails, when the Mac goes to sleep, when the namespace is deleted, when the main window
-closes, and before the application terminates. If protected credential access cannot be cleared
-safely during deletion or application termination, Symphony reports the failure and does not
-continue the destructive lifecycle operation.
+stops or fails, before the Mac acknowledges sleep, when the namespace is deleted, when the main
+window closes, and before the application terminates. If protected credential access cannot be
+cleared safely before deletion or application termination, Symphony reports the failure and does
+not continue the destructive lifecycle operation. Stored credential deletion occurs only after the
+namespace deletion commits. A failed stored-credential cleanup is reported and retried without
+restoring the deleted namespace.

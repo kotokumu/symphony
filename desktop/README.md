@@ -73,8 +73,21 @@ standard-output pipes. The process receives only a namespace identifier on its c
 desktop application, namespace daemon, and Codex processes do not link the Keychain implementation
 or receive raw stored credential values.
 
+Before accepting an operation, the helper verifies that its parent is the expected desktop
+executable and that the running parent satisfies that executable's designated code-signing
+requirement. This applies to unlock, purge, and capability operations. Unknown operations are
+rejected. The initial opaque capability signs a bounded challenge and returns the HMAC result; no
+protocol response can return the stored credential.
+
 The helper uses LocalAuthentication for device owner approval and protects its namespace credential
-with a Keychain user-presence policy and `ThisDeviceOnly` accessibility. It retains decrypted
-material only in an explicitly cleared memory buffer while the namespace is unlocked. Locking ends
-the helper session; forced termination is bounded and treated as a lifecycle failure rather than
-silently abandoning a process that may still hold credential material.
+with a Data Protection Keychain user-presence policy and `ThisDeviceOnly` accessibility. It copies
+decrypted material into an explicitly cleared memory buffer and clears temporary mutable copies.
+Locking ends the helper session; forced termination is bounded, the launcher retains failed process
+ownership, and later lock or shutdown requests retry the same process instead of allowing a
+replacement.
+
+Namespace deletion records only the namespace UUID in an owner-only cleanup ledger before the local
+repository transaction. A rollback removes that marker without purging Keychain material. After a
+commit, failed Keychain cleanup remains pending and is retried at the next catalog load. System sleep
+uses IOKit's power acknowledgement so the Mac does not proceed with cancellable sleep until broker
+locking completes successfully.

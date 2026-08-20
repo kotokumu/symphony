@@ -4,34 +4,54 @@ import SymphonyCredentialBrokerProtocol
 import SymphonyDesktopCore
 
 public protocol CredentialBrokerSessionHandle: Sendable {
+  func signChallenge(_ challenge: Data) async throws -> Data
   /// Returns only after the broker process no longer retains namespace credentials.
   func lock() async throws
 }
 
 public protocol CredentialBrokerSessionLaunching: Sendable {
   func unlock(namespaceID: Namespace.ID) async throws -> any CredentialBrokerSessionHandle
+  /// Returns only after no broker process remains owned for `namespaceID`.
+  func stop(namespaceID: Namespace.ID) async throws
   func purge(namespaceID: Namespace.ID) async throws
 }
 
-public struct CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
+public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
+  public typealias ForceKill = @Sendable (Int32) -> Int32
+
+  private struct Runtime {
+    let generation: UUID
+    let process: UnsafeProcessReference
+    let input: FileHandle?
+    let output: FileHandle?
+    let errorOutput: FileHandle?
+  }
+
   private let executableURL: URL?
   private let handshakeTimeout: TimeInterval
   private let stopTimeout: TimeInterval
   private let environment: [String: String]
+  private let forceKill: ForceKill
+  private var runtimes: [Namespace.ID: Runtime] = [:]
 
   public init(
     executableURL: URL?,
     handshakeTimeout: TimeInterval = 60,
     stopTimeout: TimeInterval = 2,
-    environment: [String: String] = ProcessInfo.processInfo.environment
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    forceKill: @escaping ForceKill = { Darwin.kill($0, SIGKILL) }
   ) {
     self.executableURL = executableURL
     self.handshakeTimeout = handshakeTimeout
     self.stopTimeout = stopTimeout
     self.environment = NamespaceProcessEnvironment.sanitized(environment)
+    self.forceKill = forceKill
   }
 
   public func unlock(namespaceID: Namespace.ID) async throws -> any CredentialBrokerSessionHandle {
+    guard runtimes[namespaceID] == nil else {
+      throw CredentialBrokerProcessError.sessionAlreadyRunning
+    }
     let executableURL = try requireExecutable()
     let process = Process()
     let input = Pipe()
@@ -51,6 +71,16 @@ public struct CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching 
     }
 
     let processReference = UnsafeProcessReference(process)
+    let generation = UUID()
+    let runtime = Runtime(
+      generation: generation,
+      process: processReference,
+      input: input.fileHandleForWriting,
+      output: output.fileHandleForReading,
+      errorOutput: errorOutput.fileHandleForReading
+    )
+    runtimes[namespaceID] = runtime
+    let handshakeTimeout = self.handshakeTimeout
     do {
       let responseData = try await withTaskCancellationHandler {
         try await Task.detached {
@@ -66,33 +96,74 @@ public struct CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching 
       switch handshake {
       case .unlocked:
         return ProcessCredentialBrokerSession(
-          process: process,
-          input: input.fileHandleForWriting,
-          output: output.fileHandleForReading,
-          errorOutput: errorOutput.fileHandleForReading,
-          stopTimeout: stopTimeout
+          namespaceID: namespaceID,
+          generation: generation,
+          launcher: self
         )
       case .failed(let message):
-        try await ProcessCredentialBrokerSession.stop(
-          processReference,
-          input: input.fileHandleForWriting,
-          timeout: stopTimeout
-        )
+        try await stop(namespaceID: namespaceID, generation: generation)
         throw CredentialBrokerProcessError.unlockFailed(message)
       }
     } catch {
-      try? await ProcessCredentialBrokerSession.stop(
-        processReference,
-        input: input.fileHandleForWriting,
-        timeout: stopTimeout
-      )
-      output.fileHandleForReading.closeFile()
-      errorOutput.fileHandleForReading.closeFile()
+      try await stop(namespaceID: namespaceID, generation: generation)
+      throw error
+    }
+  }
+
+  public func stop(namespaceID: Namespace.ID) async throws {
+    guard let runtime = runtimes[namespaceID] else {
+      return
+    }
+    try await stop(namespaceID: namespaceID, generation: runtime.generation)
+  }
+
+  fileprivate func signChallenge(
+    _ challenge: Data,
+    namespaceID: Namespace.ID,
+    generation: UUID
+  ) async throws -> Data {
+    guard challenge.count <= 32_768 else {
+      throw CredentialBrokerProcessError.requestTooLarge
+    }
+    guard let runtime = runtimes[namespaceID], runtime.generation == generation else {
+      throw CredentialBrokerProcessError.sessionNotRunning
+    }
+    guard let input = runtime.input, let output = runtime.output else {
+      throw CredentialBrokerProcessError.sessionNotRunning
+    }
+    let outputDescriptor = output.fileDescriptor
+    let responseTimeout = handshakeTimeout
+    do {
+      var command = try JSONEncoder().encode(CredentialBrokerCommand.signChallenge(challenge))
+      command.append(0x0A)
+      try input.write(contentsOf: command)
+      let responseData = try await Task.detached {
+        try BrokerPipeReader.readLine(
+          from: outputDescriptor,
+          timeout: responseTimeout,
+          maximumBytes: 65_536
+        )
+      }.value
+      switch try JSONDecoder().decode(CredentialBrokerResult.self, from: responseData) {
+      case .signature(let signature):
+        return signature
+      case .failed(let message):
+        throw CredentialBrokerProcessError.capabilityFailed(message)
+      case .locked:
+        throw CredentialBrokerProcessError.handshakeFailed
+      }
+    } catch {
+      do {
+        try await stop(namespaceID: namespaceID, generation: generation)
+      } catch {
+        throw error
+      }
       throw error
     }
   }
 
   public func purge(namespaceID: Namespace.ID) async throws {
+    try await stop(namespaceID: namespaceID)
     let executableURL = try requireExecutable()
     let process = Process()
     let errorOutput = Pipe()
@@ -110,16 +181,21 @@ public struct CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching 
     }
 
     let processReference = UnsafeProcessReference(process)
-    guard await ProcessCredentialBrokerSession.waitForExit(processReference, timeout: stopTimeout)
-    else {
-      try? await ProcessCredentialBrokerSession.stop(
-        processReference,
-        input: nil,
-        timeout: stopTimeout
-      )
+    let generation = UUID()
+    runtimes[namespaceID] = Runtime(
+      generation: generation,
+      process: processReference,
+      input: nil,
+      output: nil,
+      errorOutput: errorOutput.fileHandleForReading
+    )
+    guard await Self.waitForExit(processReference, timeout: stopTimeout) else {
+      try await stop(namespaceID: namespaceID, generation: generation)
       throw CredentialBrokerProcessError.stopTimedOut
     }
-    guard process.terminationStatus == 0 else {
+    let terminationStatus = processReference.terminationStatus
+    try await stop(namespaceID: namespaceID, generation: generation)
+    guard terminationStatus == 0 else {
       throw CredentialBrokerProcessError.purgeFailed
     }
   }
@@ -133,48 +209,37 @@ public struct CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching 
     }
     return executableURL
   }
-}
 
-private actor ProcessCredentialBrokerSession: CredentialBrokerSessionHandle {
-  private let process: UnsafeProcessReference
-  private let input: FileHandle
-  private let output: FileHandle
-  private let errorOutput: FileHandle
-  private let stopTimeout: TimeInterval
-  private var stopped = false
-
-  init(
-    process: Process,
-    input: FileHandle,
-    output: FileHandle,
-    errorOutput: FileHandle,
-    stopTimeout: TimeInterval
-  ) {
-    self.process = UnsafeProcessReference(process)
-    self.input = input
-    self.output = output
-    self.errorOutput = errorOutput
-    self.stopTimeout = stopTimeout
-  }
-
-  func lock() async throws {
-    guard !stopped else {
+  fileprivate func stop(namespaceID: Namespace.ID, generation: UUID) async throws {
+    guard let runtime = runtimes[namespaceID], runtime.generation == generation else {
       return
     }
-    try await Self.stop(process, input: input, timeout: stopTimeout)
-    stopped = true
-    output.closeFile()
-    errorOutput.closeFile()
+    try await Self.stopProcess(
+      runtime.process,
+      input: runtime.input,
+      timeout: stopTimeout,
+      forceKill: forceKill
+    )
+    guard runtimes[namespaceID]?.generation == generation else {
+      return
+    }
+    runtimes.removeValue(forKey: namespaceID)
+    runtime.output?.closeFile()
+    runtime.errorOutput?.closeFile()
   }
 
-  static func stop(
+  private static func stopProcess(
     _ process: UnsafeProcessReference,
     input: FileHandle?,
-    timeout: TimeInterval
+    timeout: TimeInterval,
+    forceKill: ForceKill
   ) async throws {
     if process.isRunning {
       if let input {
-        try? input.write(contentsOf: Data("lock\n".utf8))
+        if var command = try? JSONEncoder().encode(CredentialBrokerCommand.lock) {
+          command.append(0x0A)
+          try? input.write(contentsOf: command)
+        }
         try? input.close()
       }
       if await waitForExit(process, timeout: timeout) {
@@ -184,14 +249,16 @@ private actor ProcessCredentialBrokerSession: CredentialBrokerSessionHandle {
       if await waitForExit(process, timeout: timeout) {
         return
       }
-      _ = Darwin.kill(process.processIdentifier, SIGKILL)
+      guard forceKill(process.processIdentifier) == 0 else {
+        throw CredentialBrokerProcessError.stopTimedOut
+      }
       guard await waitForExit(process, timeout: timeout) else {
         throw CredentialBrokerProcessError.stopTimedOut
       }
     }
   }
 
-  static func waitForExit(
+  private static func waitForExit(
     _ process: UnsafeProcessReference,
     timeout: TimeInterval
   ) async -> Bool {
@@ -200,6 +267,34 @@ private actor ProcessCredentialBrokerSession: CredentialBrokerSessionHandle {
       try? await Task.sleep(for: .milliseconds(20))
     }
     return !process.isRunning
+  }
+}
+
+private struct ProcessCredentialBrokerSession: CredentialBrokerSessionHandle {
+  private let namespaceID: Namespace.ID
+  private let generation: UUID
+  private let launcher: CredentialBrokerProcessLauncher
+
+  init(
+    namespaceID: Namespace.ID,
+    generation: UUID,
+    launcher: CredentialBrokerProcessLauncher
+  ) {
+    self.namespaceID = namespaceID
+    self.generation = generation
+    self.launcher = launcher
+  }
+
+  func lock() async throws {
+    try await launcher.stop(namespaceID: namespaceID, generation: generation)
+  }
+
+  func signChallenge(_ challenge: Data) async throws -> Data {
+    try await launcher.signChallenge(
+      challenge,
+      namespaceID: namespaceID,
+      generation: generation
+    )
   }
 }
 
@@ -212,11 +307,16 @@ private final class UnsafeProcessReference: @unchecked Sendable {
 
   var isRunning: Bool { process.isRunning }
   var processIdentifier: Int32 { process.processIdentifier }
+  var terminationStatus: Int32 { process.terminationStatus }
   func terminate() { process.terminate() }
 }
 
 private enum BrokerPipeReader {
-  static func readLine(from descriptor: Int32, timeout: TimeInterval) throws -> Data {
+  static func readLine(
+    from descriptor: Int32,
+    timeout: TimeInterval,
+    maximumBytes: Int = 16_384
+  ) throws -> Data {
     let deadline = Date().addingTimeInterval(timeout)
     var accumulated = Data()
 
@@ -241,7 +341,7 @@ private enum BrokerPipeReader {
       if let newline = accumulated.firstIndex(of: 0x0A) {
         return accumulated[..<newline]
       }
-      guard accumulated.count <= 16_384 else {
+      guard accumulated.count <= maximumBytes else {
         throw CredentialBrokerProcessError.handshakeFailed
       }
     }
@@ -252,6 +352,10 @@ private enum BrokerPipeReader {
 public enum CredentialBrokerProcessError: LocalizedError, Sendable {
   case executableNotFound
   case executableNotExecutable(URL)
+  case sessionAlreadyRunning
+  case sessionNotRunning
+  case requestTooLarge
+  case capabilityFailed(String)
   case launchFailed(String)
   case handshakeFailed
   case handshakeTimedOut
@@ -265,6 +369,14 @@ public enum CredentialBrokerProcessError: LocalizedError, Sendable {
       "The native credential broker could not be found. Reinstall Symphony and try again."
     case .executableNotExecutable(let url):
       "The native credential broker is not executable at \(url.path). Reinstall Symphony and try again."
+    case .sessionAlreadyRunning:
+      "A native credential broker process is already owned for this namespace. Lock it before trying again."
+    case .sessionNotRunning:
+      "The namespace credential broker is not running. Unlock the namespace and try again."
+    case .requestTooLarge:
+      "The credential capability request is too large."
+    case .capabilityFailed(let message):
+      message
     case .launchFailed(let message):
       "The native credential broker could not start: \(message)"
     case .handshakeFailed:

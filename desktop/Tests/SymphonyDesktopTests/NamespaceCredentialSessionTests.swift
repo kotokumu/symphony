@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import LocalAuthentication
 import XCTest
 
@@ -13,7 +14,7 @@ final class NamespaceCredentialSessionTests: XCTestCase {
       namespaceID: namespaceID,
       authorizer: authorizer,
       storage: storage,
-      credentialGenerator: { Data([1, 2, 3, 4]) }
+      credentialGenerator: { SecureSecretBuffer(copying: Data([1, 2, 3, 4])) }
     )
 
     try await session.unlock(reason: "Test unlock")
@@ -42,7 +43,7 @@ final class NamespaceCredentialSessionTests: XCTestCase {
       storage: storage,
       credentialGenerator: {
         generator.increment()
-        return Data([1])
+        return SecureSecretBuffer(copying: Data([1]))
       }
     )
 
@@ -60,7 +61,7 @@ final class NamespaceCredentialSessionTests: XCTestCase {
       namespaceID: namespaceID,
       authorizer: RecordingUnlockAuthorizer(error: TestUnlockError.denied),
       storage: storage,
-      credentialGenerator: { Data([1, 2, 3]) }
+      credentialGenerator: { SecureSecretBuffer(copying: Data([1, 2, 3])) }
     )
 
     do {
@@ -94,6 +95,63 @@ final class NamespaceCredentialSessionTests: XCTestCase {
     XCTAssertEqual(retainedByteCount, 0)
     XCTAssertNil(storage.storedCredential(for: namespaceID))
   }
+
+  func testSigningChallengeReturnsOnlyDerivedCapabilityResult() async throws {
+    let namespaceID = UUID()
+    let storedCredential = Data([1, 2, 3, 4])
+    let session = NamespaceCredentialSession(
+      namespaceID: namespaceID,
+      authorizer: RecordingUnlockAuthorizer(),
+      storage: RecordingCredentialStorage(credentials: [namespaceID: storedCredential])
+    )
+    try await session.unlock(reason: "Test unlock")
+    let challenge = Data("challenge".utf8)
+
+    let signature = try await session.signChallenge(challenge)
+
+    let expected = Data(
+      HMAC<SHA256>.authenticationCode(
+        for: challenge,
+        using: SymmetricKey(data: storedCredential)
+      )
+    )
+    XCTAssertEqual(signature, expected)
+    XCTAssertNotEqual(signature, storedCredential)
+
+    await session.lock()
+    do {
+      _ = try await session.signChallenge(challenge)
+      XCTFail("Expected locked capability error")
+    } catch {
+      XCTAssertEqual(error.localizedDescription, "Protected namespace credentials are locked.")
+    }
+  }
+
+  func testSecureBufferOverwritesItsAllocationWhenCleared() {
+    let buffer = SecureSecretBuffer(copying: Data([7, 8, 9]))
+
+    buffer.clear()
+
+    XCTAssertEqual(buffer.bytesForTesting, [0, 0, 0])
+  }
+
+  func testStorageFailureOverwritesGeneratedMaterialBeforeReturning() async {
+    let namespaceID = UUID()
+    let generated = SecureSecretBuffer(copying: Data([5, 6, 7]))
+    let session = NamespaceCredentialSession(
+      namespaceID: namespaceID,
+      authorizer: RecordingUnlockAuthorizer(),
+      storage: RecordingCredentialStorage(storeError: TestCredentialStorageError.failed),
+      credentialGenerator: { generated }
+    )
+
+    do {
+      try await session.unlock(reason: "Test unlock")
+      XCTFail("Expected storage failure")
+    } catch {}
+
+    XCTAssertEqual(generated.bytesForTesting, [0, 0, 0])
+  }
 }
 
 private actor RecordingUnlockAuthorizer: NamespaceUnlockAuthorizing {
@@ -117,9 +175,11 @@ private final class RecordingCredentialStorage: NamespaceCredentialStoring, @unc
   private var credentials: [UUID: Data]
   private var loadInvocations = 0
   private var storeInvocations = 0
+  private let storeError: Error?
 
-  init(credentials: [UUID: Data] = [:]) {
+  init(credentials: [UUID: Data] = [:], storeError: Error? = nil) {
     self.credentials = credentials
+    self.storeError = storeError
   }
 
   func load(
@@ -139,8 +199,10 @@ private final class RecordingCredentialStorage: NamespaceCredentialStoring, @unc
   ) throws {
     lock.withLock {
       storeInvocations += 1
+      if let storeError { return }
       credentials[namespaceID] = credential
     }
+    if let storeError { throw storeError }
   }
 
   func removeAll(namespaceID: UUID) throws {
@@ -169,4 +231,8 @@ private enum TestUnlockError: LocalizedError {
   case denied
 
   var errorDescription: String? { "Test unlock denied." }
+}
+
+private enum TestCredentialStorageError: Error {
+  case failed
 }

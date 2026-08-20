@@ -242,6 +242,51 @@ final class NamespaceControllerTests: XCTestCase {
     XCTAssertTrue(controller.catalog.namespaces.isEmpty)
     XCTAssertFalse(controller.isChanging)
   }
+
+  func testCredentialCleanupFailureBecomesPostCommitCleanupWarning() async throws {
+    var catalog = NamespaceCatalog()
+    let namespace = try catalog.create(named: "Research")
+    let repository = TestNamespaceRepository(catalog: catalog)
+    let controller = NamespaceController(
+      repository: repository,
+      cleanupAfterDelete: { _, committed in
+        committed ? "Protected credential cleanup is pending." : nil
+      }
+    )
+    await controller.load()
+
+    let outcome = try await controller.deleteNamespace(namespace.id)
+
+    XCTAssertEqual(
+      outcome,
+      .cleanupPending("Protected credential cleanup is pending.")
+    )
+    XCTAssertTrue(controller.catalog.namespaces.isEmpty)
+  }
+
+  func testRepositoryDeleteFailureSignalsCredentialRollbackInsteadOfCommittedCleanup() async throws {
+    var catalog = NamespaceCatalog()
+    let namespace = try catalog.create(named: "Research")
+    let repository = TestNamespaceRepository(catalog: catalog)
+    let recorder = OperationRecorder()
+    let controller = NamespaceController(
+      repository: repository,
+      cleanupAfterDelete: { _, committed in
+        recorder.append("credential-cleanup:\(committed)")
+        return nil
+      }
+    )
+    await controller.load()
+    await repository.failNextDelete()
+
+    do {
+      _ = try await controller.deleteNamespace(namespace.id)
+      XCTFail("Expected repository deletion to fail")
+    } catch {}
+
+    XCTAssertEqual(recorder.values, ["credential-cleanup:false"])
+    XCTAssertEqual(controller.catalog, catalog)
+  }
 }
 
 private actor TestNamespaceRepository: NamespaceRepository {

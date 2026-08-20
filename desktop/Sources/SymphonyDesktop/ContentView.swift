@@ -1,4 +1,3 @@
-import AppKit
 import SwiftUI
 import SymphonyDesktopCore
 
@@ -7,6 +6,7 @@ struct ContentView: View {
   @ObservedObject var daemonController: NamespaceDaemonController
   @ObservedObject var authenticationController: CodexAuthenticationController
   @ObservedObject var lockController: NamespaceLockController
+  @ObservedObject var sleepLockCoordinator: NamespaceSleepLockCoordinator
 
   @State private var editor: NamespaceEditorContext?
   @State private var namespaceToDelete: DesktopNamespace?
@@ -27,15 +27,9 @@ struct ContentView: View {
     .task {
       await daemonController.startObserving()
       await authenticationController.startObserving()
+      try? sleepLockCoordinator.start()
       if controller.loadState == .loading {
         await controller.load()
-      }
-    }
-    .onReceive(
-      NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.willSleepNotification)
-    ) { _ in
-      Task {
-        try? await lockController.lockAll()
       }
     }
     .task(id: controller.catalog.selectedID) {
@@ -45,6 +39,7 @@ struct ContentView: View {
       await authenticationController.refresh(namespaceID)
     }
     .onDisappear {
+      sleepLockCoordinator.stop()
       Task {
         try? await authenticationController.cancelAll()
         try? await daemonController.stopAll()

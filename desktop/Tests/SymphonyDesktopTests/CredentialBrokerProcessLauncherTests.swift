@@ -1,6 +1,8 @@
+import Darwin
 import Foundation
 import XCTest
 
+@testable import SymphonyCredentialBrokerProtocol
 @testable import SymphonyDesktopInfrastructure
 
 final class CredentialBrokerProcessLauncherTests: XCTestCase {
@@ -52,7 +54,11 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
 
     try await session.lock()
 
-    XCTAssertEqual(try String(contentsOf: stoppedURL, encoding: .utf8), "lock")
+    let stoppedCommand = try JSONDecoder().decode(
+      CredentialBrokerCommand.self,
+      from: Data(contentsOf: stoppedURL)
+    )
+    XCTAssertEqual(stoppedCommand, .lock)
   }
 
   func testUnlockDenialIsReturnedWithoutCreatingASession() async throws {
@@ -94,6 +100,50 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
     }
   }
 
+  func testFailedForceKillRetainsRuntimeBlocksReplacementAndSupportsRetry() async throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let script = try executableScript(
+      in: directory,
+      contents: """
+        #!/bin/sh
+        printf '{"status":"unlocked"}\\n'
+        trap '' TERM
+        read command
+        exec /usr/bin/tail -f /dev/null
+        """
+    )
+    let forceKill = RetryingForceKill()
+    let namespaceID = UUID()
+    let launcher = CredentialBrokerProcessLauncher(
+      executableURL: script,
+      handshakeTimeout: 1,
+      stopTimeout: 0.05,
+      environment: ["PATH": "/usr/bin:/bin"],
+      forceKill: { processID in forceKill.call(processID) }
+    )
+    let session = try await launcher.unlock(namespaceID: namespaceID)
+
+    do {
+      try await session.lock()
+      XCTFail("Expected the first forced stop to fail")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("could not be stopped safely"))
+    }
+
+    do {
+      _ = try await launcher.unlock(namespaceID: namespaceID)
+      XCTFail("Expected retained runtime to block replacement")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("already owned"))
+    }
+
+    forceKill.allowTermination()
+    try await launcher.stop(namespaceID: namespaceID)
+    let replacement = try await launcher.unlock(namespaceID: namespaceID)
+    try await replacement.lock()
+  }
+
   private func temporaryDirectory() throws -> URL {
     let url = FileManager.default.temporaryDirectory
       .appendingPathComponent("CredentialBrokerProcessLauncherTests-\(UUID().uuidString)")
@@ -106,5 +156,20 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
     try Data(contents.utf8).write(to: url)
     try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
     return url
+  }
+}
+
+private final class RetryingForceKill: @unchecked Sendable {
+  private let lock = NSLock()
+  private var isAllowed = false
+
+  func allowTermination() {
+    lock.withLock { isAllowed = true }
+  }
+
+  func call(_ processID: Int32) -> Int32 {
+    lock.withLock {
+      isAllowed ? Darwin.kill(processID, SIGKILL) : -1
+    }
   }
 }

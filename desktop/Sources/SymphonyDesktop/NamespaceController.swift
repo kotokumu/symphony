@@ -15,24 +15,32 @@ final class NamespaceController: ObservableObject {
   @Published private(set) var isChanging = false
 
   private let repository: any NamespaceRepository
+  private let afterLoad: (NamespaceCatalog) async throws -> Void
   private let beforeDelete: (Namespace.ID) async throws -> Void
   private let afterDelete: (Namespace.ID, Bool) async -> Void
+  private let cleanupAfterDelete: (Namespace.ID, Bool) async -> String?
 
   init(
     repository: any NamespaceRepository,
+    afterLoad: @escaping (NamespaceCatalog) async throws -> Void = { _ in },
     beforeDelete: @escaping (Namespace.ID) async throws -> Void = { _ in },
-    afterDelete: @escaping (Namespace.ID, Bool) async -> Void = { _, _ in }
+    afterDelete: @escaping (Namespace.ID, Bool) async -> Void = { _, _ in },
+    cleanupAfterDelete: @escaping (Namespace.ID, Bool) async -> String? = { _, _ in nil }
   ) {
     self.repository = repository
+    self.afterLoad = afterLoad
     self.beforeDelete = beforeDelete
     self.afterDelete = afterDelete
+    self.cleanupAfterDelete = cleanupAfterDelete
   }
 
   func load() async {
     loadState = .loading
 
     do {
-      catalog = try await repository.load()
+      let loadedCatalog = try await repository.load()
+      try await afterLoad(loadedCatalog)
+      catalog = loadedCatalog
       loadState = .ready
     } catch {
       loadState = .failed(error.localizedDescription)
@@ -80,9 +88,11 @@ final class NamespaceController: ObservableObject {
       let outcome = try await repository.delete(namespace, saving: updatedCatalog)
       catalog = updatedCatalog
       await afterDelete(id, true)
-      return outcome
+      let credentialCleanupMessage = await cleanupAfterDelete(id, true)
+      return Self.combining(outcome, with: credentialCleanupMessage)
     } catch {
       await afterDelete(id, false)
+      _ = await cleanupAfterDelete(id, false)
       throw error
     }
   }
@@ -96,6 +106,21 @@ final class NamespaceController: ObservableObject {
 
   private func finishChange() {
     isChanging = false
+  }
+
+  private static func combining(
+    _ outcome: NamespaceDeletionOutcome,
+    with credentialCleanupMessage: String?
+  ) -> NamespaceDeletionOutcome {
+    guard let credentialCleanupMessage else {
+      return outcome
+    }
+    switch outcome {
+    case .complete:
+      return .cleanupPending(credentialCleanupMessage)
+    case .cleanupPending(let message):
+      return .cleanupPending("\(message) \(credentialCleanupMessage)")
+    }
   }
 }
 

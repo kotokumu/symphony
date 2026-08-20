@@ -12,6 +12,7 @@ struct SymphonyDesktopApp: App {
   @StateObject private var daemonController: NamespaceDaemonController
   @StateObject private var authenticationController: CodexAuthenticationController
   @StateObject private var lockController: NamespaceLockController
+  @StateObject private var sleepLockCoordinator: NamespaceSleepLockCoordinator
 
   init() {
     let command = SymphonyExecutableLocator().locate()
@@ -31,9 +32,19 @@ struct SymphonyDesktopApp: App {
       )
     )
     let namespaceLockController = NamespaceLockController(broker: credentialBroker)
+    let namespaceSleepLockCoordinator = NamespaceSleepLockCoordinator {
+      try await namespaceLockController.lockAll()
+    }
     _lockController = StateObject(wrappedValue: namespaceLockController)
+    _sleepLockCoordinator = StateObject(wrappedValue: namespaceSleepLockCoordinator)
     do {
       let repository = try FileNamespaceRepository()
+      let credentialCleanupCoordinator = NamespaceCredentialCleanupCoordinator(
+        store: try PendingCredentialCleanupStore(),
+        purge: { id in
+          try await namespaceLockController.removeNamespace(id)
+        }
+      )
       let codexAuthenticationController = CodexAuthenticationController(
         authenticator: authenticationManager,
         directoryURL: { id in
@@ -57,11 +68,17 @@ struct SymphonyDesktopApp: App {
       _controller = StateObject(
         wrappedValue: NamespaceController(
           repository: repository,
+          afterLoad: { catalog in
+            try await credentialCleanupCoordinator.reconcile(
+              existingNamespaceIDs: Set(catalog.namespaces.map(\.id))
+            )
+          },
           beforeDelete: { id in
             try await supervisor.stop(namespaceID: id)
             try await authenticationManager.quiesce(namespaceID: id)
             do {
-              try await namespaceLockController.removeNamespace(id)
+              try await namespaceLockController.lock(id)
+              try await credentialCleanupCoordinator.stageDeletion(id)
             } catch {
               await authenticationManager.resume(namespaceID: id)
               throw error
@@ -73,6 +90,9 @@ struct SymphonyDesktopApp: App {
             } else {
               await authenticationManager.resume(namespaceID: id)
             }
+          },
+          cleanupAfterDelete: { id, succeeded in
+            await credentialCleanupCoordinator.finishDeletion(id, committed: succeeded)
           }
         )
       )
@@ -126,7 +146,8 @@ struct SymphonyDesktopApp: App {
         controller: controller,
         daemonController: daemonController,
         authenticationController: authenticationController,
-        lockController: lockController
+        lockController: lockController,
+        sleepLockCoordinator: sleepLockCoordinator
       )
     }
     .defaultSize(width: 760, height: 520)

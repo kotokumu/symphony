@@ -15,10 +15,63 @@ public protocol NamespaceCredentialStoring: Sendable {
   func removeAll(namespaceID: UUID) throws
 }
 
+public protocol NamespaceKeychainAccessing: Sendable {
+  func makeAccessControl(
+    accessibility: CFTypeRef,
+    flags: SecAccessControlCreateFlags
+  ) throws -> SecAccessControl
+  func copyMatching(_ query: CFDictionary) -> (status: OSStatus, result: CFTypeRef?)
+  func add(_ attributes: CFDictionary) -> OSStatus
+  func delete(_ query: CFDictionary) -> OSStatus
+}
+
+public struct SystemNamespaceKeychainClient: NamespaceKeychainAccessing {
+  public init() {}
+
+  public func makeAccessControl(
+    accessibility: CFTypeRef,
+    flags: SecAccessControlCreateFlags
+  ) throws -> SecAccessControl {
+    var error: Unmanaged<CFError>?
+    guard
+      let accessControl = SecAccessControlCreateWithFlags(
+        nil,
+        accessibility,
+        flags,
+        &error
+      )
+    else {
+      throw NamespaceCredentialStorageError.accessControl(
+        error?.takeRetainedValue().localizedDescription
+          ?? "The access-control policy could not be created."
+      )
+    }
+    return accessControl
+  }
+
+  public func copyMatching(
+    _ query: CFDictionary
+  ) -> (status: OSStatus, result: CFTypeRef?) {
+    var result: CFTypeRef?
+    return (SecItemCopyMatching(query, &result), result)
+  }
+
+  public func add(_ attributes: CFDictionary) -> OSStatus {
+    SecItemAdd(attributes, nil)
+  }
+
+  public func delete(_ query: CFDictionary) -> OSStatus {
+    SecItemDelete(query)
+  }
+}
+
 public struct KeychainNamespaceCredentialStorage: NamespaceCredentialStoring {
   private static let service = "com.openai.symphony.namespace-credential"
+  private let keychain: any NamespaceKeychainAccessing
 
-  public init() {}
+  public init(keychain: any NamespaceKeychainAccessing = SystemNamespaceKeychainClient()) {
+    self.keychain = keychain
+  }
 
   public func load(
     namespaceID: UUID,
@@ -29,8 +82,7 @@ public struct KeychainNamespaceCredentialStorage: NamespaceCredentialStoring {
     query[kSecMatchLimit as String] = kSecMatchLimitOne
     query[kSecUseAuthenticationContext as String] = authorization.context
 
-    var result: CFTypeRef?
-    let status = SecItemCopyMatching(query as CFDictionary, &result)
+    let (status, result) = keychain.copyMatching(query as CFDictionary)
     switch status {
     case errSecSuccess:
       guard let data = result as? Data else {
@@ -49,34 +101,24 @@ public struct KeychainNamespaceCredentialStorage: NamespaceCredentialStoring {
     namespaceID: UUID,
     authorization: NamespaceUnlockAuthorization
   ) throws {
-    var accessControlError: Unmanaged<CFError>?
-    guard
-      let accessControl = SecAccessControlCreateWithFlags(
-        nil,
-        kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
-        .userPresence,
-        &accessControlError
-      )
-    else {
-      throw NamespaceCredentialStorageError.accessControl(
-        accessControlError?.takeRetainedValue().localizedDescription
-          ?? "The access-control policy could not be created."
-      )
-    }
+    let accessControl = try keychain.makeAccessControl(
+      accessibility: kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+      flags: .userPresence
+    )
 
     var query = baseQuery(namespaceID: namespaceID)
     query[kSecValueData as String] = credential
     query[kSecAttrAccessControl as String] = accessControl
     query[kSecUseAuthenticationContext as String] = authorization.context
 
-    let status = SecItemAdd(query as CFDictionary, nil)
+    let status = keychain.add(query as CFDictionary)
     guard status == errSecSuccess else {
       throw NamespaceCredentialStorageError.keychain(status)
     }
   }
 
   public func removeAll(namespaceID: UUID) throws {
-    let status = SecItemDelete(baseQuery(namespaceID: namespaceID) as CFDictionary)
+    let status = keychain.delete(baseQuery(namespaceID: namespaceID) as CFDictionary)
     guard status == errSecSuccess || status == errSecItemNotFound else {
       throw NamespaceCredentialStorageError.keychain(status)
     }
@@ -88,6 +130,7 @@ public struct KeychainNamespaceCredentialStorage: NamespaceCredentialStoring {
       kSecAttrService as String: Self.service,
       kSecAttrAccount as String: namespaceID.uuidString.lowercased(),
       kSecAttrSynchronizable as String: kCFBooleanFalse as Any,
+      kSecUseDataProtectionKeychain as String: kCFBooleanTrue as Any,
     ]
   }
 }

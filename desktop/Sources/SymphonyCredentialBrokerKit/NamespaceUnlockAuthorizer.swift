@@ -2,14 +2,55 @@ import Foundation
 import LocalAuthentication
 
 public final class NamespaceUnlockAuthorization: @unchecked Sendable {
-  let context: LAContext
+  private let authenticationContext: any NamespaceDeviceOwnerAuthenticationContext
+  var context: LAContext { authenticationContext.localAuthenticationContext }
 
   public init(context: LAContext = LAContext()) {
-    self.context = context
+    authenticationContext = SystemNamespaceDeviceOwnerAuthenticationContext(context: context)
+  }
+
+  init(authenticationContext: any NamespaceDeviceOwnerAuthenticationContext) {
+    self.authenticationContext = authenticationContext
   }
 
   public func invalidate() {
-    context.invalidate()
+    authenticationContext.invalidate()
+  }
+}
+
+public protocol NamespaceDeviceOwnerAuthenticationContext: Sendable {
+  var localAuthenticationContext: LAContext { get }
+  func canEvaluatePolicy(_ policy: LAPolicy, error: inout NSError?) -> Bool
+  func evaluatePolicy(_ policy: LAPolicy, localizedReason: String) async throws -> Bool
+  func invalidate()
+}
+
+public final class SystemNamespaceDeviceOwnerAuthenticationContext:
+  NamespaceDeviceOwnerAuthenticationContext,
+  @unchecked Sendable
+{
+  public let localAuthenticationContext: LAContext
+
+  public init(context: LAContext = LAContext()) {
+    localAuthenticationContext = context
+  }
+
+  public func canEvaluatePolicy(_ policy: LAPolicy, error: inout NSError?) -> Bool {
+    localAuthenticationContext.canEvaluatePolicy(policy, error: &error)
+  }
+
+  public func evaluatePolicy(
+    _ policy: LAPolicy,
+    localizedReason: String
+  ) async throws -> Bool {
+    try await localAuthenticationContext.evaluatePolicy(
+      policy,
+      localizedReason: localizedReason
+    )
+  }
+
+  public func invalidate() {
+    localAuthenticationContext.invalidate()
   }
 }
 
@@ -18,32 +59,40 @@ public protocol NamespaceUnlockAuthorizing: Sendable {
 }
 
 public struct LocalAuthenticationNamespaceUnlockAuthorizer: NamespaceUnlockAuthorizing {
-  public init() {}
+  public typealias ContextFactory = @Sendable () -> any NamespaceDeviceOwnerAuthenticationContext
+
+  private let contextFactory: ContextFactory
+
+  public init(
+    contextFactory: @escaping ContextFactory = {
+      SystemNamespaceDeviceOwnerAuthenticationContext()
+    }
+  ) {
+    self.contextFactory = contextFactory
+  }
 
   public func authorize(reason: String) async throws -> NamespaceUnlockAuthorization {
-    let authorization = NamespaceUnlockAuthorization()
+    let context = contextFactory()
+    let authorization = NamespaceUnlockAuthorization(authenticationContext: context)
     var evaluationError: NSError?
     guard
-      authorization.context.canEvaluatePolicy(
+      context.canEvaluatePolicy(
         .deviceOwnerAuthentication,
         error: &evaluationError
       )
     else {
+      authorization.invalidate()
       throw NamespaceUnlockAuthorizationError.unavailable(
         evaluationError?.localizedDescription ?? "Device owner authentication is unavailable."
       )
     }
 
+    let granted: Bool
     do {
-      let granted = try await authorization.context.evaluatePolicy(
+      granted = try await context.evaluatePolicy(
         .deviceOwnerAuthentication,
         localizedReason: reason
       )
-      guard granted else {
-        authorization.invalidate()
-        throw NamespaceUnlockAuthorizationError.denied
-      }
-      return authorization
     } catch {
       authorization.invalidate()
       if let localAuthenticationError = error as? LAError {
@@ -56,6 +105,11 @@ public struct LocalAuthenticationNamespaceUnlockAuthorizer: NamespaceUnlockAutho
       }
       throw error
     }
+    guard granted else {
+      authorization.invalidate()
+      throw NamespaceUnlockAuthorizationError.denied
+    }
+    return authorization
   }
 }
 

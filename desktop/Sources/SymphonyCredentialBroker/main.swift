@@ -11,6 +11,15 @@ struct SymphonyCredentialBrokerMain {
       Foundation.exit(64)
     }
 
+    do {
+      try ParentCodeSignatureBrokerClientAuthorizer().authorizeCaller()
+    } catch {
+      if arguments[0] == "serve" {
+        write(CredentialBrokerHandshake.failed(message: error.localizedDescription))
+      }
+      Foundation.exit(77)
+    }
+
     let session = NamespaceCredentialSession(namespaceID: namespaceID)
     switch arguments[0] {
     case "serve":
@@ -18,11 +27,10 @@ struct SymphonyCredentialBrokerMain {
         try await session.unlock(
           reason: "Unlock protected credentials for this Symphony namespace."
         )
-        write(.unlocked)
-        while let command = readLine(), command != "lock" {}
-        await session.lock()
+        write(CredentialBrokerHandshake.unlocked)
+        try await serve(session)
       } catch {
-        write(.failed(message: error.localizedDescription))
+        write(CredentialBrokerHandshake.failed(message: error.localizedDescription))
         Foundation.exit(1)
       }
     case "purge":
@@ -38,14 +46,66 @@ struct SymphonyCredentialBrokerMain {
     }
   }
 
-  private static func write(_ handshake: CredentialBrokerHandshake) {
+  private static func serve(_ session: NamespaceCredentialSession) async throws {
+    while let data = try BrokerStandardInput.readLine(maximumBytes: 65_536) {
+      do {
+        let command = try JSONDecoder().decode(CredentialBrokerCommand.self, from: data)
+        switch command.operation {
+        case .signChallenge:
+          guard let challenge = command.payload else {
+            throw BrokerCommandError.missingPayload
+          }
+          write(CredentialBrokerResult.signature(try await session.signChallenge(challenge)))
+        case .lock:
+          await session.lock()
+          write(CredentialBrokerResult.locked)
+          return
+        }
+      } catch {
+        write(CredentialBrokerResult.failed(message: error.localizedDescription))
+      }
+    }
+    await session.lock()
+  }
+
+  private static func write<Value: Encodable>(_ value: Value) {
     do {
-      var data = try JSONEncoder().encode(handshake)
+      var data = try JSONEncoder().encode(value)
       data.append(0x0A)
       FileHandle.standardOutput.write(data)
     } catch {
       FileHandle.standardError.write(Data("Broker response failed.\n".utf8))
       Foundation.exit(1)
+    }
+  }
+}
+
+private enum BrokerStandardInput {
+  static func readLine(maximumBytes: Int) throws -> Data? {
+    var line = Data()
+    while line.count <= maximumBytes {
+      guard let byte = try FileHandle.standardInput.read(upToCount: 1), !byte.isEmpty else {
+        return line.isEmpty ? nil : line
+      }
+      if byte[byte.startIndex] == 0x0A {
+        return line
+      }
+      line.append(byte)
+    }
+    throw BrokerCommandError.messageTooLarge
+  }
+}
+
+private enum BrokerCommandError: LocalizedError {
+  case missingPayload
+  case messageTooLarge
+
+  var errorDescription: String? {
+    switch self {
+    case .missingPayload:
+      "The credential capability request is missing its payload."
+    case .messageTooLarge:
+      "The credential capability request is too large."
     }
   }
 }

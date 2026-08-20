@@ -18,6 +18,7 @@ let package = Package(
       name: "SymphonyCredentialBrokerKit",
       dependencies: ["SymphonyCredentialBrokerProtocol"],
       linkerSettings: [
+        .linkedFramework("CryptoKit"),
         .linkedFramework("LocalAuthentication"),
         .linkedFramework("Security"),
       ]
@@ -32,7 +33,8 @@ let package = Package(
     ),
     .executableTarget(
       name: "SymphonyDesktop",
-      dependencies: ["SymphonyDesktopCore", "SymphonyDesktopInfrastructure"]
+      dependencies: ["SymphonyDesktopCore", "SymphonyDesktopInfrastructure"],
+      linkerSettings: [.linkedFramework("IOKit")]
     ),
     .testTarget(
       name: "SymphonyDesktopTests",

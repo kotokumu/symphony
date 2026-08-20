@@ -10,6 +10,7 @@ public actor NamespaceCredentialBroker {
   private let launcher: any CredentialBrokerSessionLaunching
   private var sessions: [Namespace.ID: any CredentialBrokerSessionHandle] = [:]
   private var pendingUnlocks: [Namespace.ID: PendingUnlock] = [:]
+  private var lockingNamespaces: Set<Namespace.ID> = []
   private var startSuspensionCount = 0
   private var applicationTerminationRequested = false
 
@@ -23,6 +24,7 @@ public actor NamespaceCredentialBroker {
     }
     guard
       pendingUnlocks[namespaceID] == nil,
+      !lockingNamespaces.contains(namespaceID),
       startSuspensionCount == 0,
       !applicationTerminationRequested
     else {
@@ -39,6 +41,7 @@ public actor NamespaceCredentialBroker {
       let session = try await task.value
       guard
         pendingUnlocks[namespaceID]?.generation == generation,
+        !lockingNamespaces.contains(namespaceID),
         startSuspensionCount == 0,
         !applicationTerminationRequested
       else {
@@ -48,25 +51,42 @@ public actor NamespaceCredentialBroker {
       pendingUnlocks.removeValue(forKey: namespaceID)
       sessions[namespaceID] = session
     } catch {
-      if pendingUnlocks[namespaceID]?.generation == generation {
-        pendingUnlocks.removeValue(forKey: namespaceID)
+      do {
+        try await launcher.stop(namespaceID: namespaceID)
+        if pendingUnlocks[namespaceID]?.generation == generation {
+          pendingUnlocks.removeValue(forKey: namespaceID)
+        }
+      } catch {
+        throw error
       }
       throw error
     }
   }
 
   public func lock(namespaceID: Namespace.ID) async throws {
-    if let pending = pendingUnlocks.removeValue(forKey: namespaceID) {
+    guard lockingNamespaces.insert(namespaceID).inserted else {
+      throw NamespaceCredentialBrokerError.lockInProgress
+    }
+    defer { lockingNamespaces.remove(namespaceID) }
+
+    if let pending = pendingUnlocks[namespaceID] {
       pending.task.cancel()
-      if let session = try? await pending.task.value {
-        try await session.lock()
-      }
+      _ = try? await pending.task.value
+      try await launcher.stop(namespaceID: namespaceID)
+      pendingUnlocks.removeValue(forKey: namespaceID)
     }
     guard let session = sessions[namespaceID] else {
       return
     }
     try await session.lock()
     sessions.removeValue(forKey: namespaceID)
+  }
+
+  public func signChallenge(_ challenge: Data, namespaceID: Namespace.ID) async throws -> Data {
+    guard let session = sessions[namespaceID] else {
+      throw NamespaceCredentialBrokerError.locked
+    }
+    return try await session.signChallenge(challenge)
   }
 
   public func lockAll() async throws {
@@ -100,7 +120,9 @@ public actor NamespaceCredentialBroker {
 
   private func lockAllOwnedSessions() async throws {
     var failures: [Namespace.ID: String] = [:]
-    let namespaceIDs = Set(sessions.keys).union(pendingUnlocks.keys)
+    let namespaceIDs = Set(sessions.keys)
+      .union(pendingUnlocks.keys)
+      .union(lockingNamespaces)
     for namespaceID in namespaceIDs {
       do {
         try await lock(namespaceID: namespaceID)
@@ -117,6 +139,8 @@ public actor NamespaceCredentialBroker {
 public enum NamespaceCredentialBrokerError: LocalizedError, Sendable {
   case unlockUnavailable
   case unlockInterrupted
+  case lockInProgress
+  case locked
   case lockAllFailed([Namespace.ID: String])
 
   public var errorDescription: String? {
@@ -125,6 +149,10 @@ public enum NamespaceCredentialBrokerError: LocalizedError, Sendable {
       "Namespace credentials cannot be unlocked while another security operation is running."
     case .unlockInterrupted:
       "Namespace unlock was interrupted because the credentials were locked."
+    case .lockInProgress:
+      "Namespace credentials are already being locked."
+    case .locked:
+      "Protected namespace credentials are locked."
     case .lockAllFailed(let failures):
       "Protected credentials could not be cleared for \(failures.count) namespace(s)."
     }

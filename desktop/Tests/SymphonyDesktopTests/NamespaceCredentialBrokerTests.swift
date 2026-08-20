@@ -78,6 +78,90 @@ final class NamespaceCredentialBrokerTests: XCTestCase {
       [.unlock(namespaceID), .lock(namespaceID), .purge(namespaceID)]
     )
   }
+
+  func testCapabilityResultIsScopedToAnUnlockedNamespace() async throws {
+    let namespaceID = UUID()
+    let otherNamespaceID = UUID()
+    let launcher = RecordingBrokerLauncher()
+    let broker = NamespaceCredentialBroker(launcher: launcher)
+    try await broker.unlock(namespaceID: namespaceID)
+
+    let result = try await broker.signChallenge(Data([1, 2]), namespaceID: namespaceID)
+
+    XCTAssertEqual(result, Data([2, 1]))
+    do {
+      _ = try await broker.signChallenge(Data([1]), namespaceID: otherNamespaceID)
+      XCTFail("Expected locked namespace rejection")
+    } catch {
+      XCTAssertEqual(error.localizedDescription, "Protected namespace credentials are locked.")
+    }
+  }
+
+  func testLockDuringPendingUnlockRejectsReplacementAndPreventsStalePublication() async throws {
+    let namespaceID = UUID()
+    let launcher = GatedBrokerLauncher()
+    let broker = NamespaceCredentialBroker(launcher: launcher)
+    let unlock = Task {
+      try await broker.unlock(namespaceID: namespaceID)
+    }
+    await launcher.waitUntilUnlockStarted()
+
+    let lock = Task {
+      try await broker.lock(namespaceID: namespaceID)
+    }
+    await Task.yield()
+
+    do {
+      try await broker.unlock(namespaceID: namespaceID)
+      XCTFail("Expected replacement unlock to be rejected")
+    } catch {
+      XCTAssertEqual(
+        error.localizedDescription,
+        "Namespace credentials cannot be unlocked while another security operation is running."
+      )
+    }
+
+    await launcher.completeUnlock()
+    try await lock.value
+    do {
+      try await unlock.value
+      XCTFail("Expected stale unlock to be interrupted")
+    } catch {}
+
+    let isUnlocked = await broker.isUnlocked(namespaceID)
+    let launcherOwnsSession = await launcher.ownsSession
+    XCTAssertFalse(isUnlocked)
+    XCTAssertFalse(launcherOwnsSession)
+  }
+
+  func testFailedPendingStopRetainsOwnershipUntilProductionRetrySucceeds() async throws {
+    let namespaceID = UUID()
+    let launcher = FailingPendingBrokerLauncher()
+    let broker = NamespaceCredentialBroker(launcher: launcher)
+
+    do {
+      try await broker.unlock(namespaceID: namespaceID)
+      XCTFail("Expected launch failure")
+    } catch {
+      XCTAssertEqual(error.localizedDescription, "Stop failed.")
+    }
+
+    do {
+      try await broker.unlock(namespaceID: namespaceID)
+      XCTFail("Expected retained ownership to block replacement")
+    } catch {
+      XCTAssertEqual(
+        error.localizedDescription,
+        "Namespace credentials cannot be unlocked while another security operation is running."
+      )
+    }
+
+    try await broker.lock(namespaceID: namespaceID)
+
+    let ownsSession = await launcher.ownsSession
+    XCTAssertFalse(ownsSession)
+    try await broker.unlock(namespaceID: namespaceID)
+  }
 }
 
 private actor RecordingBrokerLauncher: CredentialBrokerSessionLaunching {
@@ -97,6 +181,8 @@ private actor RecordingBrokerLauncher: CredentialBrokerSessionLaunching {
   func purge(namespaceID: UUID) async throws {
     operations.append(.purge(namespaceID))
   }
+
+  func stop(namespaceID: UUID) async throws {}
 
   func recordLock(_ namespaceID: UUID) {
     operations.append(.lock(namespaceID))
@@ -121,5 +207,104 @@ private actor RecordingBrokerSession: CredentialBrokerSessionHandle {
     guard !locked else { return }
     locked = true
     await launcher.recordLock(namespaceID)
+  }
+
+  func signChallenge(_ challenge: Data) async throws -> Data {
+    Data(challenge.reversed())
+  }
+}
+
+private actor GatedBrokerLauncher: CredentialBrokerSessionLaunching {
+  private var unlockStarted = false
+  private var unlockStartWaiters: [CheckedContinuation<Void, Never>] = []
+  private var unlockContinuation: CheckedContinuation<Void, Never>?
+  private(set) var ownsSession = false
+
+  func unlock(namespaceID: UUID) async throws -> any CredentialBrokerSessionHandle {
+    unlockStarted = true
+    unlockStartWaiters.forEach { $0.resume() }
+    unlockStartWaiters.removeAll()
+    await withCheckedContinuation { continuation in
+      unlockContinuation = continuation
+    }
+    ownsSession = true
+    return GatedBrokerSession(namespaceID: namespaceID, launcher: self)
+  }
+
+  func stop(namespaceID: UUID) {
+    ownsSession = false
+  }
+
+  func purge(namespaceID: UUID) {}
+
+  func waitUntilUnlockStarted() async {
+    if unlockStarted { return }
+    await withCheckedContinuation { continuation in
+      unlockStartWaiters.append(continuation)
+    }
+  }
+
+  func completeUnlock() {
+    unlockContinuation?.resume()
+    unlockContinuation = nil
+  }
+}
+
+private struct GatedBrokerSession: CredentialBrokerSessionHandle {
+  let namespaceID: UUID
+  let launcher: GatedBrokerLauncher
+
+  func lock() async throws {
+    await launcher.stop(namespaceID: namespaceID)
+  }
+
+  func signChallenge(_ challenge: Data) async throws -> Data { challenge }
+}
+
+private actor FailingPendingBrokerLauncher: CredentialBrokerSessionLaunching {
+  private var stopShouldFail = true
+  private var launchShouldFail = true
+  private(set) var ownsSession = false
+
+  func unlock(namespaceID: UUID) async throws -> any CredentialBrokerSessionHandle {
+    ownsSession = true
+    if launchShouldFail {
+      launchShouldFail = false
+      throw TestPendingBrokerError.handshakeFailed
+    }
+    return FailingPendingBrokerSession(namespaceID: namespaceID, launcher: self)
+  }
+
+  func stop(namespaceID: UUID) throws {
+    if stopShouldFail {
+      stopShouldFail = false
+      throw TestPendingBrokerError.stopFailed
+    }
+    ownsSession = false
+  }
+
+  func purge(namespaceID: UUID) {}
+}
+
+private struct FailingPendingBrokerSession: CredentialBrokerSessionHandle {
+  let namespaceID: UUID
+  let launcher: FailingPendingBrokerLauncher
+
+  func lock() async throws {
+    try await launcher.stop(namespaceID: namespaceID)
+  }
+
+  func signChallenge(_ challenge: Data) async throws -> Data { challenge }
+}
+
+private enum TestPendingBrokerError: LocalizedError {
+  case handshakeFailed
+  case stopFailed
+
+  var errorDescription: String? {
+    switch self {
+    case .handshakeFailed: "Handshake failed."
+    case .stopFailed: "Stop failed."
+    }
   }
 }
