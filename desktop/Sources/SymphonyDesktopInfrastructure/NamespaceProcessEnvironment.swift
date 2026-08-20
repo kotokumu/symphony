@@ -6,6 +6,9 @@ public enum NamespaceProcessEnvironment {
     "CODEX_ACCESS_TOKEN",
     "CODEX_API_KEY",
     "CODEX_HOME",
+    "GITHUB_APP_PRIVATE_KEY",
+    "GITHUB_TOKEN",
+    "GH_TOKEN",
   ]
 
   public static func sanitized(

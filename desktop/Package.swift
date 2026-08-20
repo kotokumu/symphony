@@ -8,13 +8,27 @@ let package = Package(
     .macOS(.v13)
   ],
   products: [
-    .executable(name: "SymphonyDesktop", targets: ["SymphonyDesktop"])
+    .executable(name: "SymphonyDesktop", targets: ["SymphonyDesktop"]),
+    .executable(name: "SymphonyCredentialBroker", targets: ["SymphonyCredentialBroker"]),
   ],
   targets: [
     .target(name: "SymphonyDesktopCore"),
+    .target(name: "SymphonyCredentialBrokerProtocol"),
+    .target(
+      name: "SymphonyCredentialBrokerKit",
+      dependencies: ["SymphonyCredentialBrokerProtocol"],
+      linkerSettings: [
+        .linkedFramework("LocalAuthentication"),
+        .linkedFramework("Security"),
+      ]
+    ),
+    .executableTarget(
+      name: "SymphonyCredentialBroker",
+      dependencies: ["SymphonyCredentialBrokerKit", "SymphonyCredentialBrokerProtocol"]
+    ),
     .target(
       name: "SymphonyDesktopInfrastructure",
-      dependencies: ["SymphonyDesktopCore"]
+      dependencies: ["SymphonyDesktopCore", "SymphonyCredentialBrokerProtocol"]
     ),
     .executableTarget(
       name: "SymphonyDesktop",
@@ -24,6 +38,8 @@ let package = Package(
       name: "SymphonyDesktopTests",
       dependencies: [
         "SymphonyDesktop",
+        "SymphonyCredentialBrokerKit",
+        "SymphonyCredentialBrokerProtocol",
         "SymphonyDesktopCore",
         "SymphonyDesktopInfrastructure",
       ]

@@ -15,4 +15,5 @@ test: check-xcode
 	swift test
 
 run: check-xcode
+	swift build --product SymphonyCredentialBroker
 	swift run SymphonyDesktop

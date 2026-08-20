@@ -49,6 +49,13 @@ Run `make -C desktop run`, then verify the following behavior:
 10. Sign in a second namespace, sign out the first, and confirm the second remains signed in.
 11. Quit and relaunch the application, select each namespace, and confirm its independent Codex
     authentication state is restored.
+12. Unlock a namespace and confirm macOS requests device owner authentication, using Touch ID when
+    available. Cancel the request and confirm the namespace remains locked with a retry action.
+13. Unlock two namespaces, lock one, and confirm the other remains unlocked.
+14. Unlock a namespace and stop its daemon, then confirm the namespace locks. Repeat by putting the
+    Mac to sleep and waking it.
+15. Unlock namespaces, quit the application, and confirm termination waits for their credential
+    brokers to stop.
 
 ## Namespace Codex Boundary
 
@@ -57,3 +64,17 @@ the namespace daemon's `codex app-server`. It creates this directory with owner-
 does not inherit API-key or access-token environment variables from the desktop process. Codex owns
 the credential file format and browser callback flow; Symphony does not parse or rewrite those
 credentials.
+
+## Native Credential Broker Boundary
+
+`SymphonyCredentialBroker` is a separate native helper process. The desktop application starts one
+helper session for each unlocked namespace and communicates through private standard-input and
+standard-output pipes. The process receives only a namespace identifier on its command line. The
+desktop application, namespace daemon, and Codex processes do not link the Keychain implementation
+or receive raw stored credential values.
+
+The helper uses LocalAuthentication for device owner approval and protects its namespace credential
+with a Keychain user-presence policy and `ThisDeviceOnly` accessibility. It retains decrypted
+material only in an explicitly cleared memory buffer while the namespace is unlocked. Locking ends
+the helper session; forced termination is bounded and treated as a lifecycle failure rather than
+silently abandoning a process that may still hold credential material.

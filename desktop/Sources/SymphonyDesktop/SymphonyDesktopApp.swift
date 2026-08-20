@@ -11,6 +11,7 @@ struct SymphonyDesktopApp: App {
   @StateObject private var controller: NamespaceController
   @StateObject private var daemonController: NamespaceDaemonController
   @StateObject private var authenticationController: CodexAuthenticationController
+  @StateObject private var lockController: NamespaceLockController
 
   init() {
     let command = SymphonyExecutableLocator().locate()
@@ -24,6 +25,13 @@ struct SymphonyDesktopApp: App {
     let authenticationManager = CodexAuthenticationManager(
       executor: CodexCLICommandExecutor(executableURL: codexExecutableURL)
     )
+    let credentialBroker = NamespaceCredentialBroker(
+      launcher: CredentialBrokerProcessLauncher(
+        executableURL: CredentialBrokerExecutableLocator().locate()
+      )
+    )
+    let namespaceLockController = NamespaceLockController(broker: credentialBroker)
+    _lockController = StateObject(wrappedValue: namespaceLockController)
     do {
       let repository = try FileNamespaceRepository()
       let codexAuthenticationController = CodexAuthenticationController(
@@ -37,6 +45,12 @@ struct SymphonyDesktopApp: App {
           supervisor: supervisor,
           directoryURL: { id in
             repository.directoryURL(for: id)
+          },
+          afterStop: { id in
+            try await namespaceLockController.lock(id)
+          },
+          afterStopAll: {
+            try await namespaceLockController.lockAll()
           }
         )
       )
@@ -46,6 +60,12 @@ struct SymphonyDesktopApp: App {
           beforeDelete: { id in
             try await supervisor.stop(namespaceID: id)
             try await authenticationManager.quiesce(namespaceID: id)
+            do {
+              try await namespaceLockController.removeNamespace(id)
+            } catch {
+              await authenticationManager.resume(namespaceID: id)
+              throw error
+            }
           },
           afterDelete: { id, succeeded in
             if succeeded {
@@ -72,6 +92,12 @@ struct SymphonyDesktopApp: App {
           supervisor: supervisor,
           directoryURL: { id in
             FileManager.default.temporaryDirectory.appendingPathComponent(id.uuidString)
+          },
+          afterStop: { id in
+            try await namespaceLockController.lock(id)
+          },
+          afterStopAll: {
+            try await namespaceLockController.lockAll()
           }
         )
       )
@@ -82,11 +108,13 @@ struct SymphonyDesktopApp: App {
     }
 
     applicationDelegate.configure {
-      try await authenticationManager.shutdownForApplicationTermination()
       do {
+        try await namespaceLockController.shutdownForApplicationTermination()
+        try await authenticationManager.shutdownForApplicationTermination()
         try await supervisor.shutdownForApplicationTermination()
       } catch {
         await authenticationManager.resumeAfterApplicationTerminationFailure()
+        await namespaceLockController.resumeAfterApplicationTerminationFailure()
         throw error
       }
     }
@@ -97,7 +125,8 @@ struct SymphonyDesktopApp: App {
       ContentView(
         controller: controller,
         daemonController: daemonController,
-        authenticationController: authenticationController
+        authenticationController: authenticationController,
+        lockController: lockController
       )
     }
     .defaultSize(width: 760, height: 520)
@@ -106,6 +135,7 @@ struct SymphonyDesktopApp: App {
 
 extension NamespaceDaemonSupervisor: NamespaceDaemonSupervising {}
 extension CodexAuthenticationManager: CodexAuthenticating {}
+extension NamespaceCredentialBroker: NamespaceCredentialBrokering {}
 
 private actor UnavailableNamespaceRepository: NamespaceRepository {
   let message: String
