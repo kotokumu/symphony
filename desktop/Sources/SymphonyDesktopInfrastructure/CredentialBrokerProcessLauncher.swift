@@ -34,7 +34,7 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
   private let forceKill: ForceKill
   private var runtimes: [Namespace.ID: Runtime] = [:]
   private var commandOwners: Set<Namespace.ID> = []
-  private var commandWaiters: [Namespace.ID: [CheckedContinuation<Void, Never>]] = [:]
+  private var stopTasks: [Namespace.ID: Task<Void, Error>] = [:]
 
   public init(
     executableURL: URL?,
@@ -65,6 +65,7 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
     process.standardInput = input
     process.standardOutput = output
     process.standardError = errorOutput
+    _ = Darwin.fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
 
     do {
       try process.run()
@@ -127,7 +128,7 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
     guard challenge.count <= 32_768 else {
       throw CredentialBrokerProcessError.requestTooLarge
     }
-    await acquireCommand(for: namespaceID)
+    try await acquireCommand(for: namespaceID)
     defer { releaseCommand(for: namespaceID) }
     guard let runtime = runtimes[namespaceID], runtime.generation == generation else {
       throw CredentialBrokerProcessError.sessionNotRunning
@@ -157,14 +158,12 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
         throw CredentialBrokerProcessError.handshakeFailed
       }
     } catch {
-      do {
-        try await stopOwnedRuntime(
-          namespaceID: namespaceID,
-          generation: generation,
-          runtime: runtime
-        )
-      } catch {
-        throw error
+      if stopTasks[namespaceID] == nil {
+        do {
+          try await stop(namespaceID: namespaceID, generation: generation)
+        } catch {
+          throw error
+        }
       }
       throw error
     }
@@ -219,29 +218,30 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
   }
 
   fileprivate func stop(namespaceID: Namespace.ID, generation: UUID) async throws {
-    await acquireCommand(for: namespaceID)
-    defer { releaseCommand(for: namespaceID) }
+    if let stopTask = stopTasks[namespaceID] {
+      try await stopTask.value
+      return
+    }
     guard let runtime = runtimes[namespaceID], runtime.generation == generation else {
       return
     }
-    try await stopOwnedRuntime(
-      namespaceID: namespaceID,
-      generation: generation,
-      runtime: runtime
-    )
-  }
-
-  private func stopOwnedRuntime(
-    namespaceID: Namespace.ID,
-    generation: UUID,
-    runtime: Runtime
-  ) async throws {
-    try await Self.stopProcess(
-      runtime.process,
-      input: runtime.input,
-      timeout: stopTimeout,
-      forceKill: forceKill
-    )
+    runtime.output?.closeFile()
+    let stopTask = Task {
+      try await Self.stopProcess(
+        runtime.process,
+        input: runtime.input,
+        timeout: stopTimeout,
+        forceKill: forceKill
+      )
+    }
+    stopTasks[namespaceID] = stopTask
+    do {
+      try await stopTask.value
+    } catch {
+      stopTasks.removeValue(forKey: namespaceID)
+      throw error
+    }
+    stopTasks.removeValue(forKey: namespaceID)
     guard runtimes[namespaceID]?.generation == generation else {
       return
     }
@@ -250,29 +250,17 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
     runtime.errorOutput?.closeFile()
   }
 
-  private func acquireCommand(for namespaceID: Namespace.ID) async {
-    guard commandOwners.contains(namespaceID) else {
-      commandOwners.insert(namespaceID)
-      return
+  private func acquireCommand(for namespaceID: Namespace.ID) async throws {
+    while commandOwners.contains(namespaceID) {
+      try Task.checkCancellation()
+      try await Task.sleep(for: .milliseconds(10))
     }
-    await withCheckedContinuation { continuation in
-      commandWaiters[namespaceID, default: []].append(continuation)
-    }
+    try Task.checkCancellation()
+    commandOwners.insert(namespaceID)
   }
 
   private func releaseCommand(for namespaceID: Namespace.ID) {
-    guard var waiters = commandWaiters[namespaceID], !waiters.isEmpty else {
-      commandOwners.remove(namespaceID)
-      commandWaiters.removeValue(forKey: namespaceID)
-      return
-    }
-    let next = waiters.removeFirst()
-    if waiters.isEmpty {
-      commandWaiters.removeValue(forKey: namespaceID)
-    } else {
-      commandWaiters[namespaceID] = waiters
-    }
-    next.resume()
+    commandOwners.remove(namespaceID)
   }
 
   private static func stopProcess(

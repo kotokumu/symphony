@@ -23,14 +23,17 @@ Run these commands from the repository root:
 ```sh
 make -C desktop build
 make -C desktop test
-make -C desktop run
+SYMPHONY_CODE_SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" make -C desktop run
 ```
 
 `make -C desktop all` runs the build and test checks used by continuous integration.
 
 ## Launch Check
 
-Run `make -C desktop run`, then verify the following behavior:
+Set `SYMPHONY_CODE_SIGN_IDENTITY` to an Apple Development code-signing identity and run
+`make -C desktop run`. The command assembles a signed development `Symphony.app`, nests and signs
+the credential broker, verifies the sealed bundle, and launches that application. Then verify the
+following behavior:
 
 1. The window titled `Symphony` displays the empty state and a `Create Namespace` button.
 2. Create two namespaces and switch between them in the sidebar.

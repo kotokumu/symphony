@@ -99,7 +99,15 @@ public struct SystemBrokerParentProcessInspector: BrokerParentProcessInspecting 
 }
 
 public struct SystemBrokerCodeSignatureChecker: BrokerCodeSignatureChecking {
-  public init() {}
+  private let security: any BrokerSecurityValidating
+
+  public init() {
+    security = SystemBrokerSecurityValidator()
+  }
+
+  init(security: any BrokerSecurityValidating) {
+    self.security = security
+  }
 
   public func process(
     _ processID: pid_t,
@@ -108,40 +116,84 @@ public struct SystemBrokerCodeSignatureChecker: BrokerCodeSignatureChecking {
     helperExecutableURL: URL,
     containingAppURL: URL
   ) throws -> Bool {
-    let helperCode = try staticCode(at: helperExecutableURL)
-    let signingInformation = try signingInformation(for: helperCode)
-    guard
-      let teamIdentifier = signingInformation[kSecCodeInfoTeamIdentifier as String] as? String,
-      !teamIdentifier.isEmpty
-    else {
+    let teamIdentifier = try security.signingTeamIdentifier(at: helperExecutableURL)
+    guard !teamIdentifier.isEmpty else {
       throw BrokerClientAuthorizationError.signatureUnavailable
     }
-
-    let requirement = try requirement(
+    let requirementSource = Self.desktopRequirementSource(
       desktopIdentifier: desktopIdentifier,
       teamIdentifier: teamIdentifier
     )
-    let appCode = try staticCode(at: containingAppURL)
-    let allArchitectures = SecCSFlags(rawValue: UInt32(kSecCSCheckAllArchitectures))
-    guard SecStaticCodeCheckValidity(appCode, allArchitectures, nil) == errSecSuccess else {
+    guard try security.staticCodeIsValid(at: containingAppURL, requirementSource: nil) else {
       return false
     }
-    let desktopCode = try staticCode(at: desktopExecutableURL)
-    guard SecStaticCodeCheckValidity(desktopCode, allArchitectures, requirement) == errSecSuccess
+    guard
+      try security.staticCodeIsValid(
+        at: desktopExecutableURL,
+        requirementSource: requirementSource
+      )
     else {
       return false
     }
+    return try security.processIsValid(processID, requirementSource: requirementSource)
+  }
 
-    var parentCode: SecCode?
-    let attributes = [kSecGuestAttributePid as String: NSNumber(value: processID)]
+  static func desktopRequirementSource(
+    desktopIdentifier: String,
+    teamIdentifier: String
+  ) -> String {
+    let escapedIdentifier = desktopIdentifier.replacingOccurrences(of: "\"", with: "\\\"")
+    let escapedTeam = teamIdentifier.replacingOccurrences(of: "\"", with: "\\\"")
+    return
+      "anchor apple generic and identifier \"\(escapedIdentifier)\" and certificate leaf[subject.OU] = \"\(escapedTeam)\""
+  }
+}
+
+protocol BrokerSecurityValidating: Sendable {
+  func signingTeamIdentifier(at helperExecutableURL: URL) throws -> String
+  func staticCodeIsValid(at url: URL, requirementSource: String?) throws -> Bool
+  func processIsValid(_ processID: pid_t, requirementSource: String) throws -> Bool
+}
+
+private struct SystemBrokerSecurityValidator: BrokerSecurityValidating {
+  func signingTeamIdentifier(at helperExecutableURL: URL) throws -> String {
+    let code = try staticCode(at: helperExecutableURL)
+    var information: CFDictionary?
+    let signingInformation = SecCSFlags(rawValue: UInt32(kSecCSSigningInformation))
     guard
-      SecCodeCopyGuestWithAttributes(nil, attributes as CFDictionary, [], &parentCode)
-        == errSecSuccess,
-      let parentCode
+      SecCodeCopySigningInformation(code, signingInformation, &information) == errSecSuccess,
+      let dictionary = information as? [String: Any],
+      let teamIdentifier = dictionary[kSecCodeInfoTeamIdentifier as String] as? String
     else {
       throw BrokerClientAuthorizationError.signatureUnavailable
     }
-    return SecCodeCheckValidity(parentCode, [], requirement) == errSecSuccess
+    return teamIdentifier
+  }
+
+  func staticCodeIsValid(at url: URL, requirementSource: String?) throws -> Bool {
+    let code = try staticCode(at: url)
+    let codeRequirement: SecRequirement?
+    if let requirementSource {
+      codeRequirement = try requirement(from: requirementSource)
+    } else {
+      codeRequirement = nil
+    }
+    let allArchitectures = SecCSFlags(rawValue: UInt32(kSecCSCheckAllArchitectures))
+    return SecStaticCodeCheckValidity(code, allArchitectures, codeRequirement) == errSecSuccess
+  }
+
+  func processIsValid(_ processID: pid_t, requirementSource: String) throws -> Bool {
+    let requirement = try requirement(from: requirementSource)
+    var processCode: SecCode?
+    let attributes = [kSecGuestAttributePid as String: NSNumber(value: processID)]
+    guard
+      SecCodeCopyGuestWithAttributes(nil, attributes as CFDictionary, [], &processCode)
+        == errSecSuccess,
+      let processCode
+    else {
+      throw BrokerClientAuthorizationError.signatureUnavailable
+    }
+    return SecCodeCheckValidity(processCode, [], requirement) == errSecSuccess
   }
 
   private func staticCode(at url: URL) throws -> SecStaticCode {
@@ -155,25 +207,7 @@ public struct SystemBrokerCodeSignatureChecker: BrokerCodeSignatureChecking {
     return code
   }
 
-  private func signingInformation(for code: SecStaticCode) throws -> [String: Any] {
-    var information: CFDictionary?
-    guard
-      SecCodeCopySigningInformation(code, [], &information) == errSecSuccess,
-      let information
-    else {
-      throw BrokerClientAuthorizationError.signatureUnavailable
-    }
-    return information as? [String: Any] ?? [:]
-  }
-
-  private func requirement(
-    desktopIdentifier: String,
-    teamIdentifier: String
-  ) throws -> SecRequirement {
-    let escapedIdentifier = desktopIdentifier.replacingOccurrences(of: "\"", with: "\\\"")
-    let escapedTeam = teamIdentifier.replacingOccurrences(of: "\"", with: "\\\"")
-    let source =
-      "anchor apple generic and identifier \"\(escapedIdentifier)\" and certificate leaf[subject.OU] = \"\(escapedTeam)\""
+  private func requirement(from source: String) throws -> SecRequirement {
     var requirement: SecRequirement?
     guard
       SecRequirementCreateWithString(source as CFString, [], &requirement) == errSecSuccess,

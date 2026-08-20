@@ -28,7 +28,10 @@ final class BrokerClientAuthorizerTests: XCTestCase {
           desktopIdentifier: ParentCodeSignatureBrokerClientAuthorizer.desktopSigningIdentifier,
           desktopExecutableURL: desktop,
           helperExecutableURL: helper,
-          containingAppURL: URL(fileURLWithPath: "/Applications/Symphony.app")
+          containingAppURL: URL(
+            fileURLWithPath: "/Applications/Symphony.app",
+            isDirectory: true
+          )
         )
       ]
     )
@@ -86,6 +89,59 @@ final class BrokerClientAuthorizerTests: XCTestCase {
     XCTAssertThrowsError(try authorizer.authorizeCaller())
     XCTAssertTrue(signatureChecker.checks.isEmpty)
   }
+
+  func testSystemCheckerBuildsPinnedRequirementAndValidatesEveryCodeBoundary() throws {
+    let helper = URL(fileURLWithPath: "/Applications/Symphony.app/Contents/Helpers/SymphonyCredentialBroker")
+    let desktop = URL(fileURLWithPath: "/Applications/Symphony.app/Contents/MacOS/SymphonyDesktop")
+    let application = URL(fileURLWithPath: "/Applications/Symphony.app")
+    let security = RecordingBrokerSecurityValidator(
+      teamIdentifier: "TEAM123456",
+      staticResults: [true, true],
+      processResult: true
+    )
+    let checker = SystemBrokerCodeSignatureChecker(security: security)
+
+    let result = try checker.process(
+      42,
+      satisfiesDesktopIdentifier: "com.kotokumu.symphony.desktop",
+      desktopExecutableURL: desktop,
+      helperExecutableURL: helper,
+      containingAppURL: application
+    )
+
+    let requirement =
+      "anchor apple generic and identifier \"com.kotokumu.symphony.desktop\" and certificate leaf[subject.OU] = \"TEAM123456\""
+    XCTAssertTrue(result)
+    XCTAssertEqual(
+      security.operations,
+      [
+        .team(helper),
+        .staticCode(application, requirement: nil),
+        .staticCode(desktop, requirement: requirement),
+        .process(42, requirement: requirement),
+      ]
+    )
+  }
+
+  func testSystemCheckerStopsBeforeParentValidationWhenAppSealIsInvalid() throws {
+    let security = RecordingBrokerSecurityValidator(
+      teamIdentifier: "TEAM123456",
+      staticResults: [false],
+      processResult: true
+    )
+    let checker = SystemBrokerCodeSignatureChecker(security: security)
+
+    let result = try checker.process(
+      42,
+      satisfiesDesktopIdentifier: "com.kotokumu.symphony.desktop",
+      desktopExecutableURL: URL(fileURLWithPath: "/app/desktop"),
+      helperExecutableURL: URL(fileURLWithPath: "/app/helper"),
+      containingAppURL: URL(fileURLWithPath: "/app")
+    )
+
+    XCTAssertFalse(result)
+    XCTAssertEqual(security.operations.count, 2)
+  }
 }
 
 private struct StubBrokerParentProcessInspector: BrokerParentProcessInspecting {
@@ -131,5 +187,41 @@ private final class RecordingBrokerCodeSignatureChecker: BrokerCodeSignatureChec
       )
     )
     return result
+  }
+}
+
+private final class RecordingBrokerSecurityValidator: BrokerSecurityValidating,
+  @unchecked Sendable
+{
+  enum Operation: Equatable {
+    case team(URL)
+    case staticCode(URL, requirement: String?)
+    case process(pid_t, requirement: String)
+  }
+
+  private let teamIdentifier: String
+  private var staticResults: [Bool]
+  private let processResult: Bool
+  private(set) var operations: [Operation] = []
+
+  init(teamIdentifier: String, staticResults: [Bool], processResult: Bool) {
+    self.teamIdentifier = teamIdentifier
+    self.staticResults = staticResults
+    self.processResult = processResult
+  }
+
+  func signingTeamIdentifier(at helperExecutableURL: URL) -> String {
+    operations.append(.team(helperExecutableURL))
+    return teamIdentifier
+  }
+
+  func staticCodeIsValid(at url: URL, requirementSource: String?) -> Bool {
+    operations.append(.staticCode(url, requirement: requirementSource))
+    return staticResults.removeFirst()
+  }
+
+  func processIsValid(_ processID: pid_t, requirementSource: String) -> Bool {
+    operations.append(.process(processID, requirement: requirementSource))
+    return processResult
   }
 }

@@ -147,19 +147,27 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
   func testConcurrentCapabilitiesKeepEachResponseBoundToItsRequest() async throws {
     let directory = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
+    let firstReceivedURL = directory.appendingPathComponent("first-received")
+    let secondReceivedURL = directory.appendingPathComponent("second-received")
+    let releaseFirstURL = directory.appendingPathComponent("release-first")
+    let releaseSecondURL = directory.appendingPathComponent("release-second")
     let script = try executableScript(
       in: directory,
       contents: """
         #!/bin/sh
         printf '{"status":"unlocked"}\\n'
-        while IFS= read -r command; do
-          case "$command" in
-            *'"operation":"lock"'*) exit 0 ;;
-            *'AQ=='*) sleep 0.1; printf '{"status":"signature","payload":"AQ=="}\\n' ;;
-            *'Ag=='*) printf '{"status":"signature","payload":"Ag=="}\\n' ;;
-            *) exit 2 ;;
-          esac
-        done
+        IFS= read -r first
+        printf '%s' "$first" > "$BROKER_FIRST_RECEIVED_FILE"
+        (
+          IFS= read -r second
+          printf '%s' "$second" > "$BROKER_SECOND_RECEIVED_FILE"
+          while [ ! -e "$BROKER_RELEASE_SECOND_FILE" ]; do sleep 0.01; done
+          printf '{"status":"signature","payload":"Ag=="}\\n'
+        ) &
+        while [ ! -e "$BROKER_RELEASE_FIRST_FILE" ]; do sleep 0.01; done
+        printf '{"status":"signature","payload":"AQ=="}\\n'
+        wait
+        IFS= read -r lock_command
         """
     )
     let namespaceID = UUID()
@@ -167,20 +175,33 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
       executableURL: script,
       handshakeTimeout: 1,
       stopTimeout: 1,
-      environment: ["PATH": "/usr/bin:/bin"]
+      environment: [
+        "PATH": "/usr/bin:/bin",
+        "BROKER_FIRST_RECEIVED_FILE": firstReceivedURL.path,
+        "BROKER_SECOND_RECEIVED_FILE": secondReceivedURL.path,
+        "BROKER_RELEASE_FIRST_FILE": releaseFirstURL.path,
+        "BROKER_RELEASE_SECOND_FILE": releaseSecondURL.path,
+      ]
     )
     let session = try await launcher.unlock(namespaceID: namespaceID)
 
-    async let first = session.signChallenge(Data([1]))
-    async let second = session.signChallenge(Data([2]))
-    let results = try await (first, second)
+    let first = Task { try await session.signChallenge(Data([1])) }
+    await eventually { FileManager.default.fileExists(atPath: firstReceivedURL.path) }
+    let second = Task { try await session.signChallenge(Data([2])) }
+    try await Task.sleep(for: .milliseconds(40))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: secondReceivedURL.path))
 
-    XCTAssertEqual(results.0, Data([1]))
-    XCTAssertEqual(results.1, Data([2]))
+    try Data().write(to: releaseFirstURL)
+    let firstResult = try await first.value
+    XCTAssertEqual(firstResult, Data([1]))
+    await eventually { FileManager.default.fileExists(atPath: secondReceivedURL.path) }
+    try Data().write(to: releaseSecondURL)
+    let secondResult = try await second.value
+    XCTAssertEqual(secondResult, Data([2]))
     try await session.lock()
   }
 
-  func testLockWaitsForInFlightCapabilityBeforeCompleting() async throws {
+  func testLockPreemptsANeverRespondingCapabilityWithinStopDeadline() async throws {
     let directory = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
     let requestStartedURL = directory.appendingPathComponent("request-started")
@@ -189,23 +210,16 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
       contents: """
         #!/bin/sh
         printf '{"status":"unlocked"}\\n'
-        while IFS= read -r command; do
-          case "$command" in
-            *'"operation":"lock"'*) exit 0 ;;
-            *)
-              : > "$BROKER_REQUEST_STARTED_FILE"
-              sleep 0.15
-              printf '{"status":"signature","payload":"AQ=="}\\n'
-              ;;
-          esac
-        done
+        IFS= read -r command
+        : > "$BROKER_REQUEST_STARTED_FILE"
+        exec /usr/bin/tail -f /dev/null
         """
     )
     let namespaceID = UUID()
     let launcher = CredentialBrokerProcessLauncher(
       executableURL: script,
-      handshakeTimeout: 1,
-      stopTimeout: 1,
+      handshakeTimeout: 60,
+      stopTimeout: 0.1,
       environment: [
         "PATH": "/usr/bin:/bin",
         "BROKER_REQUEST_STARTED_FILE": requestStartedURL.path,
@@ -216,20 +230,65 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
       try await session.signChallenge(Data([1]))
     }
     await eventually { FileManager.default.fileExists(atPath: requestStartedURL.path) }
-    let lockFinished = LockedFlag()
-    let lock = Task {
-      try await session.lock()
-      await lockFinished.mark()
-    }
-    try await Task.sleep(for: .milliseconds(30))
-    let finishedEarly = await lockFinished.value
-    XCTAssertFalse(finishedEarly)
+    let clock = ContinuousClock()
+    let started = clock.now
+    try await session.lock()
+    let elapsed = started.duration(to: clock.now)
 
-    let capabilityResult = try await capability.value
-    XCTAssertEqual(capabilityResult, Data([1]))
-    try await lock.value
-    let finished = await lockFinished.value
-    XCTAssertTrue(finished)
+    XCTAssertLessThan(elapsed, .seconds(1))
+    do {
+      _ = try await capability.value
+      XCTFail("Expected the interrupted capability to fail")
+    } catch {}
+  }
+
+  func testCancelledQueuedCapabilityIsNeverSentBeforeLock() async throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let firstReceivedURL = directory.appendingPathComponent("first-received")
+    let secondReceivedURL = directory.appendingPathComponent("second-received")
+    let script = try executableScript(
+      in: directory,
+      contents: """
+        #!/bin/sh
+        printf '{"status":"unlocked"}\\n'
+        IFS= read -r first
+        : > "$BROKER_FIRST_RECEIVED_FILE"
+        (
+          IFS= read -r second
+          case "$second" in
+            *'Ag=='*) : > "$BROKER_SECOND_RECEIVED_FILE" ;;
+          esac
+        ) &
+        exec /usr/bin/tail -f /dev/null
+        """
+    )
+    let namespaceID = UUID()
+    let launcher = CredentialBrokerProcessLauncher(
+      executableURL: script,
+      handshakeTimeout: 60,
+      stopTimeout: 0.1,
+      environment: [
+        "PATH": "/usr/bin:/bin",
+        "BROKER_FIRST_RECEIVED_FILE": firstReceivedURL.path,
+        "BROKER_SECOND_RECEIVED_FILE": secondReceivedURL.path,
+      ]
+    )
+    let session = try await launcher.unlock(namespaceID: namespaceID)
+    let first = Task { try await session.signChallenge(Data([1])) }
+    await eventually { FileManager.default.fileExists(atPath: firstReceivedURL.path) }
+    let second = Task { try await session.signChallenge(Data([2])) }
+    try await Task.sleep(for: .milliseconds(30))
+    second.cancel()
+
+    try await session.lock()
+
+    do {
+      _ = try await second.value
+      XCTFail("Expected queued capability cancellation")
+    } catch is CancellationError {}
+    XCTAssertFalse(FileManager.default.fileExists(atPath: secondReceivedURL.path))
+    first.cancel()
   }
 
   private func temporaryDirectory() throws -> URL {
@@ -272,13 +331,5 @@ private final class RetryingForceKill: @unchecked Sendable {
     lock.withLock {
       isAllowed ? Darwin.kill(processID, SIGKILL) : -1
     }
-  }
-}
-
-private actor LockedFlag {
-  private(set) var value = false
-
-  func mark() {
-    value = true
   }
 }

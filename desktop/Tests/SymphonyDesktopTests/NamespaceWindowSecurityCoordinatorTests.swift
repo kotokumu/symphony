@@ -47,6 +47,33 @@ final class NamespaceWindowSecurityCoordinatorTests: XCTestCase {
     await coordinator.waitForCurrentOperation()
     XCTAssertEqual(coordinator.state, .idle)
   }
+
+  func testTerminationWaitsForWindowCleanupBeforeStartingItsShutdown() async {
+    let gate = WindowSecurityGate()
+    let shutdownStarted = SecurityOperationRecorder()
+    let coordinator = NamespaceWindowSecurityCoordinator(
+      lockCredentials: {
+        await gate.wait()
+      },
+      cancelAuthentication: {},
+      stopDaemons: {}
+    )
+    coordinator.secureAfterWindowCloses()
+    await gate.waitUntilEntered()
+
+    let termination = Task { @MainActor in
+      await coordinator.waitForCurrentOperation()
+      await shutdownStarted.record("shutdown")
+    }
+    try? await Task.sleep(for: .milliseconds(20))
+    let beforeRelease = await shutdownStarted.values
+    XCTAssertTrue(beforeRelease.isEmpty)
+
+    await gate.open()
+    await termination.value
+    let afterRelease = await shutdownStarted.values
+    XCTAssertEqual(afterRelease, ["shutdown"])
+  }
 }
 
 private actor SecurityOperationRecorder {
@@ -73,5 +100,35 @@ private enum WindowSecurityTestError: LocalizedError {
 
   var errorDescription: String? {
     "Window cleanup failed."
+  }
+}
+
+private actor WindowSecurityGate {
+  private var entered = false
+  private var isOpen = false
+  private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+  private var openWaiters: [CheckedContinuation<Void, Never>] = []
+
+  func wait() async {
+    entered = true
+    entryWaiters.forEach { $0.resume() }
+    entryWaiters.removeAll()
+    if isOpen { return }
+    await withCheckedContinuation { continuation in
+      openWaiters.append(continuation)
+    }
+  }
+
+  func waitUntilEntered() async {
+    if entered { return }
+    await withCheckedContinuation { continuation in
+      entryWaiters.append(continuation)
+    }
+  }
+
+  func open() {
+    isOpen = true
+    openWaiters.forEach { $0.resume() }
+    openWaiters.removeAll()
   }
 }

@@ -41,6 +41,7 @@ struct SymphonyDesktopApp: App {
     }
     _lockController = StateObject(wrappedValue: namespaceLockController)
     _sleepLockCoordinator = StateObject(wrappedValue: namespaceSleepLockCoordinator)
+    let namespaceWindowSecurityCoordinator: NamespaceWindowSecurityCoordinator
     do {
       let repository = try FileNamespaceRepository()
       let credentialCleanupCoordinator = NamespaceCredentialCleanupCoordinator(
@@ -102,18 +103,19 @@ struct SymphonyDesktopApp: App {
       _authenticationController = StateObject(
         wrappedValue: codexAuthenticationController
       )
+      namespaceWindowSecurityCoordinator = NamespaceWindowSecurityCoordinator(
+        lockCredentials: {
+          try await namespaceLockController.lockAll()
+        },
+        cancelAuthentication: {
+          try await codexAuthenticationController.cancelAll()
+        },
+        stopDaemons: {
+          try await namespaceDaemonController.stopAll()
+        }
+      )
       _windowSecurityCoordinator = StateObject(
-        wrappedValue: NamespaceWindowSecurityCoordinator(
-          lockCredentials: {
-            try await namespaceLockController.lockAll()
-          },
-          cancelAuthentication: {
-            try await codexAuthenticationController.cancelAll()
-          },
-          stopDaemons: {
-            try await namespaceDaemonController.stopAll()
-          }
-        )
+        wrappedValue: namespaceWindowSecurityCoordinator
       )
     } catch {
       let repository = UnavailableNamespaceRepository(message: error.localizedDescription)
@@ -140,18 +142,19 @@ struct SymphonyDesktopApp: App {
       _authenticationController = StateObject(
         wrappedValue: codexAuthenticationController
       )
+      namespaceWindowSecurityCoordinator = NamespaceWindowSecurityCoordinator(
+        lockCredentials: {
+          try await namespaceLockController.lockAll()
+        },
+        cancelAuthentication: {
+          try await codexAuthenticationController.cancelAll()
+        },
+        stopDaemons: {
+          try await namespaceDaemonController.stopAll()
+        }
+      )
       _windowSecurityCoordinator = StateObject(
-        wrappedValue: NamespaceWindowSecurityCoordinator(
-          lockCredentials: {
-            try await namespaceLockController.lockAll()
-          },
-          cancelAuthentication: {
-            try await codexAuthenticationController.cancelAll()
-          },
-          stopDaemons: {
-            try await namespaceDaemonController.stopAll()
-          }
-        )
+        wrappedValue: namespaceWindowSecurityCoordinator
       )
     }
 
@@ -167,6 +170,7 @@ struct SymphonyDesktopApp: App {
       }
     ) {
       do {
+        await namespaceWindowSecurityCoordinator.waitForCurrentOperation()
         try await namespaceLockController.shutdownForApplicationTermination()
         try await authenticationManager.shutdownForApplicationTermination()
         try await supervisor.shutdownForApplicationTermination()

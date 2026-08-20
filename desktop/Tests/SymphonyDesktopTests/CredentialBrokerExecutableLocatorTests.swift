@@ -4,19 +4,23 @@ import XCTest
 @testable import SymphonyDesktopInfrastructure
 
 final class CredentialBrokerExecutableLocatorTests: XCTestCase {
-  func testFindsDevelopmentHelperBesideDesktopExecutable() throws {
+  func testFindsPackagedHelperInsideApplicationBundle() throws {
     let directory = FileManager.default.temporaryDirectory
       .appendingPathComponent("CredentialBrokerExecutableLocatorTests-\(UUID().uuidString)")
     defer { try? FileManager.default.removeItem(at: directory) }
     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-    let desktop = directory.appendingPathComponent("SymphonyDesktop")
-    let helper = directory.appendingPathComponent("SymphonyCredentialBroker")
-    try Data().write(to: desktop)
+    let application = directory.appendingPathComponent("Symphony.app")
+    let helper = application
+      .appendingPathComponent("Contents/Helpers")
+      .appendingPathComponent("SymphonyCredentialBroker")
+    try FileManager.default.createDirectory(
+      at: helper.deletingLastPathComponent(),
+      withIntermediateDirectories: true
+    )
     try Data().write(to: helper)
     try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: helper.path)
     let locator = CredentialBrokerExecutableLocator(
-      processExecutableURL: desktop,
-      bundleURL: directory.appendingPathComponent("NotAnApp")
+      bundleURL: application
     )
 
     XCTAssertEqual(locator.locate(), helper)
@@ -25,10 +29,7 @@ final class CredentialBrokerExecutableLocatorTests: XCTestCase {
   func testReturnsNilWhenNoExecutableHelperExists() {
     let missing = FileManager.default.temporaryDirectory
       .appendingPathComponent("missing-\(UUID().uuidString)")
-    let locator = CredentialBrokerExecutableLocator(
-      processExecutableURL: missing.appendingPathComponent("SymphonyDesktop"),
-      bundleURL: missing
-    )
+    let locator = CredentialBrokerExecutableLocator(bundleURL: missing)
 
     XCTAssertNil(locator.locate())
   }
