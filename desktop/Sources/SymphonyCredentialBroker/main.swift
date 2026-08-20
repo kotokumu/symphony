@@ -70,7 +70,17 @@ struct SymphonyCredentialBrokerMain {
   private static func runGitProcess(executable: String, arguments: [String]) -> Int32 {
     guard Darwin.setpgid(0, 0) == 0 else { return 1 }
     let authorityDescriptor: Int32 = 4
-    guard Darwin.dup2(STDERR_FILENO, authorityDescriptor) == authorityDescriptor else { return 1 }
+    guard let authorityValue = getenv("SYMPHONY_GIT_AUTHORITY_FD"),
+      let authoritySource = Int32(String(cString: authorityValue)),
+      authoritySource >= 0
+    else { return 1 }
+    var authorityInformation = stat()
+    guard Darwin.fstat(authoritySource, &authorityInformation) == 0,
+      authorityInformation.st_mode & S_IFMT == S_IFDIR,
+      (authoritySource == authorityDescriptor
+        || Darwin.dup2(authoritySource, authorityDescriptor) == authorityDescriptor)
+    else { return 1 }
+    unsetenv("SYMPHONY_GIT_AUTHORITY_FD")
     var authorityFlags = Darwin.fcntl(authorityDescriptor, F_GETFD)
     guard authorityFlags >= 0 else { return 1 }
     authorityFlags &= ~FD_CLOEXEC

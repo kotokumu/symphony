@@ -51,6 +51,7 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
     let input: FileHandle?
     let output: FileHandle?
     let errorOutput: FileHandle?
+    let readCancellation: BrokerReadCancellation
   }
 
   private let executableURL: URL?
@@ -132,7 +133,8 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
       process: processReference,
       input: input.fileHandleForWriting,
       output: output.fileHandleForReading,
-      errorOutput: errorOutput.fileHandleForReading
+      errorOutput: errorOutput.fileHandleForReading,
+      readCancellation: BrokerReadCancellation()
     )
     runtimes[namespaceID] = runtime
     let handshakeTimeout = self.handshakeTimeout
@@ -341,7 +343,8 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
           from: outputDescriptor,
           timeout: responseTimeout,
           maximumBytes: CredentialBrokerProtocolLimits.maximumResponseBytes,
-          context: .capability
+          context: .capability,
+          cancellation: runtime.readCancellation
         )
       }.value
       do {
@@ -386,7 +389,8 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
       process: processReference,
       input: nil,
       output: nil,
-      errorOutput: errorOutput.fileHandleForReading
+      errorOutput: errorOutput.fileHandleForReading,
+      readCancellation: BrokerReadCancellation()
     )
     guard await Self.waitForExit(processReference, timeout: stopTimeout) else {
       try await stop(namespaceID: namespaceID, generation: generation)
@@ -417,6 +421,7 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
     guard let runtime = runtimes[namespaceID], runtime.generation == generation else {
       return
     }
+    runtime.readCancellation.cancel()
     runtime.output?.closeFile()
     let stopTask = Task {
       try await Self.stopProcess(
@@ -727,7 +732,8 @@ private enum BrokerPipeReader {
     from descriptor: Int32,
     timeout: TimeInterval,
     maximumBytes: Int = 16_384,
-    context: Context = .handshake
+    context: Context = .handshake,
+    cancellation: BrokerReadCancellation? = nil
   ) throws -> Data {
     let clock = ContinuousClock()
     let timeoutMilliseconds = max(Int64(1), Int64((timeout * 1_000).rounded(.up)))
@@ -735,13 +741,14 @@ private enum BrokerPipeReader {
     var accumulated = Data()
 
     while clock.now < deadline {
+      if cancellation?.isCancelled == true {
+        throw CredentialBrokerProcessError.capabilityUnavailable
+      }
       let remaining = clock.now.duration(to: deadline).components
       let remainingMilliseconds =
         Double(remaining.seconds) * 1_000
         + Double(remaining.attoseconds) / 1_000_000_000_000_000
-      let pollTimeout = Int32(
-        max(1, min(remainingMilliseconds.rounded(.up), Double(Int32.max)))
-      )
+      let pollTimeout = Int32(max(1, min(remainingMilliseconds.rounded(.up), 50)))
       var pollDescriptor = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
       let result = Darwin.poll(&pollDescriptor, 1, pollTimeout)
       if result == 0 {
@@ -792,6 +799,14 @@ private enum BrokerPipeReader {
     case .capability: .invalidCapabilityResponse
     }
   }
+}
+
+private final class BrokerReadCancellation: @unchecked Sendable {
+  private let lock = NSLock()
+  private var cancelled = false
+
+  var isCancelled: Bool { lock.withLock { cancelled } }
+  func cancel() { lock.withLock { cancelled = true } }
 }
 
 public enum CredentialBrokerProcessError: LocalizedError, Sendable {

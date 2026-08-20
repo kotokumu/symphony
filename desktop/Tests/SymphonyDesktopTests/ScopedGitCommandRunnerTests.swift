@@ -685,8 +685,14 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
         OperationCredential(copying: source)
       }
 
-      XCTAssertTrue(result.output.contains("http.proxy=http://127.0.0.1:"))
-      XCTAssertTrue(result.output.contains("http.https://github.com/octo/repo.proxy=http://127.0.0.1:"))
+      XCTAssertTrue(
+        result.output.contains("http.proxy=http://127.0.0.1:"),
+        result.output
+      )
+      XCTAssertTrue(
+        result.output.contains("http.https://github.com/octo/repo.proxy=http://127.0.0.1:"),
+        result.output
+      )
       XCTAssertFalse(result.output.contains("--git-dir="))
       XCTAssertFalse(result.output.contains(fixture.root.path))
     }

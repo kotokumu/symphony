@@ -646,7 +646,8 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
       contents: """
         #!/bin/sh
         exec 3<&0
-        "$BROKER_REAL_EXECUTABLE" git-runner "$BROKER_LONG_GIT_EXECUTABLE" <&3 &
+        exec 4<"$BROKER_GIT_AUTHORITY"
+        "$BROKER_REAL_EXECUTABLE" git-runner "$BROKER_LONG_GIT_EXECUTABLE" <&3 4<&4 &
         printf '{"status":"unlocked"}\n'
         IFS= read -r command
         trap '' TERM
@@ -663,6 +664,8 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
         "BROKER_LONG_GIT_EXECUTABLE": longRunningGit.path,
         "BROKER_GIT_PARENT_FILE": gitParentURL.path,
         "BROKER_GIT_CHILD_FILE": gitChildURL.path,
+        "BROKER_GIT_AUTHORITY": directory.path,
+        "SYMPHONY_GIT_AUTHORITY_FD": "4",
       ]
     )
     let session = try await launcher.unlock(namespaceID: UUID())
@@ -708,7 +711,13 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
     process.arguments = ["git-runner", longRunningGit.path]
     process.standardInput = brokerSide
     process.standardOutput = FileHandle.nullDevice
-    process.standardError = FileHandle.nullDevice
+    let authorityDescriptor = Darwin.open(directory.path, O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+    XCTAssertGreaterThanOrEqual(authorityDescriptor, 0)
+    let authorityHandle = FileHandle(fileDescriptor: authorityDescriptor, closeOnDealloc: true)
+    process.standardError = authorityHandle
+    var processEnvironment = ProcessInfo.processInfo.environment
+    processEnvironment["SYMPHONY_GIT_AUTHORITY_FD"] = "2"
+    process.environment = processEnvironment
     try process.run()
     brokerSide.closeFile()
     await eventually { FileManager.default.fileExists(atPath: gitParentURL.path) }

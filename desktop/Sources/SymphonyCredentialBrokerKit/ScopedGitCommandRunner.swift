@@ -293,7 +293,9 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       )
         + [brokerExecutableURL.path, "git-runner", gitExecutableURL.path] + arguments
       : arguments
-    process.environment = isolated.environment
+    var processEnvironment = isolated.environment
+    if wrapsGitInBrokerExecutable { processEnvironment["SYMPHONY_GIT_AUTHORITY_FD"] = "2" }
+    process.environment = processEnvironment
     process.standardInput = server.clientHandle
     process.standardOutput = output
     process.standardError = wrapsGitInBrokerExecutable
@@ -607,8 +609,8 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     proxyPort: UInt16
   ) -> [String] {
     [
-      "-D", "WRITE_ROOT=\(authority.writeRoot.path)",
-      "-D", "TEMP_ROOT=\(temporaryDirectory.path)",
+      "-D", "WRITE_ROOT=\(authority.writeRoot.resolvingSymlinksInPath().path)",
+      "-D", "TEMP_ROOT=\(temporaryDirectory.resolvingSymlinksInPath().path)",
       "-p", Self.sandboxProfile(proxyPort: proxyPort),
     ]
   }
