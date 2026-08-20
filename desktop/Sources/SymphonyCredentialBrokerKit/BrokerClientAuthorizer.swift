@@ -116,7 +116,7 @@ public struct SystemBrokerCodeSignatureChecker: BrokerCodeSignatureChecking {
     helperExecutableURL: URL,
     containingAppURL: URL
   ) throws -> Bool {
-    let teamIdentifier = try security.signingTeamIdentifier(at: helperExecutableURL)
+    let teamIdentifier = try security.currentProcessSigningTeamIdentifier()
     guard !teamIdentifier.isEmpty else {
       throw BrokerClientAuthorizationError.signatureUnavailable
     }
@@ -150,18 +150,34 @@ public struct SystemBrokerCodeSignatureChecker: BrokerCodeSignatureChecking {
 }
 
 protocol BrokerSecurityValidating: Sendable {
-  func signingTeamIdentifier(at helperExecutableURL: URL) throws -> String
+  func currentProcessSigningTeamIdentifier() throws -> String
   func staticCodeIsValid(at url: URL, requirementSource: String?) throws -> Bool
   func processIsValid(_ processID: pid_t, requirementSource: String) throws -> Bool
 }
 
 private struct SystemBrokerSecurityValidator: BrokerSecurityValidating {
-  func signingTeamIdentifier(at helperExecutableURL: URL) throws -> String {
-    let code = try staticCode(at: helperExecutableURL)
-    var information: CFDictionary?
-    let signingInformation = SecCSFlags(rawValue: UInt32(kSecCSSigningInformation))
+  func currentProcessSigningTeamIdentifier() throws -> String {
+    var code: SecCode?
     guard
-      SecCodeCopySigningInformation(code, signingInformation, &information) == errSecSuccess,
+      SecCodeCopySelf([], &code) == errSecSuccess,
+      let code,
+      SecCodeCheckValidity(code, [], nil) == errSecSuccess
+    else {
+      throw BrokerClientAuthorizationError.signatureUnavailable
+    }
+    var information: CFDictionary?
+    let signingInformation = SecCSFlags(
+      rawValue: UInt32(kSecCSSigningInformation | kSecCSDynamicInformation)
+    )
+    // The C API accepts either SecCodeRef or SecStaticCodeRef, but the Swift overlay exposes only
+    // the static type. Preserve the dynamic CF object so signing data comes from the running helper.
+    let dynamicallyTypedCode = unsafeBitCast(code, to: SecStaticCode.self)
+    guard
+      SecCodeCopySigningInformation(
+        dynamicallyTypedCode,
+        signingInformation,
+        &information
+      ) == errSecSuccess,
       let dictionary = information as? [String: Any],
       let teamIdentifier = dictionary[kSecCodeInfoTeamIdentifier as String] as? String
     else {

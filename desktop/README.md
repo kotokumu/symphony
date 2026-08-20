@@ -32,8 +32,10 @@ SYMPHONY_CODE_SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" make -C desk
 
 Set `SYMPHONY_CODE_SIGN_IDENTITY` to an Apple Development code-signing identity and run
 `make -C desktop run`. The command assembles a signed development `Symphony.app`, nests and signs
-the credential broker, verifies the sealed bundle, and launches that application. Then verify the
-following behavior:
+the credential broker with its Team-scoped Data Protection Keychain access group, verifies the
+signed entitlements, runs an authenticated add/load/delete smoke check against the Data Protection
+Keychain, verifies the sealed bundle, and launches that application. Then verify the following
+behavior:
 
 1. The window titled `Symphony` displays the empty state and a `Create Namespace` button.
 2. Create two namespaces and switch between them in the sidebar.

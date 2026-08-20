@@ -18,6 +18,7 @@ public protocol CredentialBrokerSessionLaunching: Sendable {
 
 public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
   public typealias ForceKill = @Sendable (Int32) -> Int32
+  public typealias CommandWaitObserver = @Sendable (Namespace.ID) -> Void
 
   private struct Runtime {
     let generation: UUID
@@ -32,6 +33,7 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
   private let stopTimeout: TimeInterval
   private let environment: [String: String]
   private let forceKill: ForceKill
+  private let commandWaitObserver: CommandWaitObserver
   private var runtimes: [Namespace.ID: Runtime] = [:]
   private var commandOwners: Set<Namespace.ID> = []
   private var stopTasks: [Namespace.ID: Task<Void, Error>] = [:]
@@ -41,13 +43,15 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
     handshakeTimeout: TimeInterval = 60,
     stopTimeout: TimeInterval = 2,
     environment: [String: String] = ProcessInfo.processInfo.environment,
-    forceKill: @escaping ForceKill = { Darwin.kill($0, SIGKILL) }
+    forceKill: @escaping ForceKill = { Darwin.kill($0, SIGKILL) },
+    commandWaitObserver: @escaping CommandWaitObserver = { _ in }
   ) {
     self.executableURL = executableURL
     self.handshakeTimeout = handshakeTimeout
     self.stopTimeout = stopTimeout
     self.environment = NamespaceProcessEnvironment.sanitized(environment)
     self.forceKill = forceKill
+    self.commandWaitObserver = commandWaitObserver
   }
 
   public func unlock(namespaceID: Namespace.ID) async throws -> any CredentialBrokerSessionHandle {
@@ -65,7 +69,9 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
     process.standardInput = input
     process.standardOutput = output
     process.standardError = errorOutput
-    _ = Darwin.fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
+    guard Darwin.fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1) != -1 else {
+      throw CredentialBrokerProcessError.pipeConfigurationFailed
+    }
 
     do {
       try process.run()
@@ -251,7 +257,12 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
   }
 
   private func acquireCommand(for namespaceID: Namespace.ID) async throws {
+    var reportedWaiting = false
     while commandOwners.contains(namespaceID) {
+      if !reportedWaiting {
+        commandWaitObserver(namespaceID)
+        reportedWaiting = true
+      }
       try Task.checkCancellation()
       try await Task.sleep(for: .milliseconds(10))
     }
@@ -390,6 +401,7 @@ public enum CredentialBrokerProcessError: LocalizedError, Sendable {
   case sessionAlreadyRunning
   case sessionNotRunning
   case requestTooLarge
+  case pipeConfigurationFailed
   case capabilityFailed(String)
   case launchFailed(String)
   case handshakeFailed
@@ -410,6 +422,8 @@ public enum CredentialBrokerProcessError: LocalizedError, Sendable {
       "The namespace credential broker is not running. Unlock the namespace and try again."
     case .requestTooLarge:
       "The credential capability request is too large."
+    case .pipeConfigurationFailed:
+      "The credential broker pipe could not be configured safely."
     case .capabilityFailed(let message):
       message
     case .launchFailed(let message):

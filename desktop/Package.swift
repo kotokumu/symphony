@@ -10,6 +10,10 @@ let package = Package(
   products: [
     .executable(name: "SymphonyDesktop", targets: ["SymphonyDesktop"]),
     .executable(name: "SymphonyCredentialBroker", targets: ["SymphonyCredentialBroker"]),
+    .executable(
+      name: "SymphonyCredentialStoreSmoke",
+      targets: ["SymphonyCredentialStoreSmoke"]
+    ),
   ],
   targets: [
     .target(name: "SymphonyDesktopCore"),
@@ -26,6 +30,10 @@ let package = Package(
     .executableTarget(
       name: "SymphonyCredentialBroker",
       dependencies: ["SymphonyCredentialBrokerKit", "SymphonyCredentialBrokerProtocol"]
+    ),
+    .executableTarget(
+      name: "SymphonyCredentialStoreSmoke",
+      dependencies: ["SymphonyCredentialBrokerKit"]
     ),
     .target(
       name: "SymphonyDesktopInfrastructure",

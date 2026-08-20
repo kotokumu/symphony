@@ -86,6 +86,40 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
     }
   }
 
+  func testClosedBrokerInputReturnsAnErrorWithoutTerminatingDesktopProcess() async throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let inputClosedURL = directory.appendingPathComponent("input-closed")
+    let script = try executableScript(
+      in: directory,
+      contents: """
+        #!/bin/sh
+        printf '{"status":"unlocked"}\\n'
+        exec 0<&-
+        : > "$BROKER_INPUT_CLOSED_FILE"
+        sleep 1
+        """
+    )
+    let launcher = CredentialBrokerProcessLauncher(
+      executableURL: script,
+      handshakeTimeout: 1,
+      stopTimeout: 0.1,
+      environment: [
+        "PATH": "/usr/bin:/bin",
+        "BROKER_INPUT_CLOSED_FILE": inputClosedURL.path,
+      ]
+    )
+    let session = try await launcher.unlock(namespaceID: UUID())
+    await eventually { FileManager.default.fileExists(atPath: inputClosedURL.path) }
+
+    do {
+      _ = try await session.signChallenge(Data([1]))
+      XCTFail("Expected writing to the closed broker pipe to fail")
+    } catch {
+      XCTAssertFalse(error.localizedDescription.isEmpty)
+    }
+  }
+
   func testMissingExecutableProducesActionableError() async {
     let launcher = CredentialBrokerProcessLauncher(
       executableURL: nil,
@@ -264,6 +298,7 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
         """
     )
     let namespaceID = UUID()
+    let waitSignal = CommandWaitSignal()
     let launcher = CredentialBrokerProcessLauncher(
       executableURL: script,
       handshakeTimeout: 60,
@@ -272,13 +307,18 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
         "PATH": "/usr/bin:/bin",
         "BROKER_FIRST_RECEIVED_FILE": firstReceivedURL.path,
         "BROKER_SECOND_RECEIVED_FILE": secondReceivedURL.path,
-      ]
+      ],
+      commandWaitObserver: { id in
+        if id == namespaceID {
+          waitSignal.signal()
+        }
+      }
     )
     let session = try await launcher.unlock(namespaceID: namespaceID)
     let first = Task { try await session.signChallenge(Data([1])) }
     await eventually { FileManager.default.fileExists(atPath: firstReceivedURL.path) }
     let second = Task { try await session.signChallenge(Data([2])) }
-    try await Task.sleep(for: .milliseconds(30))
+    await waitSignal.wait()
     second.cancel()
 
     try await session.lock()
@@ -330,6 +370,21 @@ private final class RetryingForceKill: @unchecked Sendable {
   func call(_ processID: Int32) -> Int32 {
     lock.withLock {
       isAllowed ? Darwin.kill(processID, SIGKILL) : -1
+    }
+  }
+}
+
+private final class CommandWaitSignal: @unchecked Sendable {
+  private let lock = NSLock()
+  private var signaled = false
+
+  func signal() {
+    lock.withLock { signaled = true }
+  }
+
+  func wait() async {
+    while !lock.withLock({ signaled }) {
+      try? await Task.sleep(for: .milliseconds(5))
     }
   }
 }

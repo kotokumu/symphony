@@ -8,6 +8,7 @@ desktop_directory=$(dirname -- "$script_directory")
 cd "$desktop_directory"
 swift build --product SymphonyDesktop
 swift build --product SymphonyCredentialBroker
+swift build --product SymphonyCredentialStoreSmoke
 
 binary_directory=$(swift build --show-bin-path)
 output_directory="$binary_directory/SymphonyDevelopment"
@@ -19,15 +20,60 @@ mkdir -p "$staging_directory/Symphony.app/Contents/MacOS"
 mkdir -p "$staging_directory/Symphony.app/Contents/Helpers"
 cp "$binary_directory/SymphonyDesktop" "$staging_directory/Symphony.app/Contents/MacOS/SymphonyDesktop"
 cp "$binary_directory/SymphonyCredentialBroker" "$staging_directory/Symphony.app/Contents/Helpers/SymphonyCredentialBroker"
+cp "$binary_directory/SymphonyCredentialStoreSmoke" "$staging_directory/SymphonyCredentialStoreSmoke"
 cp "$script_directory/SymphonyDevelopment-Info.plist" "$staging_directory/Symphony.app/Contents/Info.plist"
 
+helper="$staging_directory/Symphony.app/Contents/Helpers/SymphonyCredentialBroker"
 codesign \
   --force \
   --timestamp=none \
   --options runtime \
   --identifier com.kotokumu.symphony.credential-broker \
   --sign "$signing_identity" \
-  "$staging_directory/Symphony.app/Contents/Helpers/SymphonyCredentialBroker"
+  "$helper"
+team_identifier=$(codesign -d --verbose=4 "$helper" 2>&1 | sed -n 's/^TeamIdentifier=//p' | head -n 1)
+if [ -z "$team_identifier" ]; then
+  echo "error: the selected signing identity does not provide an Apple Team ID" >&2
+  exit 1
+fi
+
+broker_entitlements="$staging_directory/SymphonyCredentialBroker.entitlements.plist"
+sed "s/__TEAM_IDENTIFIER__/$team_identifier/g" \
+  "$script_directory/SymphonyCredentialBroker.entitlements.plist.template" \
+  > "$broker_entitlements"
+codesign \
+  --force \
+  --timestamp=none \
+  --options runtime \
+  --identifier com.kotokumu.symphony.credential-broker \
+  --entitlements "$broker_entitlements" \
+  --sign "$signing_identity" \
+  "$helper"
+
+credential_store_smoke="$staging_directory/SymphonyCredentialStoreSmoke"
+codesign \
+  --force \
+  --timestamp=none \
+  --options runtime \
+  --identifier com.kotokumu.symphony.credential-broker \
+  --entitlements "$broker_entitlements" \
+  --sign "$signing_identity" \
+  "$credential_store_smoke"
+"$credential_store_smoke"
+
+signed_entitlements="$staging_directory/SymphonyCredentialBroker.signed-entitlements.plist"
+codesign -d --entitlements :- "$helper" > "$signed_entitlements" 2>/dev/null
+expected_application_identifier="$team_identifier.com.kotokumu.symphony.credential-broker"
+actual_application_identifier=$(
+  /usr/libexec/PlistBuddy \
+    -c "Print :com.apple.application-identifier" \
+    "$signed_entitlements"
+)
+if [ "$actual_application_identifier" != "$expected_application_identifier" ]; then
+  echo "error: the credential broker is missing its Data Protection Keychain entitlement" >&2
+  exit 1
+fi
+
 codesign \
   --force \
   --timestamp=none \

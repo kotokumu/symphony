@@ -169,17 +169,27 @@ struct SymphonyDesktopApp: App {
         }
       }
     ) {
-      do {
-        await namespaceWindowSecurityCoordinator.waitForCurrentOperation()
-        try await namespaceLockController.shutdownForApplicationTermination()
-        try await authenticationManager.shutdownForApplicationTermination()
-        try await supervisor.shutdownForApplicationTermination()
-        namespaceSleepLockCoordinator.stop()
-      } catch {
-        await authenticationManager.resumeAfterApplicationTerminationFailure()
-        await namespaceLockController.resumeAfterApplicationTerminationFailure()
-        throw error
-      }
+      try await ApplicationSecurityShutdownCoordinator(
+        windowSecurity: namespaceWindowSecurityCoordinator,
+        lockCredentials: {
+          try await namespaceLockController.shutdownForApplicationTermination()
+        },
+        shutdownAuthentication: {
+          try await authenticationManager.shutdownForApplicationTermination()
+        },
+        shutdownDaemons: {
+          try await supervisor.shutdownForApplicationTermination()
+        },
+        stopSleepProtection: {
+          namespaceSleepLockCoordinator.stop()
+        },
+        resumeAuthentication: {
+          await authenticationManager.resumeAfterApplicationTerminationFailure()
+        },
+        resumeCredentials: {
+          await namespaceLockController.resumeAfterApplicationTerminationFailure()
+        }
+      ).shutdown()
     }
   }
 

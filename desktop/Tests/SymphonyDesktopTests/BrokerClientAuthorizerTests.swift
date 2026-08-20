@@ -115,7 +115,7 @@ final class BrokerClientAuthorizerTests: XCTestCase {
     XCTAssertEqual(
       security.operations,
       [
-        .team(helper),
+        .currentProcessTeam,
         .staticCode(application, requirement: nil),
         .staticCode(desktop, requirement: requirement),
         .process(42, requirement: requirement),
@@ -141,6 +141,74 @@ final class BrokerClientAuthorizerTests: XCTestCase {
 
     XCTAssertFalse(result)
     XCTAssertEqual(security.operations.count, 2)
+  }
+
+  func testSystemCheckerRejectsAtEachIndependentSignatureBoundary() throws {
+    struct Scenario {
+      let name: String
+      let team: String
+      let staticResults: [Bool]
+      let processResult: Bool
+      let expectedOperationCount: Int
+      let throwsError: Bool
+    }
+    let scenarios = [
+      Scenario(
+        name: "missing team",
+        team: "",
+        staticResults: [],
+        processResult: true,
+        expectedOperationCount: 1,
+        throwsError: true
+      ),
+      Scenario(
+        name: "invalid app seal",
+        team: "TEAM123456",
+        staticResults: [false],
+        processResult: true,
+        expectedOperationCount: 2,
+        throwsError: false
+      ),
+      Scenario(
+        name: "invalid desktop code",
+        team: "TEAM123456",
+        staticResults: [true, false],
+        processResult: true,
+        expectedOperationCount: 3,
+        throwsError: false
+      ),
+      Scenario(
+        name: "invalid running parent",
+        team: "TEAM123456",
+        staticResults: [true, true],
+        processResult: false,
+        expectedOperationCount: 4,
+        throwsError: false
+      ),
+    ]
+
+    for scenario in scenarios {
+      let security = RecordingBrokerSecurityValidator(
+        teamIdentifier: scenario.team,
+        staticResults: scenario.staticResults,
+        processResult: scenario.processResult
+      )
+      let checker = SystemBrokerCodeSignatureChecker(security: security)
+      do {
+        let result = try checker.process(
+          42,
+          satisfiesDesktopIdentifier: "com.kotokumu.symphony.desktop",
+          desktopExecutableURL: URL(fileURLWithPath: "/app/desktop"),
+          helperExecutableURL: URL(fileURLWithPath: "/app/helper"),
+          containingAppURL: URL(fileURLWithPath: "/app")
+        )
+        XCTAssertFalse(result, scenario.name)
+        XCTAssertFalse(scenario.throwsError, scenario.name)
+      } catch {
+        XCTAssertTrue(scenario.throwsError, scenario.name)
+      }
+      XCTAssertEqual(security.operations.count, scenario.expectedOperationCount, scenario.name)
+    }
   }
 }
 
@@ -194,7 +262,7 @@ private final class RecordingBrokerSecurityValidator: BrokerSecurityValidating,
   @unchecked Sendable
 {
   enum Operation: Equatable {
-    case team(URL)
+    case currentProcessTeam
     case staticCode(URL, requirement: String?)
     case process(pid_t, requirement: String)
   }
@@ -210,8 +278,8 @@ private final class RecordingBrokerSecurityValidator: BrokerSecurityValidating,
     self.processResult = processResult
   }
 
-  func signingTeamIdentifier(at helperExecutableURL: URL) -> String {
-    operations.append(.team(helperExecutableURL))
+  func currentProcessSigningTeamIdentifier() -> String {
+    operations.append(.currentProcessTeam)
     return teamIdentifier
   }
 
