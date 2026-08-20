@@ -54,6 +54,7 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
     for directory in [firstDirectory, secondDirectory] {
       XCTAssertTrue(fileExists(directory.appendingPathComponent("Runtime/WORKFLOW.md")))
       XCTAssertTrue(fileExists(directory.appendingPathComponent("Workspaces")))
+      XCTAssertTrue(fileExists(directory.appendingPathComponent("CodexHome")))
       XCTAssertTrue(fileExists(directory.appendingPathComponent("Logs/daemon.stdout.log")))
       XCTAssertTrue(fileExists(directory.appendingPathComponent("Logs/daemon.stderr.log")))
       let workflow = try String(
@@ -62,6 +63,11 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
       )
       XCTAssertTrue(workflow.contains("kind: memory"))
       XCTAssertTrue(workflow.contains(directory.appendingPathComponent("Workspaces").path))
+      XCTAssertTrue(
+        workflow.contains(
+          "CODEX_HOME='\(directory.appendingPathComponent("CodexHome").path)' codex app-server"
+        )
+      )
     }
 
     try await supervisor.stop(namespaceID: firstID)

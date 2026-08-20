@@ -241,13 +241,24 @@ public actor NamespaceDaemonSupervisor {
       isDirectory: true
     )
     let logsDirectory = namespaceDirectory.appendingPathComponent("Logs", isDirectory: true)
+    let codexHomeDirectory = namespaceDirectory.appendingPathComponent(
+      "CodexHome",
+      isDirectory: true
+    )
 
     do {
-      for directory in [runtimeDirectory, workspaceDirectory, logsDirectory] {
+      for directory in [runtimeDirectory, workspaceDirectory, logsDirectory, codexHomeDirectory] {
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
       }
+      try fileManager.setAttributes(
+        [.posixPermissions: 0o700],
+        ofItemAtPath: codexHomeDirectory.path
+      )
       let workflowURL = runtimeDirectory.appendingPathComponent("WORKFLOW.md")
-      try workflow(workspaceDirectory: workspaceDirectory).write(
+      try workflow(
+        workspaceDirectory: workspaceDirectory,
+        codexHomeDirectory: codexHomeDirectory
+      ).write(
         to: workflowURL,
         atomically: true,
         encoding: .utf8
@@ -263,20 +274,29 @@ public actor NamespaceDaemonSupervisor {
     }
   }
 
-  private func workflow(workspaceDirectory: URL) -> String {
-    let escapedPath = workspaceDirectory.path.replacingOccurrences(of: "'", with: "''")
+  private func workflow(workspaceDirectory: URL, codexHomeDirectory: URL) -> String {
+    let escapedWorkspacePath = yamlSingleQuoted(workspaceDirectory.path)
+    let escapedCodexHomePath = shellSingleQuoted(codexHomeDirectory.path)
     return """
       ---
       tracker:
         kind: memory
       workspace:
-        root: '\(escapedPath)'
+        root: '\(escapedWorkspacePath)'
       codex:
-        command: codex app-server
+        command: env CODEX_HOME=\(escapedCodexHomePath) codex app-server
       ---
 
       This namespace is waiting for a platform connection.
       """
+  }
+
+  private func yamlSingleQuoted(_ value: String) -> String {
+    value.replacingOccurrences(of: "'", with: "''")
+  }
+
+  private func shellSingleQuoted(_ value: String) -> String {
+    "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
   }
 
   private func launch(
@@ -327,6 +347,11 @@ public actor NamespaceDaemonSupervisor {
         layout.workflowURL.path,
       ]
     process.currentDirectoryURL = workingDirectoryURL
+    var environment = ProcessInfo.processInfo.environment
+    for credentialName in ["OPENAI_API_KEY", "CODEX_ACCESS_TOKEN", "CODEX_API_KEY", "CODEX_HOME"] {
+      environment.removeValue(forKey: credentialName)
+    }
+    process.environment = environment
     process.standardOutput = output
     process.standardError = errorOutput
     let terminationDelivery = self.terminationDelivery

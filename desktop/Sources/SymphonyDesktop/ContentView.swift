@@ -4,6 +4,7 @@ import SymphonyDesktopCore
 struct ContentView: View {
   @ObservedObject var controller: NamespaceController
   @ObservedObject var daemonController: NamespaceDaemonController
+  @ObservedObject var authenticationController: CodexAuthenticationController
 
   @State private var editor: NamespaceEditorContext?
   @State private var namespaceToDelete: DesktopNamespace?
@@ -23,12 +24,20 @@ struct ContentView: View {
     }
     .task {
       await daemonController.startObserving()
+      await authenticationController.startObserving()
       if controller.loadState == .loading {
         await controller.load()
       }
     }
+    .task(id: controller.catalog.selectedID) {
+      guard let namespaceID = controller.catalog.selectedID else {
+        return
+      }
+      await authenticationController.refresh(namespaceID)
+    }
     .onDisappear {
       Task {
+        await authenticationController.cancelAll()
         try? await daemonController.stopAll()
       }
     }
@@ -105,6 +114,7 @@ struct ContentView: View {
         NamespaceDetailView(
           namespace: namespace,
           daemonState: daemonController.state(for: namespace.id),
+          authenticationState: authenticationController.state(for: namespace.id),
           start: {
             Task {
               await daemonController.start(namespace)
@@ -122,6 +132,16 @@ struct ContentView: View {
               await reportErrors {
                 try await daemonController.restart(namespace)
               }
+            }
+          },
+          signIn: {
+            Task {
+              await authenticationController.signIn(namespace.id)
+            }
+          },
+          signOut: {
+            Task {
+              await authenticationController.signOut(namespace.id)
             }
           },
           rename: { editor = .rename(namespace) },
@@ -246,9 +266,12 @@ private struct EmptyNamespaceView: View {
 private struct NamespaceDetailView: View {
   let namespace: DesktopNamespace
   let daemonState: NamespaceDaemonState
+  let authenticationState: CodexAuthenticationState
   let start: () -> Void
   let stop: () -> Void
   let restart: () -> Void
+  let signIn: () -> Void
+  let signOut: () -> Void
   let rename: () -> Void
   let delete: () -> Void
 
@@ -266,12 +289,72 @@ private struct NamespaceDetailView: View {
 
       daemonControls
 
+      Divider()
+        .frame(maxWidth: 440)
+
+      authenticationStatus
+
+      authenticationControls
+
       HStack {
         Button("Rename…", action: rename)
         Button("Delete…", role: .destructive, action: delete)
       }
     }
     .padding(48)
+  }
+
+  @ViewBuilder
+  private var authenticationStatus: some View {
+    switch authenticationState {
+    case .signedOut:
+      Label("Codex signed out", systemImage: "person.crop.circle.badge.xmark")
+        .foregroundStyle(.secondary)
+    case .authenticating:
+      HStack(spacing: 8) {
+        ProgressView()
+          .controlSize(.small)
+        Text("Waiting for ChatGPT sign-in…")
+      }
+      .foregroundStyle(.secondary)
+    case .signedIn:
+      Label("Codex signed in", systemImage: "person.crop.circle.badge.checkmark")
+        .foregroundStyle(.green)
+    case .expired(let message):
+      VStack(spacing: 6) {
+        Label("Codex sign-in expired", systemImage: "clock.badge.exclamationmark")
+          .foregroundStyle(.orange)
+        Text(message)
+          .foregroundStyle(.secondary)
+          .multilineTextAlignment(.center)
+          .frame(maxWidth: 440)
+      }
+    case .failed(let message):
+      VStack(spacing: 6) {
+        Label("Codex authentication failed", systemImage: "exclamationmark.triangle.fill")
+          .foregroundStyle(.red)
+        Text(message)
+          .foregroundStyle(.secondary)
+          .multilineTextAlignment(.center)
+          .frame(maxWidth: 440)
+      }
+    }
+  }
+
+  @ViewBuilder
+  private var authenticationControls: some View {
+    switch authenticationState {
+    case .signedOut:
+      Button("Sign in with ChatGPT", action: signIn)
+        .buttonStyle(.borderedProminent)
+    case .authenticating:
+      EmptyView()
+    case .signedIn:
+      Button("Sign Out", action: signOut)
+    case .expired, .failed:
+      Button("Try Sign In Again", action: signIn)
+        .buttonStyle(.borderedProminent)
+    }
   }
 
   @ViewBuilder

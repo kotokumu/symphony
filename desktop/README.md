@@ -8,6 +8,7 @@ application can create, rename, select, and delete multiple namespaces on one Ma
 - macOS 15.3 or later
 - Xcode 16.4 with its Swift 6 toolchain and macOS SDK
 - `mise` with the tools in `elixir/mise.toml` installed when running the daemon from a source checkout
+- Codex CLI available on `PATH` to use namespace authentication and run Codex through a daemon
 
 Xcode Command Line Tools alone are insufficient because the test suite uses XCTest.
 
@@ -43,3 +44,16 @@ Run `make -C desktop run`, then verify the following behavior:
    it returns to `Daemon running`.
 8. Close the desktop window and confirm its namespace daemons stop. Relaunch a daemon, quit the
    application, and confirm termination waits for the daemon to stop.
+9. Select a signed-out namespace, choose `Sign in with ChatGPT`, complete the browser flow, and
+   confirm the namespace displays `Codex signed in`.
+10. Sign in a second namespace, sign out the first, and confirm the second remains signed in.
+11. Quit and relaunch the application, select each namespace, and confirm its independent Codex
+    authentication state is restored.
+
+## Namespace Codex Boundary
+
+The application sets `CODEX_HOME` to `<namespace>/CodexHome` for Codex login, status, logout, and
+the namespace daemon's `codex app-server`. It creates this directory with owner-only permissions and
+does not inherit API-key or access-token environment variables from the desktop process. Codex owns
+the credential file format and browser callback flow; Symphony does not parse or rewrite those
+credentials.
