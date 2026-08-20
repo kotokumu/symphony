@@ -14,15 +14,16 @@ struct SymphonyDesktopApp: App {
 
   init() {
     let command = SymphonyExecutableLocator().locate()
+    let codexExecutableURL = CodexExecutableLocator().locate()
     let supervisor = NamespaceDaemonSupervisor(
       executableURL: command?.executableURL,
+      codexExecutableURL: codexExecutableURL,
       argumentPrefix: command?.argumentPrefix ?? [],
       workingDirectoryURL: command?.workingDirectoryURL
     )
     let authenticationManager = CodexAuthenticationManager(
-      executor: CodexCLICommandExecutor(executableURL: CodexExecutableLocator().locate())
+      executor: CodexCLICommandExecutor(executableURL: codexExecutableURL)
     )
-    let terminationAuthenticationController: CodexAuthenticationController
     do {
       let repository = try FileNamespaceRepository()
       let codexAuthenticationController = CodexAuthenticationController(
@@ -44,14 +45,20 @@ struct SymphonyDesktopApp: App {
           repository: repository,
           beforeDelete: { id in
             try await supervisor.stop(namespaceID: id)
-            await codexAuthenticationController.cancel(id)
+            try await authenticationManager.quiesce(namespaceID: id)
+          },
+          afterDelete: { id, succeeded in
+            if succeeded {
+              await authenticationManager.removeNamespace(id)
+            } else {
+              await authenticationManager.resume(namespaceID: id)
+            }
           }
         )
       )
       _authenticationController = StateObject(
         wrappedValue: codexAuthenticationController
       )
-      terminationAuthenticationController = codexAuthenticationController
     } catch {
       let repository = UnavailableNamespaceRepository(message: error.localizedDescription)
       let codexAuthenticationController = CodexAuthenticationController(
@@ -72,12 +79,16 @@ struct SymphonyDesktopApp: App {
       _authenticationController = StateObject(
         wrappedValue: codexAuthenticationController
       )
-      terminationAuthenticationController = codexAuthenticationController
     }
 
     applicationDelegate.configure {
-      await terminationAuthenticationController.cancelAll()
-      try await supervisor.shutdownForApplicationTermination()
+      try await authenticationManager.shutdownForApplicationTermination()
+      do {
+        try await supervisor.shutdownForApplicationTermination()
+      } catch {
+        await authenticationManager.resumeAfterApplicationTerminationFailure()
+        throw error
+      }
     }
   }
 

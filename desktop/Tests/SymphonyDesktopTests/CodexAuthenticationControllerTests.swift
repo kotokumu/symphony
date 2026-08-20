@@ -40,6 +40,7 @@ final class CodexAuthenticationControllerTests: XCTestCase {
     await controller.refresh(namespaceID)
     await controller.signIn(namespaceID)
     await controller.signOut(namespaceID)
+    try await controller.cancelAll()
 
     let commands = await authenticator.recordedCommands()
     XCTAssertEqual(
@@ -48,31 +49,9 @@ final class CodexAuthenticationControllerTests: XCTestCase {
         .refresh(namespaceID, directory),
         .signIn(namespaceID, directory),
         .signOut(namespaceID, directory),
+        .cancelAll,
       ]
     )
-  }
-
-  func testCancelsAnActiveBrowserLoginBeforeNamespaceDataIsRemoved() async throws {
-    let authenticator = TestCodexAuthenticator()
-    await authenticator.setBlocksSignIn(true)
-    let namespaceID = UUID()
-    let controller = CodexAuthenticationController(
-      authenticator: authenticator,
-      directoryURL: { _ in URL(fileURLWithPath: "/namespaces/auth") }
-    )
-    let signIn = Task {
-      await controller.signIn(namespaceID)
-    }
-    let deadline = Date().addingTimeInterval(1)
-    while !(await authenticator.didStartSignIn()), Date() < deadline {
-      await Task.yield()
-    }
-
-    await controller.cancel(namespaceID)
-    await signIn.value
-
-    let wasCancelled = await authenticator.wasSignInCancelled()
-    XCTAssertTrue(wasCancelled)
   }
 
   private func eventually(
@@ -92,13 +71,11 @@ private actor TestCodexAuthenticator: CodexAuthenticating {
     case refresh(UUID, URL)
     case signIn(UUID, URL)
     case signOut(UUID, URL)
+    case cancelAll
   }
 
   private var continuation: AsyncStream<CodexAuthenticationEvent>.Continuation?
   private var commands: [Command] = []
-  private var blocksSignIn = false
-  private var signInStarted = false
-  private var signInCancelled = false
 
   func events() -> AsyncStream<CodexAuthenticationEvent> {
     AsyncStream { continuation in
@@ -110,17 +87,8 @@ private actor TestCodexAuthenticator: CodexAuthenticating {
     commands.append(.refresh(namespaceID, namespaceDirectory))
   }
 
-  func signIn(namespaceID: UUID, namespaceDirectory: URL) async {
+  func signIn(namespaceID: UUID, namespaceDirectory: URL) {
     commands.append(.signIn(namespaceID, namespaceDirectory))
-    guard blocksSignIn else {
-      return
-    }
-    signInStarted = true
-    do {
-      try await Task.sleep(for: .seconds(60))
-    } catch {
-      signInCancelled = true
-    }
   }
 
   func signOut(namespaceID: UUID, namespaceDirectory: URL) {
@@ -135,15 +103,7 @@ private actor TestCodexAuthenticator: CodexAuthenticating {
     commands
   }
 
-  func setBlocksSignIn(_ value: Bool) {
-    blocksSignIn = value
-  }
-
-  func didStartSignIn() -> Bool {
-    signInStarted
-  }
-
-  func wasSignInCancelled() -> Bool {
-    signInCancelled
+  func cancelAll() {
+    commands.append(.cancelAll)
   }
 }

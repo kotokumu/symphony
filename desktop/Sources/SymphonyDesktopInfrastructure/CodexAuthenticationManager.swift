@@ -26,9 +26,24 @@ public protocol CodexCommandExecuting: Sendable {
 }
 
 public actor CodexAuthenticationManager {
+  private enum OperationOutcome: Sendable {
+    case state(CodexAuthenticationState)
+    case cancelled
+    case failed(String)
+    case terminationFailed(String)
+  }
+
+  private struct Operation {
+    let generation: UUID
+    let task: Task<OperationOutcome, Never>
+  }
+
   private let executor: any CodexCommandExecuting
   private var states: [Namespace.ID: CodexAuthenticationState] = [:]
-  private var activeOperations: Set<Namespace.ID> = []
+  private var operations: [Namespace.ID: Operation] = [:]
+  private var quiescedNamespaces: Set<Namespace.ID> = []
+  private var startSuspensionCount = 0
+  private var applicationTerminationRequested = false
   private var eventContinuations: [UUID: AsyncStream<CodexAuthenticationEvent>.Continuation] = [:]
 
   public init(executor: any CodexCommandExecuting) {
@@ -52,99 +67,210 @@ public actor CodexAuthenticationManager {
   }
 
   public func refresh(namespaceID: Namespace.ID, namespaceDirectory: URL) async {
-    guard beginOperation(for: namespaceID) else {
+    let codexHome = codexHome(in: namespaceDirectory)
+    guard
+      let operation = beginOperation(
+        for: namespaceID,
+        task: { [executor] in
+          do {
+            let result = try await executor.execute(
+              CodexCommandInvocation(arguments: ["login", "status"], codexHome: codexHome)
+            )
+            return .state(Self.statusState(from: result))
+          } catch is CancellationError {
+            return .cancelled
+          } catch CodexCLIError.stopFailed {
+            return .terminationFailed(CodexCLIError.stopFailed.localizedDescription)
+          } catch {
+            return .failed(
+              "Codex authentication could not be checked: \(error.localizedDescription)")
+          }
+        })
+    else {
       return
     }
-    defer { finishOperation(for: namespaceID) }
-
-    do {
-      let result = try await execute(
-        ["login", "status"],
-        namespaceDirectory: namespaceDirectory
-      )
-      publish(statusState(from: result), for: namespaceID)
-    } catch is CancellationError {
-      return
-    } catch {
-      publish(
-        .failed(
-          message: "Codex authentication could not be checked: \(error.localizedDescription)"),
-        for: namespaceID
-      )
-    }
+    await complete(operation, for: namespaceID)
   }
 
   public func signIn(namespaceID: Namespace.ID, namespaceDirectory: URL) async {
-    guard beginOperation(for: namespaceID) else {
+    let codexHome = codexHome(in: namespaceDirectory)
+    guard canBeginOperation(for: namespaceID) else {
       return
     }
-    defer { finishOperation(for: namespaceID) }
     publish(.authenticating, for: namespaceID)
-
-    do {
-      let loginResult = try await execute(["login"], namespaceDirectory: namespaceDirectory)
-      guard loginResult.status == 0 else {
-        publish(
-          .failed(message: "Codex sign-in failed: \(message(from: loginResult))"),
-          for: namespaceID
-        )
-        return
-      }
-
-      let statusResult = try await execute(
-        ["login", "status"],
-        namespaceDirectory: namespaceDirectory
-      )
-      publish(statusState(from: statusResult), for: namespaceID)
-    } catch is CancellationError {
-      publish(.signedOut, for: namespaceID)
-    } catch {
-      publish(
-        .failed(message: "Codex sign-in failed: \(error.localizedDescription)"),
-        for: namespaceID
-      )
+    guard
+      let operation = beginOperation(
+        for: namespaceID,
+        task: { [executor] in
+          do {
+            let loginResult = try await executor.execute(
+              CodexCommandInvocation(arguments: ["login"], codexHome: codexHome)
+            )
+            guard loginResult.status == 0 else {
+              return .state(
+                .failed(message: "Codex sign-in failed: \(Self.message(from: loginResult))")
+              )
+            }
+            let statusResult = try await executor.execute(
+              CodexCommandInvocation(arguments: ["login", "status"], codexHome: codexHome)
+            )
+            return .state(Self.statusState(from: statusResult))
+          } catch is CancellationError {
+            return .cancelled
+          } catch CodexCLIError.stopFailed {
+            return .terminationFailed(CodexCLIError.stopFailed.localizedDescription)
+          } catch {
+            return .failed("Codex sign-in failed: \(error.localizedDescription)")
+          }
+        })
+    else {
+      return
     }
+    await complete(operation, for: namespaceID)
   }
 
   public func signOut(namespaceID: Namespace.ID, namespaceDirectory: URL) async {
-    guard beginOperation(for: namespaceID) else {
+    let codexHome = codexHome(in: namespaceDirectory)
+    guard
+      let operation = beginOperation(
+        for: namespaceID,
+        task: { [executor] in
+          do {
+            let result = try await executor.execute(
+              CodexCommandInvocation(arguments: ["logout"], codexHome: codexHome)
+            )
+            if result.status == 0 || Self.normalized(result.output).contains("not logged in") {
+              return .state(.signedOut)
+            }
+            return .state(
+              .failed(message: "Codex sign-out failed: \(Self.message(from: result))")
+            )
+          } catch is CancellationError {
+            return .cancelled
+          } catch CodexCLIError.stopFailed {
+            return .terminationFailed(CodexCLIError.stopFailed.localizedDescription)
+          } catch {
+            return .failed("Codex sign-out failed: \(error.localizedDescription)")
+          }
+        })
+    else {
       return
     }
-    defer { finishOperation(for: namespaceID) }
+    await complete(operation, for: namespaceID)
+  }
 
+  public func quiesce(namespaceID: Namespace.ID) async throws {
+    quiescedNamespaces.insert(namespaceID)
     do {
-      let result = try await execute(["logout"], namespaceDirectory: namespaceDirectory)
-      if result.status == 0 || normalized(result.output).contains("not logged in") {
-        publish(.signedOut, for: namespaceID)
-      } else {
-        publish(
-          .failed(message: "Codex sign-out failed: \(message(from: result))"),
-          for: namespaceID
-        )
-      }
-    } catch is CancellationError {
-      return
+      try await cancelOperation(for: namespaceID)
     } catch {
-      publish(
-        .failed(message: "Codex sign-out failed: \(error.localizedDescription)"),
-        for: namespaceID
-      )
+      quiescedNamespaces.remove(namespaceID)
+      throw error
     }
   }
 
-  private func execute(
-    _ arguments: [String],
-    namespaceDirectory: URL
-  ) async throws -> CodexCommandResult {
-    try await executor.execute(
-      CodexCommandInvocation(
-        arguments: arguments,
-        codexHome: namespaceDirectory.appendingPathComponent("CodexHome", isDirectory: true)
-      )
-    )
+  public func resume(namespaceID: Namespace.ID) {
+    quiescedNamespaces.remove(namespaceID)
   }
 
-  private func statusState(from result: CodexCommandResult) -> CodexAuthenticationState {
+  public func removeNamespace(_ namespaceID: Namespace.ID) {
+    operations.removeValue(forKey: namespaceID)?.task.cancel()
+    states.removeValue(forKey: namespaceID)
+    quiescedNamespaces.remove(namespaceID)
+  }
+
+  public func cancelAll() async throws {
+    startSuspensionCount += 1
+    defer { startSuspensionCount -= 1 }
+    try await drainOperations()
+  }
+
+  public func shutdownForApplicationTermination() async throws {
+    applicationTerminationRequested = true
+    do {
+      try await drainOperations()
+    } catch {
+      applicationTerminationRequested = false
+      throw error
+    }
+  }
+
+  public func resumeAfterApplicationTerminationFailure() {
+    applicationTerminationRequested = false
+  }
+
+  private func drainOperations() async throws {
+    var failedToStop = false
+    for namespaceID in Array(operations.keys) {
+      do {
+        try await cancelOperation(for: namespaceID)
+      } catch {
+        failedToStop = true
+      }
+    }
+    if failedToStop {
+      throw CodexAuthenticationLifecycleError.stopFailed
+    }
+  }
+
+  private func cancelOperation(for namespaceID: Namespace.ID) async throws {
+    guard let operation = operations[namespaceID] else {
+      return
+    }
+    operation.task.cancel()
+    let outcome = await operation.task.value
+    if operations[namespaceID]?.generation == operation.generation {
+      operations.removeValue(forKey: namespaceID)
+    }
+    if case .cancelled = outcome, states[namespaceID] == .authenticating {
+      publish(.signedOut, for: namespaceID)
+    }
+    if case .terminationFailed(let message) = outcome {
+      publish(.failed(message: message), for: namespaceID)
+      throw CodexAuthenticationLifecycleError.stopFailed
+    }
+  }
+
+  private func canBeginOperation(for namespaceID: Namespace.ID) -> Bool {
+    startSuspensionCount == 0
+      && !applicationTerminationRequested
+      && !quiescedNamespaces.contains(namespaceID)
+      && operations[namespaceID] == nil
+  }
+
+  private func beginOperation(
+    for namespaceID: Namespace.ID,
+    task: @escaping @Sendable () async -> OperationOutcome
+  ) -> Operation? {
+    guard canBeginOperation(for: namespaceID) else {
+      return nil
+    }
+    let operation = Operation(generation: UUID(), task: Task { await task() })
+    operations[namespaceID] = operation
+    return operation
+  }
+
+  private func complete(_ operation: Operation, for namespaceID: Namespace.ID) async {
+    let outcome = await operation.task.value
+    guard operations[namespaceID]?.generation == operation.generation else {
+      return
+    }
+    operations.removeValue(forKey: namespaceID)
+    switch outcome {
+    case .state(let state):
+      publish(state, for: namespaceID)
+    case .cancelled:
+      break
+    case .failed(let message), .terminationFailed(let message):
+      publish(.failed(message: message), for: namespaceID)
+    }
+  }
+
+  private func codexHome(in namespaceDirectory: URL) -> URL {
+    namespaceDirectory.appendingPathComponent("CodexHome", isDirectory: true)
+  }
+
+  private static func statusState(from result: CodexCommandResult) -> CodexAuthenticationState {
     let output = message(from: result)
     let normalizedOutput = normalized(output)
     if normalizedOutput.contains("not logged in") {
@@ -159,21 +285,13 @@ public actor CodexAuthenticationManager {
     return .failed(message: "Codex authentication could not be checked: \(output)")
   }
 
-  private func message(from result: CodexCommandResult) -> String {
+  private static func message(from result: CodexCommandResult) -> String {
     let message = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
     return message.isEmpty ? "The Codex command exited with status \(result.status)." : message
   }
 
-  private func normalized(_ message: String) -> String {
+  private static func normalized(_ message: String) -> String {
     message.lowercased()
-  }
-
-  private func beginOperation(for namespaceID: Namespace.ID) -> Bool {
-    activeOperations.insert(namespaceID).inserted
-  }
-
-  private func finishOperation(for namespaceID: Namespace.ID) {
-    activeOperations.remove(namespaceID)
   }
 
   private func publish(_ state: CodexAuthenticationState, for namespaceID: Namespace.ID) {
@@ -186,5 +304,13 @@ public actor CodexAuthenticationManager {
 
   private func removeEventContinuation(_ id: UUID) {
     eventContinuations.removeValue(forKey: id)
+  }
+}
+
+public enum CodexAuthenticationLifecycleError: LocalizedError, Sendable {
+  case stopFailed
+
+  public var errorDescription: String? {
+    "The Codex authentication process could not be stopped safely. Try again before deleting the namespace or quitting."
   }
 }

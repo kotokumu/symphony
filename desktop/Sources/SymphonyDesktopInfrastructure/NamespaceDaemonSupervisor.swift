@@ -20,6 +20,7 @@ public actor NamespaceDaemonSupervisor {
   }
 
   private let executableURL: URL?
+  private let codexExecutableURL: URL?
   private let argumentPrefix: [String]
   private let workingDirectoryURL: URL?
   private let readinessTimeout: TimeInterval
@@ -30,6 +31,7 @@ public actor NamespaceDaemonSupervisor {
   private let forcedStopTimeout: TimeInterval
   private let forceKill: ForceKill
   private let fileManager: FileManager
+  private let environment: [String: String]
 
   private var generations: [Namespace.ID: UUID] = [:]
   private var runtimes: [Namespace.ID: Runtime] = [:]
@@ -42,6 +44,7 @@ public actor NamespaceDaemonSupervisor {
 
   public init(
     executableURL: URL?,
+    codexExecutableURL: URL?,
     argumentPrefix: [String] = [],
     workingDirectoryURL: URL? = nil,
     readinessTimeout: TimeInterval = 15,
@@ -55,9 +58,11 @@ public actor NamespaceDaemonSupervisor {
     gracefulStopTimeout: TimeInterval = 3,
     forcedStopTimeout: TimeInterval = 2,
     forceKill: @escaping ForceKill = { Darwin.kill($0, SIGKILL) },
-    fileManager: FileManager = .default
+    fileManager: FileManager = .default,
+    environment: [String: String] = ProcessInfo.processInfo.environment
   ) {
     self.executableURL = executableURL
+    self.codexExecutableURL = codexExecutableURL
     self.argumentPrefix = argumentPrefix
     self.workingDirectoryURL = workingDirectoryURL
     self.readinessTimeout = readinessTimeout
@@ -68,6 +73,7 @@ public actor NamespaceDaemonSupervisor {
     self.forcedStopTimeout = forcedStopTimeout
     self.forceKill = forceKill
     self.fileManager = fileManager
+    self.environment = environment
   }
 
   public func events() -> AsyncStream<NamespaceDaemonEvent> {
@@ -255,9 +261,11 @@ public actor NamespaceDaemonSupervisor {
         ofItemAtPath: codexHomeDirectory.path
       )
       let workflowURL = runtimeDirectory.appendingPathComponent("WORKFLOW.md")
+      let codexExecutableURL = try requireCodexExecutable()
       try workflow(
         workspaceDirectory: workspaceDirectory,
-        codexHomeDirectory: codexHomeDirectory
+        codexHomeDirectory: codexHomeDirectory,
+        codexExecutableURL: codexExecutableURL
       ).write(
         to: workflowURL,
         atomically: true,
@@ -274,9 +282,14 @@ public actor NamespaceDaemonSupervisor {
     }
   }
 
-  private func workflow(workspaceDirectory: URL, codexHomeDirectory: URL) -> String {
+  private func workflow(
+    workspaceDirectory: URL,
+    codexHomeDirectory: URL,
+    codexExecutableURL: URL
+  ) -> String {
     let escapedWorkspacePath = yamlSingleQuoted(workspaceDirectory.path)
     let escapedCodexHomePath = shellSingleQuoted(codexHomeDirectory.path)
+    let escapedCodexExecutablePath = shellSingleQuoted(codexExecutableURL.path)
     return """
       ---
       tracker:
@@ -284,11 +297,21 @@ public actor NamespaceDaemonSupervisor {
       workspace:
         root: '\(escapedWorkspacePath)'
       codex:
-        command: env CODEX_HOME=\(escapedCodexHomePath) codex app-server
+        command: env CODEX_HOME=\(escapedCodexHomePath) \(escapedCodexExecutablePath) app-server
       ---
 
       This namespace is waiting for a platform connection.
       """
+  }
+
+  private func requireCodexExecutable() throws -> URL {
+    guard let codexExecutableURL else {
+      throw NamespaceDaemonError.codexExecutableNotFound
+    }
+    guard fileManager.isExecutableFile(atPath: codexExecutableURL.path) else {
+      throw NamespaceDaemonError.codexExecutableNotExecutable(codexExecutableURL)
+    }
+    return codexExecutableURL
   }
 
   private func yamlSingleQuoted(_ value: String) -> String {
@@ -347,11 +370,7 @@ public actor NamespaceDaemonSupervisor {
         layout.workflowURL.path,
       ]
     process.currentDirectoryURL = workingDirectoryURL
-    var environment = ProcessInfo.processInfo.environment
-    for credentialName in ["OPENAI_API_KEY", "CODEX_ACCESS_TOKEN", "CODEX_API_KEY", "CODEX_HOME"] {
-      environment.removeValue(forKey: credentialName)
-    }
-    process.environment = environment
+    process.environment = NamespaceProcessEnvironment.sanitized(environment)
     process.standardOutput = output
     process.standardError = errorOutput
     let terminationDelivery = self.terminationDelivery
@@ -563,6 +582,8 @@ public struct NamespaceDaemonStopAllError: LocalizedError, Sendable {
 public enum NamespaceDaemonError: LocalizedError, Sendable {
   case executableNotFound
   case executableNotExecutable(URL)
+  case codexExecutableNotFound
+  case codexExecutableNotExecutable(URL)
   case runtimePreparationFailed
   case endpointUnavailable
   case launchFailed
@@ -575,6 +596,10 @@ public enum NamespaceDaemonError: LocalizedError, Sendable {
       "The Symphony daemon executable could not be found. Reinstall the application and try again."
     case .executableNotExecutable(let url):
       "The Symphony daemon at \(url.path) is not executable. Reinstall the application and try again."
+    case .codexExecutableNotFound:
+      "The Codex CLI could not be found. Install Codex and try again."
+    case .codexExecutableNotExecutable(let url):
+      "The Codex CLI at \(url.path) is not executable. Reinstall Codex and try again."
     case .runtimePreparationFailed:
       "The namespace runtime could not be prepared. Check disk space and permissions, then try again."
     case .endpointUnavailable:

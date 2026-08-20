@@ -7,6 +7,7 @@ protocol CodexAuthenticating: Sendable {
   func refresh(namespaceID: Namespace.ID, namespaceDirectory: URL) async
   func signIn(namespaceID: Namespace.ID, namespaceDirectory: URL) async
   func signOut(namespaceID: Namespace.ID, namespaceDirectory: URL) async
+  func cancelAll() async throws
 }
 
 @MainActor
@@ -17,7 +18,6 @@ final class CodexAuthenticationController: ObservableObject {
   private let directoryURL: @Sendable (Namespace.ID) -> URL
   private var eventStreamTask: Task<AsyncStream<CodexAuthenticationEvent>, Never>?
   private var observationTask: Task<Void, Never>?
-  private var operations: [Namespace.ID: (generation: UUID, task: Task<Void, Never>)] = [:]
 
   init(
     authenticator: any CodexAuthenticating,
@@ -30,9 +30,6 @@ final class CodexAuthenticationController: ObservableObject {
   deinit {
     eventStreamTask?.cancel()
     observationTask?.cancel()
-    for operation in operations.values {
-      operation.task.cancel()
-    }
   }
 
   func startObserving() async {
@@ -67,74 +64,29 @@ final class CodexAuthenticationController: ObservableObject {
 
   func refresh(_ namespaceID: Namespace.ID) async {
     await startObserving()
-    let directory = directoryURL(namespaceID)
-    await replaceOperation(for: namespaceID) { [authenticator] in
-      await authenticator.refresh(
-        namespaceID: namespaceID,
-        namespaceDirectory: directory
-      )
-    }
+    await authenticator.refresh(
+      namespaceID: namespaceID,
+      namespaceDirectory: directoryURL(namespaceID)
+    )
   }
 
   func signIn(_ namespaceID: Namespace.ID) async {
     await startObserving()
-    let directory = directoryURL(namespaceID)
-    await replaceOperation(for: namespaceID) { [authenticator] in
-      await authenticator.signIn(
-        namespaceID: namespaceID,
-        namespaceDirectory: directory
-      )
-    }
+    await authenticator.signIn(
+      namespaceID: namespaceID,
+      namespaceDirectory: directoryURL(namespaceID)
+    )
   }
 
   func signOut(_ namespaceID: Namespace.ID) async {
     await startObserving()
-    let directory = directoryURL(namespaceID)
-    await replaceOperation(for: namespaceID) { [authenticator] in
-      await authenticator.signOut(
-        namespaceID: namespaceID,
-        namespaceDirectory: directory
-      )
-    }
+    await authenticator.signOut(
+      namespaceID: namespaceID,
+      namespaceDirectory: directoryURL(namespaceID)
+    )
   }
 
-  func cancel(_ namespaceID: Namespace.ID) async {
-    guard let operation = operations[namespaceID] else {
-      return
-    }
-    operation.task.cancel()
-    await operation.task.value
-    if operations[namespaceID]?.generation == operation.generation {
-      operations.removeValue(forKey: namespaceID)
-    }
-  }
-
-  func cancelAll() async {
-    let activeOperations = operations
-    for operation in activeOperations.values {
-      operation.task.cancel()
-    }
-    for (namespaceID, operation) in activeOperations {
-      await operation.task.value
-      if operations[namespaceID]?.generation == operation.generation {
-        operations.removeValue(forKey: namespaceID)
-      }
-    }
-  }
-
-  private func replaceOperation(
-    for namespaceID: Namespace.ID,
-    with operation: @escaping @MainActor () async -> Void
-  ) async {
-    await cancel(namespaceID)
-    let generation = UUID()
-    let task = Task { @MainActor in
-      await operation()
-    }
-    operations[namespaceID] = (generation, task)
-    await task.value
-    if operations[namespaceID]?.generation == generation {
-      operations.removeValue(forKey: namespaceID)
-    }
+  func cancelAll() async throws {
+    try await authenticator.cancelAll()
   }
 }

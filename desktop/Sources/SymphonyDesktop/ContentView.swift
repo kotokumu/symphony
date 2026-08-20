@@ -37,7 +37,7 @@ struct ContentView: View {
     }
     .onDisappear {
       Task {
-        await authenticationController.cancelAll()
+        try? await authenticationController.cancelAll()
         try? await daemonController.stopAll()
       }
     }

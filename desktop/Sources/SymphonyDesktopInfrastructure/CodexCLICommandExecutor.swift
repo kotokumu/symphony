@@ -5,15 +5,24 @@ public actor CodexCLICommandExecutor: CodexCommandExecuting {
   private let executableURL: URL?
   private let fileManager: FileManager
   private let environment: [String: String]
+  private let gracefulStopTimeout: TimeInterval
+  private let forcedStopTimeout: TimeInterval
+  private let forceKill: @Sendable (Int32) -> Int32
 
   public init(
     executableURL: URL?,
     fileManager: FileManager = .default,
-    environment: [String: String] = ProcessInfo.processInfo.environment
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    gracefulStopTimeout: TimeInterval = 2,
+    forcedStopTimeout: TimeInterval = 2,
+    forceKill: @escaping @Sendable (Int32) -> Int32 = { Darwin.kill($0, SIGKILL) }
   ) {
     self.executableURL = executableURL
     self.fileManager = fileManager
     self.environment = environment
+    self.gracefulStopTimeout = gracefulStopTimeout
+    self.forcedStopTimeout = forcedStopTimeout
+    self.forceKill = forceKill
   }
 
   public func execute(_ invocation: CodexCommandInvocation) async throws -> CodexCommandResult {
@@ -25,12 +34,10 @@ public actor CodexCLICommandExecutor: CodexCommandExecuting {
     let output = Pipe()
     process.executableURL = executableURL
     process.arguments = invocation.arguments
-    var commandEnvironment = environment
-    for credentialName in ["OPENAI_API_KEY", "CODEX_ACCESS_TOKEN", "CODEX_API_KEY"] {
-      commandEnvironment.removeValue(forKey: credentialName)
-    }
-    commandEnvironment["CODEX_HOME"] = invocation.codexHome.path
-    process.environment = commandEnvironment
+    process.environment = NamespaceProcessEnvironment.sanitized(
+      environment,
+      codexHome: invocation.codexHome
+    )
     process.standardOutput = output
     process.standardError = output
 
@@ -40,31 +47,24 @@ public actor CodexCLICommandExecutor: CodexCommandExecuting {
       throw CodexCLIError.launchFailed
     }
 
-    return try await withTaskCancellationHandler {
-      async let outputData = Task.detached {
-        output.fileHandleForReading.readDataToEndOfFile()
-      }.value
-      let status = await Task.detached {
-        process.waitUntilExit()
-        return process.terminationStatus
-      }.value
-      let data = await outputData
-      try Task.checkCancellation()
-      return CodexCommandResult(
-        status: status,
-        output: String(decoding: data, as: UTF8.self)
-      )
-    } onCancel: {
-      if process.isRunning {
-        process.terminate()
-        let processIdentifier = process.processIdentifier
-        DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
-          if process.isRunning {
-            Darwin.kill(processIdentifier, SIGKILL)
-          }
-        }
-      }
+    let outputReader = Task.detached {
+      output.fileHandleForReading.readDataToEndOfFile()
     }
+    do {
+      while process.isRunning {
+        try await Task.sleep(for: .milliseconds(25))
+      }
+      try Task.checkCancellation()
+    } catch is CancellationError {
+      try await terminate(process)
+      _ = await outputReader.value
+      throw CancellationError()
+    }
+    let data = await outputReader.value
+    return CodexCommandResult(
+      status: process.terminationStatus,
+      output: String(decoding: data, as: UTF8.self)
+    )
   }
 
   private func requireExecutable() throws -> URL {
@@ -89,6 +89,32 @@ public actor CodexCLICommandExecutor: CodexCommandExecuting {
       throw CodexCLIError.homePreparationFailed
     }
   }
+
+  private func terminate(_ process: Process) async throws {
+    guard process.isRunning else {
+      return
+    }
+    process.terminate()
+    if await waitForExit(process, timeout: gracefulStopTimeout) {
+      return
+    }
+    guard forceKill(process.processIdentifier) == 0 else {
+      throw CodexCLIError.stopFailed
+    }
+    guard await waitForExit(process, timeout: forcedStopTimeout) else {
+      throw CodexCLIError.stopFailed
+    }
+  }
+
+  private func waitForExit(_ process: Process, timeout: TimeInterval) async -> Bool {
+    let deadline = Date().addingTimeInterval(timeout)
+    while process.isRunning, Date() < deadline {
+      _ = await Task.detached {
+        Darwin.usleep(25_000)
+      }.value
+    }
+    return !process.isRunning
+  }
 }
 
 public enum CodexCLIError: LocalizedError, Sendable {
@@ -96,6 +122,7 @@ public enum CodexCLIError: LocalizedError, Sendable {
   case executableNotExecutable(URL)
   case homePreparationFailed
   case launchFailed
+  case stopFailed
 
   public var errorDescription: String? {
     switch self {
@@ -107,6 +134,8 @@ public enum CodexCLIError: LocalizedError, Sendable {
       "The namespace Codex home could not be prepared. Check disk space and permissions, then try again."
     case .launchFailed:
       "The Codex CLI could not be launched. Reinstall Codex and try again."
+    case .stopFailed:
+      "The Codex authentication process could not be stopped safely. Try again before deleting the namespace or quitting."
     }
   }
 }
