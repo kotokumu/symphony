@@ -28,7 +28,9 @@ struct ContentView: View {
       }
     }
     .task {
-      githubConnectionController.resumeAfterSecurityOperation()
+      if await windowSecurityCoordinator.waitUntilSafeToResumeAdmission() {
+        githubConnectionController.resumeAfterSecurityOperation()
+      }
       await daemonController.startObserving()
       await authenticationController.startObserving()
       if controller.loadState == .loading {
@@ -43,6 +45,11 @@ struct ContentView: View {
     }
     .onDisappear {
       windowSecurityCoordinator.secureAfterWindowCloses()
+    }
+    .onChange(of: windowSecurityCoordinator.state) { state in
+      if state == .idle {
+        githubConnectionController.resumeAfterSecurityOperation()
+      }
     }
     .sheet(item: $editor) { context in
       NamespaceEditorSheet(context: context) { name in

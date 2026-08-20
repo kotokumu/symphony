@@ -7,6 +7,31 @@ import XCTest
 
 @MainActor
 final class GitHubConnectionControllerTests: XCTestCase {
+  func testInvalidAppIDsHaveNoCredentialOrLedgerSideEffects() async {
+    let invalidValues = ["", "abc", "0", "-1", "9223372036854775808"]
+    for value in invalidValues {
+      let namespaceID = UUID()
+      let broker = RecordingGitHubConnectionBroker()
+      let cleanup = RecordingGitHubCredentialCleanup()
+      let controller = GitHubConnectionController(broker: broker, credentialCleanup: cleanup)
+
+      await controller.beginConnection(
+        namespaceID: namespaceID,
+        appIDText: value,
+        privateKeyFileURL: URL(fileURLWithPath: "/private/key.pem")
+      )
+
+      guard case .failed(let message) = controller.state(for: namespaceID) else {
+        return XCTFail("Expected invalid App ID failure for \(value)")
+      }
+      XCTAssertTrue(message.contains("numeric GitHub App ID"))
+      let configured = await broker.configured
+      let started = await cleanup.started
+      XCTAssertTrue(configured.isEmpty)
+      XCTAssertTrue(started.isEmpty)
+    }
+  }
+
   func testConnectsOneNamespaceThroughInstallationAndRepositorySelection() async throws {
     let namespaceID = UUID()
     let broker = RecordingGitHubConnectionBroker()

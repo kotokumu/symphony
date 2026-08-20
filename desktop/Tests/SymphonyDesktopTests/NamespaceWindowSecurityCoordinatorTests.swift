@@ -1,6 +1,8 @@
+import Foundation
 import XCTest
 
 @testable import SymphonyDesktop
+@testable import SymphonyDesktopCore
 
 @MainActor
 final class NamespaceWindowSecurityCoordinatorTests: XCTestCase {
@@ -74,6 +76,73 @@ final class NamespaceWindowSecurityCoordinatorTests: XCTestCase {
     let afterRelease = await shutdownStarted.values
     XCTAssertEqual(afterRelease, ["shutdown"])
   }
+
+  func testReopenWaitsForActiveWindowSecurityBeforeResumingGitHubAdmission() async throws {
+    let gate = WindowSecurityGate()
+    let github = GitHubConnectionController(
+      broker: WindowTestGitHubBroker(),
+      credentialCleanup: WindowTestGitHubCleanup()
+    )
+    try await github.quiesceAll()
+    let coordinator = NamespaceWindowSecurityCoordinator(
+      lockCredentials: { await gate.wait() },
+      cancelAuthentication: {},
+      stopDaemons: {}
+    )
+    coordinator.secureAfterWindowCloses()
+    await gate.waitUntilEntered()
+
+    let reopen = Task { @MainActor in
+      if await coordinator.waitUntilSafeToResumeAdmission() {
+        github.resumeAfterSecurityOperation()
+      }
+    }
+    let blockedNamespace = UUID()
+    await github.beginConnection(
+      namespaceID: blockedNamespace,
+      appIDText: "10",
+      privateKeyFileURL: URL(fileURLWithPath: "/private/key.pem")
+    )
+    XCTAssertEqual(github.state(for: blockedNamespace), .idle)
+
+    await gate.open()
+    await reopen.value
+    await github.beginConnection(
+      namespaceID: blockedNamespace,
+      appIDText: "10",
+      privateKeyFileURL: URL(fileURLWithPath: "/private/key.pem")
+    )
+    guard case .choosingInstallation = github.state(for: blockedNamespace) else {
+      return XCTFail("Expected admission after window security completed")
+    }
+  }
+}
+
+private actor WindowTestGitHubBroker: GitHubConnectionBrokering {
+  func configureGitHubApp(appID: Int64, privateKeyFileURL: URL, namespaceID: UUID) {}
+
+  func discoverGitHubInstallations(namespaceID: UUID) -> [GitHubInstallation] {
+    [
+      GitHubInstallation(
+        id: 20,
+        accountLogin: "octo",
+        accountType: "Organization",
+        permissions: ["issues": "read", "contents": "write"],
+        isSuspended: false
+      )
+    ]
+  }
+
+  func discoverGitHubRepositories(
+    installationID: Int64,
+    namespaceID: UUID
+  ) -> [GitHubRepository] { [] }
+}
+
+private actor WindowTestGitHubCleanup: GitHubCredentialCleaning {
+  func setupStarted(_ namespaceID: UUID) {}
+  func cleanup(_ namespaceID: UUID) -> String? { nil }
+  func connectionCommitted(_ namespaceID: UUID) {}
 }
 
 private actor SecurityOperationRecorder {
