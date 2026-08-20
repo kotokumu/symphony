@@ -296,7 +296,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       repositoryURL: scope.repositoryURL,
       brokerRepositoryURL: proxy?.repositoryURL
     )
-    var processEnvironment = isolated.environment
+    let processEnvironment = isolated.environment
     let processReference: GitProcessReference
     var launchedReference: GitProcessReference?
     var watchdog: GitLifetimeWatchdog?
@@ -646,7 +646,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
   ) throws -> [String] {
     let writeRoot = try authority.descriptorBoundPath()
     let temporaryRoot = try Self.descriptorBoundPath(temporaryDescriptor)
-    [
+    return [
       "-D", "WRITE_ROOT=\(writeRoot)",
       "-D", "TEMP_ROOT=\(temporaryRoot)",
       "-D", "GIT_EXECUTABLE=\(gitExecutableURL.path)",
@@ -755,13 +755,13 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     var argumentPointers = arguments.map { strdup($0) }
     var environmentPointers = environment.map { strdup("\($0.key)=\($0.value)") }
     guard argumentPointers.allSatisfy({ $0 != nil }), environmentPointers.allSatisfy({ $0 != nil }) else {
-      argumentPointers.compactMap { $0 }.forEach(free)
-      environmentPointers.compactMap { $0 }.forEach(free)
+      argumentPointers.compactMap { $0 }.forEach { free(UnsafeMutableRawPointer($0)) }
+      environmentPointers.compactMap { $0 }.forEach { free(UnsafeMutableRawPointer($0)) }
       throw GitCommandRunnerError.launchFailed
     }
     defer {
-      argumentPointers.compactMap { $0 }.forEach(free)
-      environmentPointers.compactMap { $0 }.forEach(free)
+      argumentPointers.compactMap { $0 }.forEach { free(UnsafeMutableRawPointer($0)) }
+      environmentPointers.compactMap { $0 }.forEach { free(UnsafeMutableRawPointer($0)) }
     }
     argumentPointers.append(nil)
     environmentPointers.append(nil)
@@ -1062,6 +1062,15 @@ private final class GitExecutionAuthority: @unchecked Sendable {
   deinit { Darwin.close(descriptor) }
 }
 
+private final class LockedValue<Value>: @unchecked Sendable {
+  private let lock = NSLock()
+  private var storage: Value
+
+  init(_ value: Value) { storage = value }
+  var value: Value { lock.withLock { storage } }
+  func set(_ value: Value) { lock.withLock { storage = value } }
+}
+
 final class GitHubConnectProxy: @unchecked Sendable {
   let port: UInt16
   let repositoryURL: URL
@@ -1285,12 +1294,11 @@ final class GitHubConnectProxy: @unchecked Sendable {
   private func connectToGitHub() -> NWConnection? {
     let connection = NWConnection(host: "github.com", port: 443, using: .tls)
     let semaphore = DispatchSemaphore(value: 0)
-    let stateLock = NSLock()
-    var ready = false
+    let ready = LockedValue(false)
     connection.stateUpdateHandler = { state in
       switch state {
       case .ready:
-        stateLock.withLock { ready = true }
+        ready.set(true)
         semaphore.signal()
       case .failed, .cancelled:
         semaphore.signal()
@@ -1300,7 +1308,7 @@ final class GitHubConnectProxy: @unchecked Sendable {
     }
     connection.start(queue: DispatchQueue.global(qos: .userInitiated))
     guard semaphore.wait(timeout: .now() + .seconds(5)) == .success,
-      stateLock.withLock({ ready })
+      ready.value
     else {
       connection.cancel()
       return nil
@@ -1350,16 +1358,13 @@ final class GitHubConnectProxy: @unchecked Sendable {
     let deadline = ContinuousClock.now.advanced(by: .seconds(30))
     while ContinuousClock.now < deadline, !lock.withLock({ stopped }) {
       let semaphore = DispatchSemaphore(value: 0)
-      var received: Data?
-      var complete = false
-      var failed = false
+      let result = LockedValue<(Data?, Bool, Bool)>((nil, false, false))
       upstream.receive(minimumIncompleteLength: 1, maximumLength: 16_384) { data, _, isComplete, error in
-        received = data
-        complete = isComplete
-        failed = error != nil
+        result.set((data, isComplete, error != nil))
         semaphore.signal()
       }
       guard semaphore.wait(timeout: .now() + .milliseconds(500)) == .success else { continue }
+      let (received, complete, failed) = result.value
       if let received, !sendAll(received, to: client) { return }
       if complete || failed { return }
     }
@@ -1367,12 +1372,12 @@ final class GitHubConnectProxy: @unchecked Sendable {
 
   private func send(_ data: Data, to connection: NWConnection) -> Bool {
     let semaphore = DispatchSemaphore(value: 0)
-    var succeeded = false
+    let succeeded = LockedValue(false)
     connection.send(content: data, completion: .contentProcessed { error in
-      succeeded = error == nil
+      succeeded.set(error == nil)
       semaphore.signal()
     })
-    return semaphore.wait(timeout: .now() + .seconds(5)) == .success && succeeded
+    return semaphore.wait(timeout: .now() + .seconds(5)) == .success && succeeded.value
   }
 
   private func sendAll(_ data: Data, to descriptor: Int32) -> Bool {
@@ -1531,8 +1536,9 @@ private final class GitProcessReference: @unchecked Sendable {
       usleep(1_000)
     }
     guard let status = stateLock.withLock({ waitedStatus }) else { return 1 }
-    if WIFEXITED(status) { return WEXITSTATUS(status) }
-    if WIFSIGNALED(status) { return 128 + WTERMSIG(status) }
+    let terminationSignal = status & 0x7f
+    if terminationSignal == 0 { return (status >> 8) & 0xff }
+    if terminationSignal != 0x7f { return 128 + terminationSignal }
     return 1
   }
   func terminateGroup(_ signal: Int32) {
