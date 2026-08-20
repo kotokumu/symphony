@@ -60,4 +60,25 @@ public final class SecureSecretBuffer: @unchecked Sendable {
       Array(UnsafeRawBufferPointer(start: pointer, count: capacity))
     }
   }
+
+  func redacting(_ value: Data) -> Data {
+    withTemporaryData { secret in
+      guard !secret.isEmpty else { return value }
+      let token = String(decoding: secret, as: UTF8.self)
+      let patterns = [
+        secret,
+        Data(secret.base64EncodedString().utf8),
+        Data(secret.map { String(format: "%02x", $0) }.joined().utf8),
+        Data(Data("x-access-token:\(token)".utf8).base64EncodedString().utf8),
+      ]
+      var result = value
+      let replacement = Data("[REDACTED]".utf8)
+      for pattern in patterns where !pattern.isEmpty {
+        while let range = result.range(of: pattern) {
+          result.replaceSubrange(range, with: replacement)
+        }
+      }
+      return result
+    }
+  }
 }

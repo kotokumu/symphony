@@ -159,6 +159,38 @@ public actor NamespaceCredentialBroker {
     }
   }
 
+  public func authorizeGitHubRepository(
+    connection: GitHubConnection,
+    workspacesRoot: URL,
+    namespaceID: Namespace.ID
+  ) async throws {
+    let session = try availableSession(namespaceID)
+    try await session.authorizeGitHubRepository(
+      GitHubRepositoryAuthorization(
+        appID: connection.appID,
+        installationID: connection.installationID,
+        repositoryID: connection.repositoryID,
+        repositoryFullName: connection.repositoryFullName,
+        repositoryURL: connection.repositoryURL,
+        workspacesRoot: workspacesRoot
+      )
+    )
+  }
+
+  public func performGitHubIssueRequest(
+    _ request: GitHubIssueCapabilityRequest,
+    namespaceID: Namespace.ID
+  ) async throws -> GitHubIssueCapabilityResponse {
+    try await availableSession(namespaceID).performGitHubIssueRequest(request)
+  }
+
+  public func performGitHubGitOperation(
+    _ request: GitRepositoryCapabilityRequest,
+    namespaceID: Namespace.ID
+  ) async throws -> GitRepositoryCapabilityResult {
+    try await availableSession(namespaceID).performGitHubGitOperation(request)
+  }
+
   public func lockAll() async throws {
     startSuspensionCount += 1
     defer { startSuspensionCount -= 1 }

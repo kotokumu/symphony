@@ -12,6 +12,7 @@ public actor NamespaceCredentialSession {
   private let storage: any NamespaceCredentialStoring
   private let credentialGenerator: CredentialGenerator
   private let githubAPI: any GitHubAppAPIRequesting
+  private let githubAccess: NamespaceGitHubAccessSession
   private var authorization: NamespaceUnlockAuthorization?
   private var credential: SecureSecretBuffer?
 
@@ -27,6 +28,24 @@ public actor NamespaceCredentialSession {
     self.storage = storage
     self.credentialGenerator = credentialGenerator
     self.githubAPI = githubAPI
+    githubAccess = NamespaceGitHubAccessSession(api: GitHubAppAPIClient())
+  }
+
+  init(
+    namespaceID: UUID,
+    authorizer: any NamespaceUnlockAuthorizing,
+    storage: any NamespaceCredentialStoring,
+    credentialGenerator: @escaping CredentialGenerator,
+    githubAPI: any GitHubAppAPIRequesting,
+    githubRepositoryAPI: any GitHubRepositoryAPIRequesting,
+    now: @escaping @Sendable () -> Date
+  ) {
+    self.namespaceID = namespaceID
+    self.authorizer = authorizer
+    self.storage = storage
+    self.credentialGenerator = credentialGenerator
+    self.githubAPI = githubAPI
+    githubAccess = NamespaceGitHubAccessSession(api: githubRepositoryAPI, now: now)
   }
 
   deinit {
@@ -70,15 +89,17 @@ public actor NamespaceCredentialSession {
     }
   }
 
-  public func lock() {
+  public func lock() async throws {
+    try await githubAccess.stopRetainedGitOperation()
+    await githubAccess.clear()
     credential?.clear()
     credential = nil
     authorization?.invalidate()
     authorization = nil
   }
 
-  public func removeStoredCredential() throws {
-    lock()
+  public func removeStoredCredential() async throws {
+    try await lock()
     try storage.removeAll(namespaceID: namespaceID)
   }
 
@@ -96,10 +117,11 @@ public actor NamespaceCredentialSession {
     }
   }
 
-  public func configureGitHubApp(appID: Int64, privateKeyFilePath: String) throws {
+  public func configureGitHubApp(appID: Int64, privateKeyFilePath: String) async throws {
     guard let authorization, credential != nil else {
       throw NamespaceCredentialSessionError.locked
     }
+    await githubAccess.clear()
     var pemData = try Self.readPrivateKey(at: privateKeyFilePath)
     defer { pemData.resetBytes(in: pemData.startIndex..<pemData.endIndex) }
     var githubCredential = try StoredGitHubAppCredential(appID: appID, pemData: pemData)
@@ -134,8 +156,30 @@ public actor NamespaceCredentialSession {
     return try await githubAPI.listRepositories(installationID: installationID, jwt: jwt)
   }
 
+  public func authorizeGitHubRepository(
+    _ authorization: GitHubRepositoryAuthorization
+  ) async throws {
+    try await githubAccess.authorize(authorization, storedAppID: try githubCredentialAppID())
+  }
+
+  public func performGitHubIssueRequest(
+    _ request: GitHubIssueCapabilityRequest
+  ) async throws -> GitHubIssueCapabilityResponse {
+    try await githubAccess.performIssueRequest(request, jwt: githubJWT())
+  }
+
+  public func performGitHubGitOperation(
+    _ request: GitRepositoryCapabilityRequest
+  ) async throws -> GitRepositoryCapabilityResult {
+    try await githubAccess.performGitOperation(request, jwt: githubJWT())
+  }
+
   var retainedByteCount: Int {
     credential?.retainedByteCount ?? 0
+  }
+
+  var retainedInstallationTokenByteCount: Int {
+    get async { await githubAccess.retainedTokenByteCount }
   }
 
   public static func randomCredential() throws -> SecureSecretBuffer {
@@ -158,6 +202,15 @@ public actor NamespaceCredentialSession {
       var githubCredential = try StoredGitHubAppCredential.decode(from: data)
       defer { githubCredential.clear() }
       return try githubCredential.makeJWT()
+    }
+  }
+
+  private func githubCredentialAppID() throws -> Int64 {
+    guard let credential else { throw NamespaceCredentialSessionError.locked }
+    return try credential.withTemporaryData { data in
+      var githubCredential = try StoredGitHubAppCredential.decode(from: data)
+      defer { githubCredential.clear() }
+      return githubCredential.appID
     }
   }
 

@@ -5,6 +5,28 @@ import XCTest
 @testable import SymphonyDesktopCore
 @testable import SymphonyDesktopInfrastructure
 
+private extension NamespaceCredentialBrokerSessionHandle {
+  func authorizeGitHubRepository(_ authorization: GitHubRepositoryAuthorization) async throws {
+    throw TestBrokerCapabilityError.unsupported
+  }
+
+  func performGitHubIssueRequest(
+    _ request: GitHubIssueCapabilityRequest
+  ) async throws -> GitHubIssueCapabilityResponse {
+    throw TestBrokerCapabilityError.unsupported
+  }
+
+  func performGitHubGitOperation(
+    _ request: GitRepositoryCapabilityRequest
+  ) async throws -> GitRepositoryCapabilityResult {
+    throw TestBrokerCapabilityError.unsupported
+  }
+}
+
+private enum TestBrokerCapabilityError: Error {
+  case unsupported
+}
+
 final class NamespaceCredentialBrokerTests: XCTestCase {
   func testLockingOneNamespaceLeavesAnotherSessionUnlocked() async throws {
     let first = UUID()

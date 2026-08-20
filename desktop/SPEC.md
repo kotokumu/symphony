@@ -126,9 +126,34 @@ setup requires the namespace to be unlocked.
 The GitHub App private key is imported and used through the protected credential boundary. Symphony
 Desktop does not read or return the private key. GitHub App authentication and installation-token
 use during connection discovery remain inside that boundary. The connection is accepted only when
-the installation is active, can read issues, can write repository contents, and can access the
+the installation is active, can read and write issues and repository contents, and can access the
 selected repository. Missing permissions, suspended or revoked installations, inaccessible
 repositories, rejected credentials, and GitHub service failures produce actionable errors.
+
+After the namespace is unlocked, Symphony can list issues, read an issue and its comments, add an
+issue comment, and open or close an issue in the selected repository. Requests for another
+installation or repository, unsupported GitHub operations, and malformed or oversized requests are
+rejected before GitHub credentials are used. Read requests recover once from an expired credential.
+Issue mutations are not repeated automatically after dispatch because their effect may already have
+occurred.
+
+Symphony mints repository-scoped installation credentials inside the protected credential boundary.
+It reuses an unexpired credential only in protected process memory and refreshes it before expiry.
+The credential is cleared when access is rejected, the namespace is locked, or the broker exits. It
+is not returned to the desktop application, daemon, or Codex and is not written to namespace files,
+repository configuration, process arguments, environment variables, or logs.
+
+Symphony can clone the selected repository into a new namespace workspace and fetch or push that
+repository over HTTPS. Fetch and push reject repositories outside the namespace workspace,
+repositories whose origin does not match the selected repository, unsafe Git configuration, and
+unsupported push destinations. Git receives its short-lived credential through an operation-scoped
+credential helper. Repository URLs and configuration remain credential-free. A failed clone removes
+the partial workspace when its identity is still safe to prove; otherwise Symphony reports that
+cleanup is required before access can resume.
+
+Locking protected credentials stops active GitHub and Git access, cancels queued access, clears
+short-lived credentials, and prevents replacement access until owned processes have exited. A stop
+failure remains retryable through the namespace lock operation.
 
 The selected app identity, installation, account, and repository remain associated with the
 namespace's stable identity across application restarts and namespace renames. Stored private-key

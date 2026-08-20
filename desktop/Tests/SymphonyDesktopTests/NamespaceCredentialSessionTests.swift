@@ -27,7 +27,7 @@ final class NamespaceCredentialSessionTests: XCTestCase {
     XCTAssertEqual(retainedByteCount, 4)
     XCTAssertEqual(reasons, ["Test unlock"])
 
-    await session.lock()
+    try await session.lock()
 
     let lockedByteCount = await session.retainedByteCount
     XCTAssertEqual(lockedByteCount, 0)
@@ -120,7 +120,7 @@ final class NamespaceCredentialSessionTests: XCTestCase {
     XCTAssertEqual(signature, expected)
     XCTAssertNotEqual(signature, storedCredential)
 
-    await session.lock()
+    try await session.lock()
     do {
       _ = try await session.signChallenge(challenge)
       XCTFail("Expected locked capability error")

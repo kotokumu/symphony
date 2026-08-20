@@ -269,6 +269,71 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
     try await session.lock()
   }
 
+  func testScopedRepositoryCapabilitiesUseClosedBrokerFrames() async throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let authorizationURL = directory.appendingPathComponent("authorization")
+    let issueURL = directory.appendingPathComponent("issue")
+    let gitURL = directory.appendingPathComponent("git")
+    let script = try executableScript(
+      in: directory,
+      contents: """
+        #!/bin/sh
+        printf '{"status":"unlocked"}\n'
+        IFS= read -r authorization
+        printf '%s' "$authorization" > "$BROKER_AUTHORIZATION_FILE"
+        printf '{"status":"githubRepositoryAuthorized"}\n'
+        IFS= read -r issue
+        printf '%s' "$issue" > "$BROKER_ISSUE_FILE"
+        printf '{"status":"githubIssueResponse","githubIssueResponse":{"status":200,"body":"e30="}}\n'
+        IFS= read -r git
+        printf '%s' "$git" > "$BROKER_GIT_FILE"
+        printf '{"status":"githubGitResult","githubGitResult":{"exitStatus":0,"output":"ok","wasTruncated":false}}\n'
+        IFS= read -r lock_command
+        """
+    )
+    let launcher = CredentialBrokerProcessLauncher(
+      executableURL: script,
+      handshakeTimeout: 1,
+      stopTimeout: 1,
+      environment: [
+        "PATH": "/usr/bin:/bin",
+        "BROKER_AUTHORIZATION_FILE": authorizationURL.path,
+        "BROKER_ISSUE_FILE": issueURL.path,
+        "BROKER_GIT_FILE": gitURL.path,
+      ]
+    )
+    let session = try await launcher.unlock(namespaceID: UUID())
+    let authorization = GitHubRepositoryAuthorization(
+      appID: 10,
+      installationID: 20,
+      repositoryID: 30,
+      repositoryFullName: "octo/repo",
+      repositoryURL: URL(string: "https://github.com/octo/repo")!,
+      workspacesRoot: URL(fileURLWithPath: "/private/workspaces")
+    )
+
+    try await session.authorizeGitHubRepository(authorization)
+    let issue = try await session.performGitHubIssueRequest(.getIssue(issueNumber: 7))
+    let git = try await session.performGitHubGitOperation(.clone(targetName: "issue-7"))
+
+    XCTAssertEqual(issue.body, Data("{}".utf8))
+    XCTAssertEqual(git.output, "ok")
+    XCTAssertEqual(
+      try JSONDecoder().decode(CredentialBrokerCommand.self, from: Data(contentsOf: authorizationURL)),
+      .authorizeGitHubRepository(authorization)
+    )
+    XCTAssertEqual(
+      try JSONDecoder().decode(CredentialBrokerCommand.self, from: Data(contentsOf: issueURL)),
+      .performGitHubIssueRequest(.getIssue(issueNumber: 7))
+    )
+    XCTAssertEqual(
+      try JSONDecoder().decode(CredentialBrokerCommand.self, from: Data(contentsOf: gitURL)),
+      .performGitHubGitOperation(.clone(targetName: "issue-7"))
+    )
+    try await session.lock()
+  }
+
   func testGitHubCapabilityRejectsFailedWrongAndMalformedFrames() async throws {
     let responses = [
       ("{\"status\":\"failed\",\"message\":\"Installation revoked.\"}", "Installation revoked."),

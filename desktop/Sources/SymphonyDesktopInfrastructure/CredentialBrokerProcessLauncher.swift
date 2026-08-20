@@ -15,6 +15,13 @@ public protocol GitHubCredentialBrokerSessionHandle: Sendable {
   func listGitHubRepositories(
     installationID: Int64
   ) async throws -> [GitHubRepositoryDescriptor]
+  func authorizeGitHubRepository(_ authorization: GitHubRepositoryAuthorization) async throws
+  func performGitHubIssueRequest(
+    _ request: GitHubIssueCapabilityRequest
+  ) async throws -> GitHubIssueCapabilityResponse
+  func performGitHubGitOperation(
+    _ request: GitRepositoryCapabilityRequest
+  ) async throws -> GitRepositoryCapabilityResult
 }
 
 public protocol NamespaceCredentialBrokerSessionHandle:
@@ -229,6 +236,69 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
     ) {
     case .githubRepositories(let repositories):
       return repositories
+    case .failed(let message):
+      throw CredentialBrokerProcessError.capabilityFailed(message)
+    default:
+      throw CredentialBrokerProcessError.invalidCapabilityResponse
+    }
+  }
+
+  fileprivate func authorizeGitHubRepository(
+    _ authorization: GitHubRepositoryAuthorization,
+    namespaceID: Namespace.ID,
+    generation: UUID
+  ) async throws {
+    switch try await perform(
+      .authorizeGitHubRepository(authorization),
+      namespaceID: namespaceID,
+      generation: generation
+    ) {
+    case .githubRepositoryAuthorized:
+      return
+    case .githubCapabilityFailed(let failure):
+      throw GitHubCapabilityError(failure)
+    case .failed(let message):
+      throw CredentialBrokerProcessError.capabilityFailed(message)
+    default:
+      throw CredentialBrokerProcessError.invalidCapabilityResponse
+    }
+  }
+
+  fileprivate func performGitHubIssueRequest(
+    _ request: GitHubIssueCapabilityRequest,
+    namespaceID: Namespace.ID,
+    generation: UUID
+  ) async throws -> GitHubIssueCapabilityResponse {
+    switch try await perform(
+      .performGitHubIssueRequest(request),
+      namespaceID: namespaceID,
+      generation: generation
+    ) {
+    case .githubIssueResponse(let response):
+      return response
+    case .githubCapabilityFailed(let failure):
+      throw GitHubCapabilityError(failure)
+    case .failed(let message):
+      throw CredentialBrokerProcessError.capabilityFailed(message)
+    default:
+      throw CredentialBrokerProcessError.invalidCapabilityResponse
+    }
+  }
+
+  fileprivate func performGitHubGitOperation(
+    _ request: GitRepositoryCapabilityRequest,
+    namespaceID: Namespace.ID,
+    generation: UUID
+  ) async throws -> GitRepositoryCapabilityResult {
+    switch try await perform(
+      .performGitHubGitOperation(request),
+      namespaceID: namespaceID,
+      generation: generation
+    ) {
+    case .githubGitResult(let result):
+      return result
+    case .githubCapabilityFailed(let failure):
+      throw GitHubCapabilityError(failure)
     case .failed(let message):
       throw CredentialBrokerProcessError.capabilityFailed(message)
     default:
@@ -519,6 +589,44 @@ private struct ProcessCredentialBrokerSession: NamespaceCredentialBrokerSessionH
       generation: generation
     )
   }
+
+  func authorizeGitHubRepository(_ authorization: GitHubRepositoryAuthorization) async throws {
+    try await launcher.authorizeGitHubRepository(
+      authorization,
+      namespaceID: namespaceID,
+      generation: generation
+    )
+  }
+
+  func performGitHubIssueRequest(
+    _ request: GitHubIssueCapabilityRequest
+  ) async throws -> GitHubIssueCapabilityResponse {
+    try await launcher.performGitHubIssueRequest(
+      request,
+      namespaceID: namespaceID,
+      generation: generation
+    )
+  }
+
+  func performGitHubGitOperation(
+    _ request: GitRepositoryCapabilityRequest
+  ) async throws -> GitRepositoryCapabilityResult {
+    try await launcher.performGitHubGitOperation(
+      request,
+      namespaceID: namespaceID,
+      generation: generation
+    )
+  }
+}
+
+public struct GitHubCapabilityError: LocalizedError, Equatable, Sendable {
+  public let failure: GitHubCapabilityFailure
+
+  public init(_ failure: GitHubCapabilityFailure) {
+    self.failure = failure
+  }
+
+  public var errorDescription: String? { failure.message }
 }
 
 private final class UnsafeProcessReference: @unchecked Sendable {
