@@ -39,7 +39,7 @@ final class NamespaceSleepLockCoordinator: ObservableObject {
           return
         }
         do {
-          try await lockAll()
+          try await self.lockAll()
           request.allow()
         } catch {
           request.fail()
