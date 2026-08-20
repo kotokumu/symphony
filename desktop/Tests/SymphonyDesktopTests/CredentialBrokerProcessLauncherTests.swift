@@ -86,6 +86,94 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
     }
   }
 
+  func testHandshakeTimeoutCleansUpRuntimeAndAllowsReplacement() async throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let firstAttemptURL = directory.appendingPathComponent("first-attempt")
+    let script = try executableScript(
+      in: directory,
+      contents: """
+        #!/bin/sh
+        if [ ! -e "$BROKER_FIRST_ATTEMPT_FILE" ]; then
+          : > "$BROKER_FIRST_ATTEMPT_FILE"
+          exec /usr/bin/tail -f /dev/null
+        fi
+        printf '{"status":"unlocked"}\n'
+        IFS= read -r lock_command
+        """
+    )
+    let namespaceID = UUID()
+    let launcher = CredentialBrokerProcessLauncher(
+      executableURL: script,
+      handshakeTimeout: 0.05,
+      stopTimeout: 0.1,
+      environment: [
+        "PATH": "/usr/bin:/bin",
+        "BROKER_FIRST_ATTEMPT_FILE": firstAttemptURL.path,
+      ]
+    )
+    let clock = ContinuousClock()
+    let started = clock.now
+
+    do {
+      _ = try await launcher.unlock(namespaceID: namespaceID)
+      XCTFail("Expected handshake timeout")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("unlock timed out"))
+    }
+    XCTAssertLessThan(started.duration(to: clock.now), .seconds(1))
+
+    let replacement = try await launcher.unlock(namespaceID: namespaceID)
+    try await replacement.lock()
+  }
+
+  func testCapabilityTimeoutCleansUpRuntimeAndAllowsReplacement() async throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let firstCapabilityURL = directory.appendingPathComponent("first-capability")
+    let script = try executableScript(
+      in: directory,
+      contents: """
+        #!/bin/sh
+        printf '{"status":"unlocked"}\n'
+        IFS= read -r command
+        if [ ! -e "$BROKER_FIRST_CAPABILITY_FILE" ]; then
+          : > "$BROKER_FIRST_CAPABILITY_FILE"
+          exec /usr/bin/tail -f /dev/null
+        fi
+        printf '{"status":"signature","payload":"AQ=="}\n'
+        IFS= read -r lock_command
+        """
+    )
+    let namespaceID = UUID()
+    let launcher = CredentialBrokerProcessLauncher(
+      executableURL: script,
+      handshakeTimeout: 0.2,
+      capabilityTimeout: 0.05,
+      stopTimeout: 0.1,
+      environment: [
+        "PATH": "/usr/bin:/bin",
+        "BROKER_FIRST_CAPABILITY_FILE": firstCapabilityURL.path,
+      ]
+    )
+    let session = try await launcher.unlock(namespaceID: namespaceID)
+    let clock = ContinuousClock()
+    let started = clock.now
+
+    do {
+      _ = try await session.signChallenge(Data([1]))
+      XCTFail("Expected capability timeout")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("operation timed out"))
+    }
+    XCTAssertLessThan(started.duration(to: clock.now), .seconds(1))
+
+    let replacement = try await launcher.unlock(namespaceID: namespaceID)
+    let signature = try await replacement.signChallenge(Data([1]))
+    XCTAssertEqual(signature, Data([1]))
+    try await replacement.lock()
+  }
+
   func testClosedBrokerInputReturnsAnErrorWithoutTerminatingDesktopProcess() async throws {
     let directory = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
