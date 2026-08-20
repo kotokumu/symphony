@@ -692,6 +692,9 @@ final class GitHubConnectionControllerTests: XCTestCase {
       ["issues": "read", "contents": "read"],
       ["issues": "none", "contents": "write"],
       ["issues": "read", "contents": "write"],
+      ["issues": "write", "contents": "read"],
+      ["issues": "write"],
+      ["contents": "write"],
     ]
     for permissions in rejected {
       XCTAssertThrowsError(try GitHubPermissionRequirements.validate(makeInstallation(permissions)))

@@ -131,7 +131,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     try assertNoCredentialRepresentations("never-print-this-token", under: fixture.root)
   }
 
-  func testRemovesBrokerCreatedPartialCloneAfterFailure() async throws {
+  func testFailedClonePreservesBrokerStagingAndBlocksRetryBeforeCredentialUse() async throws {
     let fixture = try makeFixture()
     let external = fixture.root.appendingPathComponent("external-sentinel")
     try Data("preserve-me".utf8).write(to: external)
@@ -163,12 +163,20 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     } catch let error as GitCommandRunnerError {
       XCTAssertEqual(error.failure.category, .gitFailed)
     }
-    XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent("partial").path))
+    let residue = try findCloneStagingDirectory(in: fixture.root)
+    XCTAssertEqual(try Data(contentsOf: residue.appendingPathComponent("nested/data")), Data("partial".utf8))
     XCTAssertEqual(try Data(contentsOf: external), Data("preserve-me".utf8))
-    XCTAssertFalse(
-      try FileManager.default.contentsOfDirectory(atPath: fixture.root.path)
-        .contains { $0.hasPrefix(".symphony-") }
-    )
+    let credentialRequests = CredentialRequestCounter()
+    do {
+      _ = try await runner.run(.clone(targetName: "retry"), in: fixture.scope) {
+        credentialRequests.increment()
+        return OperationCredential(copying: source)
+      }
+      XCTFail("Expected preserved staging to close admission")
+    } catch let error as GitCommandRunnerError {
+      XCTAssertEqual(error.failure.category, .cleanupRequired)
+    }
+    XCTAssertEqual(credentialRequests.value, 0)
   }
 
   func testBoundsOutputAndReturnsATypedFailure() async throws {
@@ -232,6 +240,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
   }
 
+  #if false // Superseded by fail-closed staging preservation tests below.
   func testDoesNotDeleteAReplacementAtTheFailedClonePath() async throws {
     let fixture = try makeFixture()
     let ready = fixture.root.appendingPathComponent("ready")
@@ -585,6 +594,46 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     try replacement.restoreOriginal(in: quarantine)
     try await runner.stopRetainedOperation()
     XCTAssertFalse(FileManager.default.fileExists(atPath: quarantine.path))
+  }
+
+  #endif
+
+  func testCloneTargetReplacementBetweenCreationAndOpenNeverLaunchesOrDeletesEitherEntry() async throws {
+    let fixture = try makeFixture()
+    let replacement = DescriptorEntryReplacement(targetEntry: nil)
+    let marker = fixture.root.appendingPathComponent("launched")
+    let executable = try makeExecutable("#!/bin/sh\ntouch \"\(marker.path)\"\n")
+    let runner = ScopedGitCommandRunner(
+      gitExecutableURL: executable,
+      brokerExecutableURL: executable,
+      operationTimeout: 2,
+      wrapsGitInBrokerExecutable: false,
+      beforeCloneTargetOpen: { descriptor, name in
+        replacement.replace(parentDescriptor: descriptor, name: name)
+      }
+    )
+    let credentialRequests = CredentialRequestCounter()
+    let source = SecureSecretBuffer(copying: Data("token".utf8))
+    defer { source.clear() }
+
+    do {
+      _ = try await runner.run(.clone(targetName: "published"), in: fixture.scope) {
+        credentialRequests.increment()
+        return OperationCredential(copying: source)
+      }
+      XCTFail("Expected clone staging replacement rejection")
+    } catch let error as GitCommandRunnerError {
+      XCTAssertEqual(error.failure.category, .cleanupRequired)
+    }
+    XCTAssertEqual(credentialRequests.value, 0)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    let replacementURL = try replacement.replacementURL(in: fixture.root)
+    XCTAssertEqual(try Data(contentsOf: replacementURL.appendingPathComponent("keep")), Data("sentinel".utf8))
+    let originalURL = fixture.root.appendingPathComponent(
+      replacementURL.lastPathComponent + "-original",
+      isDirectory: true
+    )
+    XCTAssertTrue(FileManager.default.fileExists(atPath: originalURL.path))
   }
 
   func testStopAtFinalPreparationBarrierPreventsLaunch() async throws {

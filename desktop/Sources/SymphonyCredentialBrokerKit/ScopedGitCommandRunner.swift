@@ -900,17 +900,10 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       close(parentDescriptor)
       throw GitCommandRunnerError.launchFailed
     }
-    let targetDescriptor = openat(
-      parentDescriptor,
-      name,
-      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
-    )
     var created = stat()
-    guard targetDescriptor >= 0, fstat(targetDescriptor, &created) == 0,
+    guard fstatat(parentDescriptor, name, &created, AT_SYMLINK_NOFOLLOW) == 0,
       created.st_mode & S_IFMT == S_IFDIR
     else {
-      if targetDescriptor >= 0 { close(targetDescriptor) }
-      _ = unlinkat(parentDescriptor, name, AT_REMOVEDIR)
       close(parentDescriptor)
       throw GitCommandRunnerError.cleanupRequired
     }
@@ -919,15 +912,21 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       inode: UInt64(created.st_ino)
     )
     beforeCloneTargetOpen(parentDescriptor, name)
-    var atPath = stat()
-    guard fstatat(parentDescriptor, name, &atPath, AT_SYMLINK_NOFOLLOW) == 0,
-      atPath.st_mode & S_IFMT == S_IFDIR,
-      FileIdentity(device: UInt64(atPath.st_dev), inode: UInt64(atPath.st_ino)) == createdIdentity
+    let targetDescriptor = openat(
+      parentDescriptor,
+      name,
+      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+    )
+    var opened = stat()
+    guard targetDescriptor >= 0, fstat(targetDescriptor, &opened) == 0,
+      opened.st_mode & S_IFMT == S_IFDIR,
+      FileIdentity(device: UInt64(opened.st_dev), inode: UInt64(opened.st_ino)) == createdIdentity
     else {
+      if targetDescriptor >= 0 { close(targetDescriptor) }
       throw CloneTargetPreparationError.replaced(
         CloneTargetHandle(
           parentDescriptor: parentDescriptor,
-          targetDescriptor: targetDescriptor,
+          targetDescriptor: -1,
           name: name,
           identity: createdIdentity
         )
