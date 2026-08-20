@@ -117,11 +117,14 @@ final class CodexCLICommandExecutorTests: XCTestCase {
   func testCancellationReportsWhenForcedTerminationCannotBeDelivered() async throws {
     let executable = try makeBlockingExecutable(ignoresTerm: true)
     let codexHome = temporaryDirectory.appendingPathComponent("undeliverable", isDirectory: true)
+    let forceKill = FailOnceForceKill()
     let executor = CodexCLICommandExecutor(
       executableURL: executable,
       gracefulStopTimeout: 0.05,
       forcedStopTimeout: 0.05,
-      forceKill: { _ in -1 }
+      forceKill: { processIdentifier in
+        forceKill.deliver(to: processIdentifier)
+      }
     )
     let command = Task {
       try await executor.execute(CodexCommandInvocation(arguments: [], codexHome: codexHome))
@@ -136,8 +139,18 @@ final class CodexCLICommandExecutorTests: XCTestCase {
     }
 
     let processIdentifier = try recordedProcessIdentifier(in: codexHome)
-    Darwin.kill(processIdentifier, SIGKILL)
+    XCTAssertEqual(Darwin.kill(processIdentifier, 0), 0)
+    do {
+      _ = try await executor.execute(
+        CodexCommandInvocation(arguments: [], codexHome: codexHome)
+      )
+      XCTFail("Expected the retained process to block replacement")
+    } catch CodexCLIError.commandAlreadyRunning {
+    }
+
+    try await executor.stop(codexHome: codexHome)
     await waitForProcessExit(processIdentifier)
+    XCTAssertEqual(Darwin.kill(processIdentifier, 0), -1)
   }
 
   private func makeBlockingExecutable(ignoresTerm: Bool) throws -> URL {
@@ -188,5 +201,18 @@ final class CodexCLICommandExecutorTests: XCTestCase {
     while Darwin.kill(processIdentifier, 0) == 0, Date() < deadline {
       try? await Task.sleep(for: .milliseconds(10))
     }
+  }
+}
+
+private final class FailOnceForceKill: @unchecked Sendable {
+  private let lock = NSLock()
+  private var deliveryCount = 0
+
+  func deliver(to processIdentifier: Int32) -> Int32 {
+    lock.lock()
+    deliveryCount += 1
+    let shouldFail = deliveryCount == 1
+    lock.unlock()
+    return shouldFail ? -1 : Darwin.kill(processIdentifier, SIGKILL)
   }
 }

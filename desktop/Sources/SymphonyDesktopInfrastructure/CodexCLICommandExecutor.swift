@@ -2,12 +2,18 @@ import Darwin
 import Foundation
 
 public actor CodexCLICommandExecutor: CodexCommandExecuting {
+  private struct Runtime {
+    let process: Process
+    let outputReader: Task<Data, Never>
+  }
+
   private let executableURL: URL?
   private let fileManager: FileManager
   private let environment: [String: String]
   private let gracefulStopTimeout: TimeInterval
   private let forcedStopTimeout: TimeInterval
   private let forceKill: @Sendable (Int32) -> Int32
+  private var runtimes: [URL: Runtime] = [:]
 
   public init(
     executableURL: URL?,
@@ -29,6 +35,9 @@ public actor CodexCLICommandExecutor: CodexCommandExecuting {
     try Task.checkCancellation()
     let executableURL = try requireExecutable()
     try prepareCodexHome(invocation.codexHome)
+    guard runtimes[invocation.codexHome] == nil else {
+      throw CodexCLIError.commandAlreadyRunning
+    }
 
     let process = Process()
     let output = Pipe()
@@ -50,21 +59,31 @@ public actor CodexCLICommandExecutor: CodexCommandExecuting {
     let outputReader = Task.detached {
       output.fileHandleForReading.readDataToEndOfFile()
     }
+    runtimes[invocation.codexHome] = Runtime(process: process, outputReader: outputReader)
     do {
       while process.isRunning {
         try await Task.sleep(for: .milliseconds(25))
       }
       try Task.checkCancellation()
     } catch is CancellationError {
-      try await terminate(process)
-      _ = await outputReader.value
+      try await stop(codexHome: invocation.codexHome)
       throw CancellationError()
     }
     let data = await outputReader.value
+    removeRuntime(for: invocation.codexHome, process: process)
     return CodexCommandResult(
       status: process.terminationStatus,
       output: String(decoding: data, as: UTF8.self)
     )
+  }
+
+  public func stop(codexHome: URL) async throws {
+    guard let runtime = runtimes[codexHome] else {
+      return
+    }
+    try await terminate(runtime.process)
+    _ = await runtime.outputReader.value
+    removeRuntime(for: codexHome, process: runtime.process)
   }
 
   private func requireExecutable() throws -> URL {
@@ -115,6 +134,13 @@ public actor CodexCLICommandExecutor: CodexCommandExecuting {
     }
     return !process.isRunning
   }
+
+  private func removeRuntime(for codexHome: URL, process: Process) {
+    guard runtimes[codexHome]?.process === process else {
+      return
+    }
+    runtimes.removeValue(forKey: codexHome)
+  }
 }
 
 public enum CodexCLIError: LocalizedError, Sendable {
@@ -123,6 +149,7 @@ public enum CodexCLIError: LocalizedError, Sendable {
   case homePreparationFailed
   case launchFailed
   case stopFailed
+  case commandAlreadyRunning
 
   public var errorDescription: String? {
     switch self {
@@ -136,6 +163,8 @@ public enum CodexCLIError: LocalizedError, Sendable {
       "The Codex CLI could not be launched. Reinstall Codex and try again."
     case .stopFailed:
       "The Codex authentication process could not be stopped safely. Try again before deleting the namespace or quitting."
+    case .commandAlreadyRunning:
+      "Another Codex authentication command is still running for this namespace. Stop it before trying again."
     }
   }
 }

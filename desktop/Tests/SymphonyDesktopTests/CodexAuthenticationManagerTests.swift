@@ -251,9 +251,9 @@ final class CodexAuthenticationManagerTests: XCTestCase {
       await manager.signIn(namespaceID: namespaceID, namespaceDirectory: namespaceDirectory)
       await completion.markComplete()
     }
-    await waitUntil {
-      await manager.state(for: namespaceID) == .authenticating
-    }
+    await waitForFile(codexHome.appendingPathComponent("waiting-for-callback"))
+    let authenticatingState = await manager.state(for: namespaceID)
+    XCTAssertEqual(authenticatingState, .authenticating)
     let completedBeforeCallback = await completion.isComplete()
     XCTAssertFalse(completedBeforeCallback)
 
@@ -340,6 +340,35 @@ final class CodexAuthenticationManagerTests: XCTestCase {
     XCTAssertEqual(resumedState, .signedIn)
   }
 
+  func testFailedStopRetainsOwnershipAndASecondQuiesceRetriesCleanup() async throws {
+    let executor = RetainingStopFailureExecutor()
+    let manager = CodexAuthenticationManager(executor: executor)
+    let namespaceID = UUID()
+    let namespaceDirectory = temporaryDirectory.appendingPathComponent(
+      "stop-retry", isDirectory: true)
+    let signIn = Task {
+      await manager.signIn(namespaceID: namespaceID, namespaceDirectory: namespaceDirectory)
+    }
+    await waitUntil {
+      await executor.executionCount() == 1
+    }
+
+    do {
+      try await manager.quiesce(namespaceID: namespaceID)
+      XCTFail("Expected the first stop to fail")
+    } catch CodexAuthenticationLifecycleError.stopFailed {
+    }
+    await signIn.value
+    await manager.signIn(namespaceID: namespaceID, namespaceDirectory: namespaceDirectory)
+    let replacementCount = await executor.executionCount()
+    XCTAssertEqual(replacementCount, 1)
+
+    try await manager.quiesce(namespaceID: namespaceID)
+
+    let stopAttempts = await executor.stopAttemptCount()
+    XCTAssertEqual(stopAttempts, 2)
+  }
+
   private func makeStatefulCodexExecutable() throws -> URL {
     let executable = testDirectory.appendingPathComponent("fake-codex")
     let script = """
@@ -355,6 +384,7 @@ final class CodexAuthenticationManagerTests: XCTestCase {
       fi
       if [ "$1" = "login" ]; then
         if [ -f "$CODEX_HOME/require-callback" ]; then
+          touch "$CODEX_HOME/waiting-for-callback"
           while [ ! -f "$CODEX_HOME/callback-complete" ]; do
             sleep 0.05
           done
@@ -385,6 +415,14 @@ final class CodexAuthenticationManagerTests: XCTestCase {
     }
     let conditionSatisfied = await condition()
     XCTAssertTrue(conditionSatisfied)
+  }
+
+  private func waitForFile(_ url: URL, timeout: TimeInterval = 2) async {
+    let deadline = Date().addingTimeInterval(timeout)
+    while !FileManager.default.fileExists(atPath: url.path), Date() < deadline {
+      try? await Task.sleep(for: .milliseconds(10))
+    }
+    XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
   }
 
   private var temporaryDirectory: URL {
@@ -429,6 +467,36 @@ private actor GatedCodexCommandExecutor: CodexCommandExecuting {
 
   func executionCount(for codexHome: URL) -> Int {
     counts[codexHome, default: 0]
+  }
+}
+
+private actor RetainingStopFailureExecutor: CodexCommandExecuting {
+  private var executions = 0
+  private var stopAttempts = 0
+
+  func execute(_ invocation: CodexCommandInvocation) async throws -> CodexCommandResult {
+    executions += 1
+    do {
+      try await Task.sleep(for: .seconds(60))
+      return CodexCommandResult(status: 0, output: "Login successful")
+    } catch is CancellationError {
+      throw CodexCLIError.stopFailed
+    }
+  }
+
+  func stop(codexHome: URL) async throws {
+    stopAttempts += 1
+    if stopAttempts == 1 {
+      throw CodexCLIError.stopFailed
+    }
+  }
+
+  func executionCount() -> Int {
+    executions
+  }
+
+  func stopAttemptCount() -> Int {
+    stopAttempts
   }
 }
 

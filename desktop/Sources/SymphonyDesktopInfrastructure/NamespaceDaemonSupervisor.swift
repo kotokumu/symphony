@@ -251,6 +251,7 @@ public actor NamespaceDaemonSupervisor {
       "CodexHome",
       isDirectory: true
     )
+    let codexExecutableURL = try requireCodexExecutable()
 
     do {
       for directory in [runtimeDirectory, workspaceDirectory, logsDirectory, codexHomeDirectory] {
@@ -261,7 +262,6 @@ public actor NamespaceDaemonSupervisor {
         ofItemAtPath: codexHomeDirectory.path
       )
       let workflowURL = runtimeDirectory.appendingPathComponent("WORKFLOW.md")
-      let codexExecutableURL = try requireCodexExecutable()
       try workflow(
         workspaceDirectory: workspaceDirectory,
         codexHomeDirectory: codexHomeDirectory,

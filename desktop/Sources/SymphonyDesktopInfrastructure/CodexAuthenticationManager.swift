@@ -23,6 +23,11 @@ public struct CodexCommandResult: Equatable, Sendable {
 
 public protocol CodexCommandExecuting: Sendable {
   func execute(_ invocation: CodexCommandInvocation) async throws -> CodexCommandResult
+  func stop(codexHome: URL) async throws
+}
+
+extension CodexCommandExecuting {
+  public func stop(codexHome: URL) async throws {}
 }
 
 public actor CodexAuthenticationManager {
@@ -35,6 +40,7 @@ public actor CodexAuthenticationManager {
 
   private struct Operation {
     let generation: UUID
+    let codexHome: URL
     let task: Task<OperationOutcome, Never>
   }
 
@@ -71,6 +77,7 @@ public actor CodexAuthenticationManager {
     guard
       let operation = beginOperation(
         for: namespaceID,
+        codexHome: codexHome,
         task: { [executor] in
           do {
             let result = try await executor.execute(
@@ -101,6 +108,7 @@ public actor CodexAuthenticationManager {
     guard
       let operation = beginOperation(
         for: namespaceID,
+        codexHome: codexHome,
         task: { [executor] in
           do {
             let loginResult = try await executor.execute(
@@ -134,6 +142,7 @@ public actor CodexAuthenticationManager {
     guard
       let operation = beginOperation(
         for: namespaceID,
+        codexHome: codexHome,
         task: { [executor] in
           do {
             let result = try await executor.execute(
@@ -161,12 +170,7 @@ public actor CodexAuthenticationManager {
 
   public func quiesce(namespaceID: Namespace.ID) async throws {
     quiescedNamespaces.insert(namespaceID)
-    do {
-      try await cancelOperation(for: namespaceID)
-    } catch {
-      quiescedNamespaces.remove(namespaceID)
-      throw error
-    }
+    try await cancelOperation(for: namespaceID)
   }
 
   public func resume(namespaceID: Namespace.ID) {
@@ -174,7 +178,9 @@ public actor CodexAuthenticationManager {
   }
 
   public func removeNamespace(_ namespaceID: Namespace.ID) {
-    operations.removeValue(forKey: namespaceID)?.task.cancel()
+    guard operations[namespaceID] == nil else {
+      return
+    }
     states.removeValue(forKey: namespaceID)
     quiescedNamespaces.remove(namespaceID)
   }
@@ -219,15 +225,19 @@ public actor CodexAuthenticationManager {
     }
     operation.task.cancel()
     let outcome = await operation.task.value
+    if case .terminationFailed(let message) = outcome {
+      do {
+        try await executor.stop(codexHome: operation.codexHome)
+      } catch {
+        publish(.failed(message: message), for: namespaceID)
+        throw CodexAuthenticationLifecycleError.stopFailed
+      }
+    }
     if operations[namespaceID]?.generation == operation.generation {
       operations.removeValue(forKey: namespaceID)
     }
     if case .cancelled = outcome, states[namespaceID] == .authenticating {
       publish(.signedOut, for: namespaceID)
-    }
-    if case .terminationFailed(let message) = outcome {
-      publish(.failed(message: message), for: namespaceID)
-      throw CodexAuthenticationLifecycleError.stopFailed
     }
   }
 
@@ -240,12 +250,17 @@ public actor CodexAuthenticationManager {
 
   private func beginOperation(
     for namespaceID: Namespace.ID,
+    codexHome: URL,
     task: @escaping @Sendable () async -> OperationOutcome
   ) -> Operation? {
     guard canBeginOperation(for: namespaceID) else {
       return nil
     }
-    let operation = Operation(generation: UUID(), task: Task { await task() })
+    let operation = Operation(
+      generation: UUID(),
+      codexHome: codexHome,
+      task: Task { await task() }
+    )
     operations[namespaceID] = operation
     return operation
   }
@@ -255,13 +270,16 @@ public actor CodexAuthenticationManager {
     guard operations[namespaceID]?.generation == operation.generation else {
       return
     }
-    operations.removeValue(forKey: namespaceID)
     switch outcome {
     case .state(let state):
+      operations.removeValue(forKey: namespaceID)
       publish(state, for: namespaceID)
     case .cancelled:
-      break
-    case .failed(let message), .terminationFailed(let message):
+      operations.removeValue(forKey: namespaceID)
+    case .failed(let message):
+      operations.removeValue(forKey: namespaceID)
+      publish(.failed(message: message), for: namespaceID)
+    case .terminationFailed(let message):
       publish(.failed(message: message), for: namespaceID)
     }
   }

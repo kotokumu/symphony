@@ -378,6 +378,55 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
     )
   }
 
+  func testMissingCodexExecutableReportsAnActionableFailure() async throws {
+    let supervisor = NamespaceDaemonSupervisor(
+      executableURL: try makeLongRunningExecutable(),
+      codexExecutableURL: nil,
+      readinessTimeout: 0.1,
+      readinessProbe: { _ in false },
+      portAllocator: { 42302 }
+    )
+    let namespaceID = UUID()
+
+    await supervisor.start(
+      namespaceID: namespaceID,
+      namespaceDirectory: try makeNamespaceDirectory(namespaceID)
+    )
+
+    let state = await supervisor.state(for: namespaceID)
+    XCTAssertEqual(
+      state,
+      .failed(message: "The Codex CLI could not be found. Install Codex and try again.")
+    )
+  }
+
+  func testNonExecutableCodexReportsItsPath() async throws {
+    let codexExecutable = temporaryDirectory.appendingPathComponent("codex-not-executable")
+    try Data().write(to: codexExecutable)
+    let supervisor = NamespaceDaemonSupervisor(
+      executableURL: try makeLongRunningExecutable(),
+      codexExecutableURL: codexExecutable,
+      readinessTimeout: 0.1,
+      readinessProbe: { _ in false },
+      portAllocator: { 42303 }
+    )
+    let namespaceID = UUID()
+
+    await supervisor.start(
+      namespaceID: namespaceID,
+      namespaceDirectory: try makeNamespaceDirectory(namespaceID)
+    )
+
+    let state = await supervisor.state(for: namespaceID)
+    XCTAssertEqual(
+      state,
+      .failed(
+        message:
+          "The Codex CLI at \(codexExecutable.path) is not executable. Reinstall Codex and try again."
+      )
+    )
+  }
+
   func testReadinessCleanupFailureRetainsOwnershipAndBlocksReplacement() async throws {
     let pidFile = temporaryDirectory.appendingPathComponent("daemon.pid")
     let executable = try makeExecutable(

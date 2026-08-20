@@ -306,54 +306,53 @@ private struct NamespaceDetailView: View {
 
   @ViewBuilder
   private var authenticationStatus: some View {
-    switch authenticationState {
-    case .signedOut:
-      Label("Codex signed out", systemImage: "person.crop.circle.badge.xmark")
-        .foregroundStyle(.secondary)
-    case .authenticating:
+    let presentation = CodexAuthenticationPresentation(state: authenticationState)
+    if presentation.showsProgress {
       HStack(spacing: 8) {
         ProgressView()
           .controlSize(.small)
-        Text("Waiting for ChatGPT sign-in…")
+        Text(presentation.status)
       }
       .foregroundStyle(.secondary)
-    case .signedIn:
-      Label("Codex signed in", systemImage: "person.crop.circle.badge.checkmark")
-        .foregroundStyle(.green)
-    case .expired(let message):
+    } else if let systemImage = presentation.systemImage {
       VStack(spacing: 6) {
-        Label("Codex sign-in expired", systemImage: "clock.badge.exclamationmark")
-          .foregroundStyle(.orange)
-        Text(message)
-          .foregroundStyle(.secondary)
-          .multilineTextAlignment(.center)
-          .frame(maxWidth: 440)
-      }
-    case .failed(let message):
-      VStack(spacing: 6) {
-        Label("Codex authentication failed", systemImage: "exclamationmark.triangle.fill")
-          .foregroundStyle(.red)
-        Text(message)
-          .foregroundStyle(.secondary)
-          .multilineTextAlignment(.center)
-          .frame(maxWidth: 440)
+        Label(presentation.status, systemImage: systemImage)
+          .foregroundStyle(authenticationStatusColor(presentation.tone))
+        if let detail = presentation.detail {
+          Text(detail)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: 440)
+        }
       }
     }
   }
 
   @ViewBuilder
   private var authenticationControls: some View {
-    switch authenticationState {
-    case .signedOut:
-      Button("Sign in with ChatGPT", action: signIn)
-        .buttonStyle(.borderedProminent)
-    case .authenticating:
+    switch CodexAuthenticationPresentation(state: authenticationState).action {
+    case .none:
       EmptyView()
-    case .signedIn:
-      Button("Sign Out", action: signOut)
-    case .expired, .failed:
-      Button("Try Sign In Again", action: signIn)
+    case .signIn(let title):
+      Button(title, action: signIn)
         .buttonStyle(.borderedProminent)
+    case .signOut(let title):
+      Button(title, action: signOut)
+    }
+  }
+
+  private func authenticationStatusColor(
+    _ tone: CodexAuthenticationPresentation.Tone
+  ) -> Color {
+    switch tone {
+    case .secondary:
+      .secondary
+    case .success:
+      .green
+    case .warning:
+      .orange
+    case .error:
+      .red
     }
   }
 
