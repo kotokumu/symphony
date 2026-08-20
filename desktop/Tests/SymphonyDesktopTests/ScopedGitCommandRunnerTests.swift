@@ -172,7 +172,8 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     }
     await gate.waitUntilPaused()
     let stop = Task { try await runner.stopRetainedOperation() }
-    XCTAssertTrue(await runner.waitUntilStopRequested())
+    let stopWasRequested = await runner.waitUntilStopRequested()
+    XCTAssertTrue(stopWasRequested)
     await gate.resume()
     do {
       _ = try await operation.value
