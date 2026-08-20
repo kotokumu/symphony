@@ -33,6 +33,12 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     XCTAssertTrue(result.output.contains("https://github.com/octo/repo"))
     XCTAssertTrue(result.output.contains("GIT_CONFIG_NOSYSTEM=1"))
     XCTAssertTrue(result.output.contains("GIT_CONFIG_GLOBAL=/dev/null"))
+    XCTAssertTrue(result.output.contains("http.proxy="))
+    XCTAssertTrue(result.output.contains("http.sslVerify=true"))
+    XCTAssertTrue(result.output.contains("http.https://github.com/octo/repo.proxy="))
+    XCTAssertTrue(result.output.contains("protocol.allow=never"))
+    XCTAssertTrue(result.output.contains("protocol.https.allow=always"))
+    XCTAssertTrue(result.output.contains("NO_PROXY=*"))
     XCTAssertFalse(result.output.contains("never-print-this-token"))
     XCTAssertFalse(result.output.lowercased().contains("http_proxy"))
     XCTAssertFalse(result.output.contains("GITHUB_TOKEN"))
@@ -240,7 +246,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     let operation = Task {
       try await runner.run(.fetch(repositoryName: repository.lastPathComponent), in: fixture.scope) {
         credentialRequests.increment()
-        OperationCredential(copying: source)
+        return OperationCredential(copying: source)
       }
     }
     await gate.waitUntilPaused()

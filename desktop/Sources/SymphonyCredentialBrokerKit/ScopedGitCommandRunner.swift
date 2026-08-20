@@ -186,7 +186,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     let serverTask = Task.detached { server.serve() }
     let process = Process()
     let output = Pipe()
-    let arguments = gitArguments(plan.arguments)
+    let arguments = gitArguments(plan.arguments, repositoryURL: scope.repositoryURL)
     process.executableURL = wrapsGitInBrokerExecutable ? brokerExecutableURL : gitExecutableURL
     process.arguments = wrapsGitInBrokerExecutable
       ? ["git-runner", gitExecutableURL.path] + arguments
@@ -342,13 +342,25 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     return false
   }
 
-  private func gitArguments(_ operationArguments: [String]) -> [String] {
+  private func gitArguments(_ operationArguments: [String], repositoryURL: URL) -> [String] {
     let helper = shellQuote(brokerExecutableURL.path)
+    let repositoryHTTPKey = "http.\(repositoryURL.absoluteString)"
     return [
       "-c", "credential.helper=",
       "-c", "credential.helper=!\(helper) git-credential",
       "-c", "credential.useHttpPath=true",
       "-c", "http.followRedirects=false",
+      "-c", "http.proxy=",
+      "-c", "http.sslVerify=true",
+      "-c", "http.extraHeader=",
+      "-c", "http.cookieFile=",
+      "-c", "http.saveCookies=false",
+      "-c", "\(repositoryHTTPKey).proxy=",
+      "-c", "\(repositoryHTTPKey).sslVerify=true",
+      "-c", "\(repositoryHTTPKey).extraHeader=",
+      "-c", "\(repositoryHTTPKey).cookieFile=",
+      "-c", "protocol.allow=never",
+      "-c", "protocol.https.allow=always",
       "-c", "core.hooksPath=/dev/null",
     ] + operationArguments
   }
@@ -370,6 +382,8 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       "GIT_CONFIG_GLOBAL": "/dev/null",
       "GIT_TERMINAL_PROMPT": "0",
       "GIT_ASKPASS": "/usr/bin/false",
+      "NO_PROXY": "*",
+      "no_proxy": "*",
     ], directory)
   }
 

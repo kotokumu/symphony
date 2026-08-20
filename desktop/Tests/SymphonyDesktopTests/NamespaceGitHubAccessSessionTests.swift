@@ -334,6 +334,35 @@ final class NamespaceGitHubAccessSessionTests: XCTestCase {
     XCTAssertEqual(mutationIssueCount, 1)
   }
 
+  func testSafelyRefreshesMutationWhenAuthenticationFailsBeforeDispatch() async throws {
+    let root = try makeDirectory()
+    let now = Date()
+    let api = RecordingRepositoryAPI(
+      expirations: [now.addingTimeInterval(3_600), now.addingTimeInterval(3_600)],
+      issueResults: [
+        .failure(.failure(
+          GitHubCapabilityFailure(category: .authExpired, message: "preflight expired", status: 401),
+          invalidatesLease: true,
+          retryGET: true
+        )),
+        .success(.comment(GitHubIssueCommentRecord(id: 70, body: "created"))),
+      ]
+    )
+    let session = NamespaceGitHubAccessSession(api: api, now: { now })
+    try await session.authorize(makeAuthorization(root: root), storedAppID: 10)
+
+    let response = try await session.performIssueRequest(
+      .createComment(issueNumber: 7, body: "created"),
+      jwt: "jwt"
+    )
+
+    XCTAssertEqual(response, .comment(GitHubIssueCommentRecord(id: 70, body: "created")))
+    let issueCount = await api.issueCount
+    let mintCount = await api.mintCount
+    XCTAssertEqual(issueCount, 2)
+    XCTAssertEqual(mintCount, 2)
+  }
+
   private func makeAuthorization(root: URL) -> GitHubRepositoryAuthorization {
     GitHubRepositoryAuthorization(
       appID: 10,
