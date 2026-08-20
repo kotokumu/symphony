@@ -156,6 +156,8 @@ struct GitRepositoryTrustPolicy: Sendable {
 
   private func requireChildName(_ value: String) throws {
     guard !value.isEmpty, value != ".", value != "..", value.utf8.count <= 255,
+      !value.hasPrefix(".symphony-clone-"),
+      !value.hasPrefix(".symphony-failed-clone-"),
       !value.contains("/"), !value.unicodeScalars.contains(where: {
         $0.value == 0 || CharacterSet.controlCharacters.contains($0)
       })
