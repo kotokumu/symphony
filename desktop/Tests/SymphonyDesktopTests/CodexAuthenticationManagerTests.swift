@@ -468,6 +468,8 @@ private actor GatedCodexCommandExecutor: CodexCommandExecuting {
   func executionCount(for codexHome: URL) -> Int {
     counts[codexHome, default: 0]
   }
+
+  func stop(codexHome: URL) async throws {}
 }
 
 private actor RetainingStopFailureExecutor: CodexCommandExecuting {
@@ -480,14 +482,14 @@ private actor RetainingStopFailureExecutor: CodexCommandExecuting {
       try await Task.sleep(for: .seconds(60))
       return CodexCommandResult(status: 0, output: "Login successful")
     } catch is CancellationError {
-      throw CodexCLIError.stopFailed
+      throw CodexCommandLifecycleError.stopFailed
     }
   }
 
   func stop(codexHome: URL) async throws {
     stopAttempts += 1
     if stopAttempts == 1 {
-      throw CodexCLIError.stopFailed
+      throw CodexCommandLifecycleError.stopFailed
     }
   }
 
@@ -519,6 +521,8 @@ private actor RecordingCodexCommandExecutor: CodexCommandExecuting {
   func recordedInvocations() -> [CodexCommandInvocation] {
     invocations
   }
+
+  func stop(codexHome: URL) async throws {}
 }
 
 private enum TestCommandError: Error {

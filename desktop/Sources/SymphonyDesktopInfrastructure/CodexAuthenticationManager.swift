@@ -23,11 +23,22 @@ public struct CodexCommandResult: Equatable, Sendable {
 
 public protocol CodexCommandExecuting: Sendable {
   func execute(_ invocation: CodexCommandInvocation) async throws -> CodexCommandResult
+  /// Returns only after no process remains owned for `codexHome`.
   func stop(codexHome: URL) async throws
 }
 
-extension CodexCommandExecuting {
-  public func stop(codexHome: URL) async throws {}
+public enum CodexCommandLifecycleError: LocalizedError, Sendable {
+  case stopFailed
+  case commandAlreadyRunning
+
+  public var errorDescription: String? {
+    switch self {
+    case .stopFailed:
+      "The Codex authentication process could not be stopped safely. Try again before deleting the namespace or quitting."
+    case .commandAlreadyRunning:
+      "Another Codex authentication command is still running for this namespace. Stop it before trying again."
+    }
+  }
 }
 
 public actor CodexAuthenticationManager {
@@ -86,8 +97,8 @@ public actor CodexAuthenticationManager {
             return .state(Self.statusState(from: result))
           } catch is CancellationError {
             return .cancelled
-          } catch CodexCLIError.stopFailed {
-            return .terminationFailed(CodexCLIError.stopFailed.localizedDescription)
+          } catch CodexCommandLifecycleError.stopFailed {
+            return .terminationFailed(CodexCommandLifecycleError.stopFailed.localizedDescription)
           } catch {
             return .failed(
               "Codex authentication could not be checked: \(error.localizedDescription)")
@@ -125,8 +136,8 @@ public actor CodexAuthenticationManager {
             return .state(Self.statusState(from: statusResult))
           } catch is CancellationError {
             return .cancelled
-          } catch CodexCLIError.stopFailed {
-            return .terminationFailed(CodexCLIError.stopFailed.localizedDescription)
+          } catch CodexCommandLifecycleError.stopFailed {
+            return .terminationFailed(CodexCommandLifecycleError.stopFailed.localizedDescription)
           } catch {
             return .failed("Codex sign-in failed: \(error.localizedDescription)")
           }
@@ -156,8 +167,8 @@ public actor CodexAuthenticationManager {
             )
           } catch is CancellationError {
             return .cancelled
-          } catch CodexCLIError.stopFailed {
-            return .terminationFailed(CodexCLIError.stopFailed.localizedDescription)
+          } catch CodexCommandLifecycleError.stopFailed {
+            return .terminationFailed(CodexCommandLifecycleError.stopFailed.localizedDescription)
           } catch {
             return .failed("Codex sign-out failed: \(error.localizedDescription)")
           }

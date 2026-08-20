@@ -4,6 +4,7 @@ import Foundation
 public actor CodexCLICommandExecutor: CodexCommandExecuting {
   private struct Runtime {
     let process: Process
+    let outputReadHandle: FileHandle
     let outputReader: Task<Data, Never>
   }
 
@@ -36,7 +37,7 @@ public actor CodexCLICommandExecutor: CodexCommandExecuting {
     let executableURL = try requireExecutable()
     try prepareCodexHome(invocation.codexHome)
     guard runtimes[invocation.codexHome] == nil else {
-      throw CodexCLIError.commandAlreadyRunning
+      throw CodexCommandLifecycleError.commandAlreadyRunning
     }
 
     let process = Process()
@@ -56,10 +57,15 @@ public actor CodexCLICommandExecutor: CodexCommandExecuting {
       throw CodexCLIError.launchFailed
     }
 
+    let outputReadHandle = output.fileHandleForReading
     let outputReader = Task.detached {
-      output.fileHandleForReading.readDataToEndOfFile()
+      outputReadHandle.readDataToEndOfFile()
     }
-    runtimes[invocation.codexHome] = Runtime(process: process, outputReader: outputReader)
+    runtimes[invocation.codexHome] = Runtime(
+      process: process,
+      outputReadHandle: outputReadHandle,
+      outputReader: outputReader
+    )
     do {
       while process.isRunning {
         try await Task.sleep(for: .milliseconds(25))
@@ -82,7 +88,8 @@ public actor CodexCLICommandExecutor: CodexCommandExecuting {
       return
     }
     try await terminate(runtime.process)
-    _ = await runtime.outputReader.value
+    try? runtime.outputReadHandle.close()
+    runtime.outputReader.cancel()
     removeRuntime(for: codexHome, process: runtime.process)
   }
 
@@ -118,10 +125,10 @@ public actor CodexCLICommandExecutor: CodexCommandExecuting {
       return
     }
     guard forceKill(process.processIdentifier) == 0 else {
-      throw CodexCLIError.stopFailed
+      throw CodexCommandLifecycleError.stopFailed
     }
     guard await waitForExit(process, timeout: forcedStopTimeout) else {
-      throw CodexCLIError.stopFailed
+      throw CodexCommandLifecycleError.stopFailed
     }
   }
 
@@ -148,8 +155,6 @@ public enum CodexCLIError: LocalizedError, Sendable {
   case executableNotExecutable(URL)
   case homePreparationFailed
   case launchFailed
-  case stopFailed
-  case commandAlreadyRunning
 
   public var errorDescription: String? {
     switch self {
@@ -161,10 +166,6 @@ public enum CodexCLIError: LocalizedError, Sendable {
       "The namespace Codex home could not be prepared. Check disk space and permissions, then try again."
     case .launchFailed:
       "The Codex CLI could not be launched. Reinstall Codex and try again."
-    case .stopFailed:
-      "The Codex authentication process could not be stopped safely. Try again before deleting the namespace or quitting."
-    case .commandAlreadyRunning:
-      "Another Codex authentication command is still running for this namespace. Stop it before trying again."
     }
   }
 }

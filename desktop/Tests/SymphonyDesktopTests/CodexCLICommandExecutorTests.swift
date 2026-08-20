@@ -135,7 +135,7 @@ final class CodexCLICommandExecutorTests: XCTestCase {
     do {
       _ = try await command.value
       XCTFail("Expected stop failure")
-    } catch CodexCLIError.stopFailed {
+    } catch CodexCommandLifecycleError.stopFailed {
     }
 
     let processIdentifier = try recordedProcessIdentifier(in: codexHome)
@@ -145,12 +145,53 @@ final class CodexCLICommandExecutorTests: XCTestCase {
         CodexCommandInvocation(arguments: [], codexHome: codexHome)
       )
       XCTFail("Expected the retained process to block replacement")
-    } catch CodexCLIError.commandAlreadyRunning {
+    } catch CodexCommandLifecycleError.commandAlreadyRunning {
     }
 
     try await executor.stop(codexHome: codexHome)
     await waitForProcessExit(processIdentifier)
     XCTAssertEqual(Darwin.kill(processIdentifier, 0), -1)
+  }
+
+  func testCancellationDoesNotWaitForADescendantHoldingTheOutputPipe() async throws {
+    let executable = temporaryDirectory.appendingPathComponent("descendant-output")
+    let script = """
+      #!/bin/sh
+      trap 'exit 0' TERM
+      sleep 5 &
+      echo $! > "$CODEX_HOME/descendant-pid"
+      echo $$ > "$CODEX_HOME/pid"
+      touch "$CODEX_HOME/ready"
+      while :; do sleep 0.05; done
+      """
+    try script.write(to: executable, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+    let codexHome = temporaryDirectory.appendingPathComponent("descendant", isDirectory: true)
+    let executor = CodexCLICommandExecutor(
+      executableURL: executable,
+      gracefulStopTimeout: 0.5,
+      forcedStopTimeout: 0.5
+    )
+    let command = Task {
+      try await executor.execute(CodexCommandInvocation(arguments: [], codexHome: codexHome))
+    }
+    await waitForFile(codexHome.appendingPathComponent("ready"))
+    let startedStopping = Date()
+
+    command.cancel()
+    do {
+      _ = try await command.value
+      XCTFail("Expected cancellation")
+    } catch is CancellationError {
+    }
+
+    XCTAssertLessThan(Date().timeIntervalSince(startedStopping), 1)
+    try assertRecordedProcessExited(in: codexHome)
+    let descendantIdentifier = try recordedProcessIdentifier(
+      at: codexHome.appendingPathComponent("descendant-pid")
+    )
+    _ = Darwin.kill(descendantIdentifier, SIGKILL)
+    await waitForProcessExit(descendantIdentifier)
   }
 
   private func makeBlockingExecutable(ignoresTerm: Bool) throws -> URL {
@@ -184,8 +225,12 @@ final class CodexCLICommandExecutorTests: XCTestCase {
   }
 
   private func recordedProcessIdentifier(in codexHome: URL) throws -> Int32 {
+    try recordedProcessIdentifier(at: codexHome.appendingPathComponent("pid"))
+  }
+
+  private func recordedProcessIdentifier(at url: URL) throws -> Int32 {
     let value = try String(
-      contentsOf: codexHome.appendingPathComponent("pid"),
+      contentsOf: url,
       encoding: .utf8
     ).trimmingCharacters(in: .whitespacesAndNewlines)
     return try XCTUnwrap(Int32(value))
