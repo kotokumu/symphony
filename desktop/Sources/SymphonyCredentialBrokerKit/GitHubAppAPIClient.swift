@@ -8,8 +8,22 @@ public protocol GitHubHTTPTransporting: Sendable {
 public struct URLSessionGitHubHTTPTransport: GitHubHTTPTransporting {
   private let session: URLSession
 
-  public init(session: URLSession = .shared) {
+  public init(session: URLSession = URLSessionGitHubHTTPTransport.makeEphemeralSession()) {
     self.session = session
+  }
+
+  public static func makeEphemeralConfiguration() -> URLSessionConfiguration {
+    let configuration = URLSessionConfiguration.ephemeral
+    configuration.urlCache = nil
+    configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+    configuration.httpCookieStorage = nil
+    configuration.httpShouldSetCookies = false
+    configuration.urlCredentialStorage = nil
+    return configuration
+  }
+
+  public static func makeEphemeralSession() -> URLSession {
+    URLSession(configuration: makeEphemeralConfiguration())
   }
 
   public func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
@@ -42,16 +56,19 @@ public struct GitHubAppAPIClient: GitHubAppAPIRequesting {
   }
 
   public func listInstallations(jwt: String) async throws -> [GitHubInstallationDescriptor] {
+    let deadline = Date().addingTimeInterval(50)
     var all: [GitHubInstallationDescriptor] = []
     for page in 1...10 {
       let request = try makeRequest(
         path: "/app/installations",
         bearer: jwt,
-        queryItems: pageQuery(page)
+        queryItems: pageQuery(page),
+        deadline: deadline
       )
-      let data = try await send(request, authentication: .app)
+      let data = try await send(request, authentication: .app, deadline: deadline)
       let pageValues = try decode([InstallationResponse].self, from: data)
       all.append(contentsOf: pageValues.map(\.descriptor))
+      try requireDescriptorBudget(all)
       if pageValues.count < 100 { return all }
     }
     throw GitHubAppAPIError.paginationLimit
@@ -64,13 +81,19 @@ public struct GitHubAppAPIClient: GitHubAppAPIRequesting {
     guard installationID > 0 else {
       throw GitHubAppAPIError.installationRevoked
     }
+    let deadline = Date().addingTimeInterval(50)
     var tokenRequest = try makeRequest(
       path: "/app/installations/\(installationID)/access_tokens",
-      bearer: jwt
+      bearer: jwt,
+      deadline: deadline
     )
     tokenRequest.httpMethod = "POST"
     tokenRequest.httpBody = Data("{}".utf8)
-    let tokenData = try await send(tokenRequest, authentication: .installation(installationID))
+    let tokenData = try await send(
+      tokenRequest,
+      authentication: .installation(installationID),
+      deadline: deadline
+    )
     let token = try decode(InstallationTokenResponse.self, from: tokenData).token
 
     var all: [GitHubRepositoryDescriptor] = []
@@ -78,11 +101,17 @@ public struct GitHubAppAPIClient: GitHubAppAPIRequesting {
       let request = try makeRequest(
         path: "/installation/repositories",
         bearer: token,
-        queryItems: pageQuery(page)
+        queryItems: pageQuery(page),
+        deadline: deadline
       )
-      let data = try await send(request, authentication: .installation(installationID))
+      let data = try await send(
+        request,
+        authentication: .installation(installationID),
+        deadline: deadline
+      )
       let response = try decode(RepositoriesResponse.self, from: data)
       all.append(contentsOf: response.repositories.map(\.descriptor))
+      try requireDescriptorBudget(all)
       if response.repositories.count < 100 { return all }
     }
     throw GitHubAppAPIError.paginationLimit
@@ -95,8 +124,12 @@ public struct GitHubAppAPIClient: GitHubAppAPIRequesting {
   private func makeRequest(
     path: String,
     bearer: String,
-    queryItems: [URLQueryItem] = []
+    queryItems: [URLQueryItem] = [],
+    deadline: Date
   ) throws -> URLRequest {
+    guard baseURL.scheme?.lowercased() == "https" else {
+      throw GitHubAppAPIError.insecureBaseURL
+    }
     guard var components = URLComponents(url: baseURL.appendingPathComponent(path), resolvingAgainstBaseURL: false) else {
       throw GitHubAppAPIError.invalidResponse
     }
@@ -105,7 +138,9 @@ public struct GitHubAppAPIClient: GitHubAppAPIRequesting {
       throw GitHubAppAPIError.invalidResponse
     }
     var request = URLRequest(url: url)
-    request.timeoutInterval = 30
+    let remaining = deadline.timeIntervalSinceNow
+    guard remaining > 0 else { throw GitHubAppAPIError.requestTimedOut }
+    request.timeoutInterval = min(30, remaining)
     request.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
     request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
     request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
@@ -113,7 +148,11 @@ public struct GitHubAppAPIClient: GitHubAppAPIRequesting {
     return request
   }
 
-  private func send(_ request: URLRequest, authentication: Authentication) async throws -> Data {
+  private func send(
+    _ request: URLRequest,
+    authentication: Authentication,
+    deadline: Date
+  ) async throws -> Data {
     let data: Data
     let response: HTTPURLResponse
     do {
@@ -123,6 +162,7 @@ public struct GitHubAppAPIClient: GitHubAppAPIRequesting {
     } catch {
       throw GitHubAppAPIError.transport(error.localizedDescription)
     }
+    guard Date() < deadline else { throw GitHubAppAPIError.requestTimedOut }
     guard data.count <= 2 * 1_024 * 1_024 else {
       throw GitHubAppAPIError.responseTooLarge
     }
@@ -153,6 +193,12 @@ public struct GitHubAppAPIClient: GitHubAppAPIRequesting {
       return try JSONDecoder().decode(type, from: data)
     } catch {
       throw GitHubAppAPIError.invalidResponse
+    }
+  }
+
+  private func requireDescriptorBudget<Value: Encodable>(_ value: Value) throws {
+    guard try JSONEncoder().encode(value).count <= CredentialBrokerProtocolLimits.maximumGitHubDescriptorBytes else {
+      throw GitHubAppAPIError.responseTooLarge
     }
   }
 }
@@ -233,6 +279,8 @@ public enum GitHubAppAPIError: LocalizedError, Sendable {
   case invalidResponse
   case responseTooLarge
   case paginationLimit
+  case insecureBaseURL
+  case requestTimedOut
 
   public var errorDescription: String? {
     switch self {
@@ -252,6 +300,10 @@ public enum GitHubAppAPIError: LocalizedError, Sendable {
       "GitHub returned more connection data than Symphony can process safely. Narrow the installation and try again."
     case .paginationLimit:
       "GitHub returned too many results to load safely. Narrow the app installation and try again."
+    case .insecureBaseURL:
+      "GitHub credentials may only be sent over HTTPS."
+    case .requestTimedOut:
+      "GitHub did not finish the request within the credential broker deadline. Try again."
     }
   }
 }

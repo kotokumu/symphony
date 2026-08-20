@@ -1,5 +1,11 @@
 import Foundation
 
+public enum CredentialBrokerProtocolLimits {
+  public static let maximumCommandBytes = 65_536
+  public static let maximumResponseBytes = 1_048_576
+  public static let maximumGitHubDescriptorBytes = 1_000_000
+}
+
 public enum CredentialBrokerHandshake: Codable, Equatable, Sendable {
   case unlocked
   case failed(message: String)

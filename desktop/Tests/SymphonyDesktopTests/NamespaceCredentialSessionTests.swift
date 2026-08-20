@@ -214,6 +214,113 @@ final class NamespaceCredentialSessionTests: XCTestCase {
     XCTAssertEqual(storage.storedCredential(for: namespaceID), original)
   }
 
+  func testGitHubJWTContainsRequiredClaimsAndValidRS256Signature() throws {
+    let attributes: [String: Any] = [
+      kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+      kSecAttrKeySizeInBits as String: 2_048,
+    ]
+    var error: Unmanaged<CFError>?
+    let privateKey = try XCTUnwrap(SecKeyCreateRandomKey(attributes as CFDictionary, &error))
+    let publicKey = try XCTUnwrap(SecKeyCopyPublicKey(privateKey))
+    let der = try XCTUnwrap(SecKeyCopyExternalRepresentation(privateKey, &error) as Data?)
+    let pem = Data(
+      "-----BEGIN RSA PRIVATE KEY-----\n\(der.base64EncodedString())\n-----END RSA PRIVATE KEY-----\n".utf8
+    )
+    var credential = try StoredGitHubAppCredential(appID: 12345, pemData: pem)
+    defer { credential.clear() }
+    let now = Date(timeIntervalSince1970: 2_000_000_000)
+
+    let jwt = try credential.makeJWT(now: now)
+    let parts = jwt.split(separator: ".")
+    XCTAssertEqual(parts.count, 3)
+    let header = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: try decodeBase64URL(parts[0])) as? [String: String]
+    )
+    let claims = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: try decodeBase64URL(parts[1])) as? [String: Any]
+    )
+    XCTAssertEqual(header["alg"], "RS256")
+    XCTAssertEqual(header["typ"], "JWT")
+    XCTAssertEqual((claims["iss"] as? NSNumber)?.int64Value, 12345)
+    XCTAssertEqual((claims["iat"] as? NSNumber)?.int64Value, 1_999_999_940)
+    XCTAssertEqual((claims["exp"] as? NSNumber)?.int64Value, 2_000_000_480)
+    let signingInput = Data("\(parts[0]).\(parts[1])".utf8)
+    let signature = try decodeBase64URL(parts[2])
+    XCTAssertTrue(
+      SecKeyVerifySignature(
+        publicKey,
+        .rsaSignatureMessagePKCS1v15SHA256,
+        signingInput as CFData,
+        signature as CFData,
+        &error
+      )
+    )
+  }
+
+  func testReplacementStorageFailurePreservesStoredAndInMemoryCredential() async throws {
+    let namespaceID = UUID()
+    let original = Data([9, 8, 7])
+    let storage = RecordingCredentialStorage(
+      credentials: [namespaceID: original],
+      replaceError: TestCredentialStorageError.failed
+    )
+    let session = NamespaceCredentialSession(
+      namespaceID: namespaceID,
+      authorizer: RecordingUnlockAuthorizer(),
+      storage: storage
+    )
+    let privateKeyURL = try makePrivateKeyPEM()
+    defer { try? FileManager.default.removeItem(at: privateKeyURL) }
+    try await session.unlock(reason: "Test unlock")
+
+    do {
+      try await session.configureGitHubApp(appID: 10, privateKeyFilePath: privateKeyURL.path)
+      XCTFail("Expected replacement failure")
+    } catch {}
+
+    XCTAssertEqual(storage.storedCredential(for: namespaceID), original)
+    let signature = try await session.signChallenge(Data("challenge".utf8))
+    let expected = Data(
+      HMAC<SHA256>.authenticationCode(
+        for: Data("challenge".utf8),
+        using: SymmetricKey(data: original)
+      )
+    )
+    XCTAssertEqual(signature, expected)
+  }
+
+  func testOversizedPrivateKeyFileIsRejectedBeforeReplacement() async throws {
+    let namespaceID = UUID()
+    let original = Data([1, 2, 3])
+    let storage = RecordingCredentialStorage(credentials: [namespaceID: original])
+    let session = NamespaceCredentialSession(
+      namespaceID: namespaceID,
+      authorizer: RecordingUnlockAuthorizer(),
+      storage: storage
+    )
+    let url = FileManager.default.temporaryDirectory
+      .appendingPathComponent("oversized-github-key-\(UUID().uuidString)")
+    try Data(repeating: 0x41, count: 128 * 1_024 + 1).write(to: url)
+    defer { try? FileManager.default.removeItem(at: url) }
+    try await session.unlock(reason: "Test unlock")
+
+    do {
+      try await session.configureGitHubApp(appID: 10, privateKeyFilePath: url.path)
+      XCTFail("Expected bounded private key failure")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("unexpectedly large"))
+    }
+    XCTAssertEqual(storage.storedCredential(for: namespaceID), original)
+  }
+
+  private func decodeBase64URL(_ value: Substring) throws -> Data {
+    var base64 = String(value)
+      .replacingOccurrences(of: "-", with: "+")
+      .replacingOccurrences(of: "_", with: "/")
+    base64 += String(repeating: "=", count: (4 - base64.count % 4) % 4)
+    return try XCTUnwrap(Data(base64Encoded: base64))
+  }
+
   private func makePrivateKeyPEM() throws -> URL {
     let attributes: [String: Any] = [
       kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
@@ -285,10 +392,16 @@ private final class RecordingCredentialStorage: NamespaceCredentialStoring, @unc
   private var loadInvocations = 0
   private var storeInvocations = 0
   private let storeError: Error?
+  private let replaceError: Error?
 
-  init(credentials: [UUID: Data] = [:], storeError: Error? = nil) {
+  init(
+    credentials: [UUID: Data] = [:],
+    storeError: Error? = nil,
+    replaceError: Error? = nil
+  ) {
     self.credentials = credentials
     self.storeError = storeError
+    self.replaceError = replaceError
   }
 
   func load(
@@ -319,6 +432,7 @@ private final class RecordingCredentialStorage: NamespaceCredentialStoring, @unc
     namespaceID: UUID,
     authorization: NamespaceUnlockAuthorization
   ) throws {
+    if let replaceError { throw replaceError }
     lock.withLock {
       credentials[namespaceID] = credential
     }

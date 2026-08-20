@@ -43,6 +43,7 @@ struct SymphonyDesktopApp: App {
     _lockController = StateObject(wrappedValue: namespaceLockController)
     _sleepLockCoordinator = StateObject(wrappedValue: namespaceSleepLockCoordinator)
     let namespaceWindowSecurityCoordinator: NamespaceWindowSecurityCoordinator
+    let githubConnectionControllerForShutdown: GitHubConnectionController
     do {
       let repository = try FileNamespaceRepository()
       let credentialCleanupCoordinator = NamespaceCredentialCleanupCoordinator(
@@ -59,12 +60,12 @@ struct SymphonyDesktopApp: App {
           try await namespaceLockController.removeNamespace(id)
         }
       )
-      _githubConnectionController = StateObject(
-        wrappedValue: GitHubConnectionController(
-          broker: credentialBroker,
-          credentialCleanup: githubCredentialCleanupCoordinator
-        )
+      let githubController = GitHubConnectionController(
+        broker: credentialBroker,
+        credentialCleanup: githubCredentialCleanupCoordinator
       )
+      githubConnectionControllerForShutdown = githubController
+      _githubConnectionController = StateObject(wrappedValue: githubController)
       let codexAuthenticationController = CodexAuthenticationController(
         authenticator: authenticationManager,
         directoryURL: { id in
@@ -121,6 +122,7 @@ struct SymphonyDesktopApp: App {
       )
       namespaceWindowSecurityCoordinator = NamespaceWindowSecurityCoordinator(
         lockCredentials: {
+          try await githubController.quiesceAll()
           try await namespaceLockController.lockAll()
         },
         cancelAuthentication: {
@@ -158,16 +160,17 @@ struct SymphonyDesktopApp: App {
       _authenticationController = StateObject(
         wrappedValue: codexAuthenticationController
       )
-      _githubConnectionController = StateObject(
-        wrappedValue: GitHubConnectionController(
-          broker: credentialBroker,
-          credentialCleanup: UnavailableGitHubCredentialCleanup(
-            message: error.localizedDescription
-          )
+      let githubController = GitHubConnectionController(
+        broker: credentialBroker,
+        credentialCleanup: UnavailableGitHubCredentialCleanup(
+          message: error.localizedDescription
         )
       )
+      githubConnectionControllerForShutdown = githubController
+      _githubConnectionController = StateObject(wrappedValue: githubController)
       namespaceWindowSecurityCoordinator = NamespaceWindowSecurityCoordinator(
         lockCredentials: {
+          try await githubController.quiesceAll()
           try await namespaceLockController.lockAll()
         },
         cancelAuthentication: {
@@ -196,6 +199,7 @@ struct SymphonyDesktopApp: App {
       try await ApplicationSecurityShutdownCoordinator(
         windowSecurity: namespaceWindowSecurityCoordinator,
         lockCredentials: {
+          try await githubConnectionControllerForShutdown.quiesceAll()
           try await namespaceLockController.shutdownForApplicationTermination()
         },
         shutdownAuthentication: {

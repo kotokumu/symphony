@@ -130,6 +130,19 @@ final class KeychainNamespaceCredentialStorageTests: XCTestCase {
     ) { error in
       XCTAssertTrue(error.localizedDescription.contains("Protected credential storage failed"))
     }
+
+    let replacementFailure = KeychainNamespaceCredentialStorage(
+      keychain: RecordingNamespaceKeychain(updateStatus: errSecNotAvailable)
+    )
+    XCTAssertThrowsError(
+      try replacementFailure.replace(
+        Data([2]),
+        namespaceID: namespaceID,
+        authorization: authorization
+      )
+    ) { error in
+      XCTAssertTrue(error.localizedDescription.contains("Protected credential storage failed"))
+    }
   }
 
   func testAccessControlAndDeleteFailuresRemainVisible() throws {
@@ -200,6 +213,7 @@ private final class RecordingNamespaceKeychain: NamespaceKeychainAccessing, @unc
   private let copyResult: CFTypeRef?
   private let addStatus: OSStatus
   private let deleteStatus: OSStatus
+  private let updateStatus: OSStatus
   private let accessControlError: Error?
   private(set) var copyQueries: [[String: Any]] = []
   private(set) var addQueries: [[String: Any]] = []
@@ -212,12 +226,14 @@ private final class RecordingNamespaceKeychain: NamespaceKeychainAccessing, @unc
     copyStatus: OSStatus = errSecSuccess,
     copyResult: CFTypeRef? = Data([1]) as CFData,
     addStatus: OSStatus = errSecSuccess,
+    updateStatus: OSStatus = errSecSuccess,
     deleteStatus: OSStatus = errSecSuccess,
     accessControlError: Error? = nil
   ) {
     self.copyStatus = copyStatus
     self.copyResult = copyResult
     self.addStatus = addStatus
+    self.updateStatus = updateStatus
     self.deleteStatus = deleteStatus
     self.accessControlError = accessControlError
   }
@@ -256,7 +272,7 @@ private final class RecordingNamespaceKeychain: NamespaceKeychainAccessing, @unc
         attributes as NSDictionary as! [String: Any]
       )
     )
-    return errSecSuccess
+    return updateStatus
   }
 
   func delete(_ query: CFDictionary) -> OSStatus {

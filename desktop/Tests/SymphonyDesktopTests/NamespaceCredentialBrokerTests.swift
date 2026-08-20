@@ -1,6 +1,7 @@
 import Foundation
 import XCTest
 
+@testable import SymphonyCredentialBrokerProtocol
 @testable import SymphonyDesktopCore
 @testable import SymphonyDesktopInfrastructure
 
@@ -186,6 +187,31 @@ final class NamespaceCredentialBrokerTests: XCTestCase {
     await launcher.completeLock()
     try await lock.value
   }
+
+  func testGitHubCapabilitiesAndRemovalRemainNamespaceScoped() async throws {
+    let first = UUID()
+    let second = UUID()
+    let launcher = RecordingBrokerLauncher()
+    let broker = NamespaceCredentialBroker(launcher: launcher)
+    try await broker.unlock(namespaceID: first)
+    try await broker.unlock(namespaceID: second)
+
+    let firstInstallations = try await broker.discoverGitHubInstallations(namespaceID: first)
+    let secondInstallations = try await broker.discoverGitHubInstallations(namespaceID: second)
+    XCTAssertEqual(firstInstallations.first?.accountLogin, first.uuidString.lowercased())
+    XCTAssertEqual(secondInstallations.first?.accountLogin, second.uuidString.lowercased())
+
+    try await broker.removeGitHubAppCredential(namespaceID: first)
+
+    do {
+      _ = try await broker.discoverGitHubInstallations(namespaceID: first)
+      XCTFail("Expected removed namespace capability to be locked")
+    } catch {
+      XCTAssertEqual(error.localizedDescription, "Protected namespace credentials are locked.")
+    }
+    let stillAvailable = try await broker.discoverGitHubInstallations(namespaceID: second)
+    XCTAssertEqual(stillAvailable.first?.accountLogin, second.uuidString.lowercased())
+  }
 }
 
 private actor RecordingBrokerLauncher: CredentialBrokerSessionLaunching {
@@ -197,7 +223,7 @@ private actor RecordingBrokerLauncher: CredentialBrokerSessionLaunching {
 
   private(set) var operations: [Operation] = []
 
-  func unlock(namespaceID: UUID) async throws -> any CredentialBrokerSessionHandle {
+  func unlock(namespaceID: UUID) async throws -> any NamespaceCredentialBrokerSessionHandle {
     operations.append(.unlock(namespaceID))
     return RecordingBrokerSession(namespaceID: namespaceID, launcher: self)
   }
@@ -217,7 +243,7 @@ private actor RecordingBrokerLauncher: CredentialBrokerSessionLaunching {
   }
 }
 
-private actor RecordingBrokerSession: CredentialBrokerSessionHandle {
+private actor RecordingBrokerSession: NamespaceCredentialBrokerSessionHandle {
   let namespaceID: UUID
   let launcher: RecordingBrokerLauncher
   private var locked = false
@@ -236,6 +262,21 @@ private actor RecordingBrokerSession: CredentialBrokerSessionHandle {
   func signChallenge(_ challenge: Data) async throws -> Data {
     Data(challenge.reversed())
   }
+
+  func configureGitHubApp(appID: Int64, privateKeyFileURL: URL) async throws {}
+  func listGitHubInstallations() async throws -> [GitHubInstallationDescriptor] {
+    [
+      GitHubInstallationDescriptor(
+        id: 20,
+        accountLogin: namespaceID.uuidString.lowercased(),
+        accountType: "Organization",
+        permissions: ["issues": "read", "contents": "write"],
+        isSuspended: false
+      )
+    ]
+  }
+  func listGitHubRepositories(installationID: Int64) async throws
+    -> [GitHubRepositoryDescriptor] { [] }
 }
 
 private actor GatedBrokerLauncher: CredentialBrokerSessionLaunching {
@@ -244,7 +285,7 @@ private actor GatedBrokerLauncher: CredentialBrokerSessionLaunching {
   private var unlockContinuation: CheckedContinuation<Void, Never>?
   private(set) var ownsSession = false
 
-  func unlock(namespaceID: UUID) async throws -> any CredentialBrokerSessionHandle {
+  func unlock(namespaceID: UUID) async throws -> any NamespaceCredentialBrokerSessionHandle {
     unlockStarted = true
     unlockStartWaiters.forEach { $0.resume() }
     unlockStartWaiters.removeAll()
@@ -274,7 +315,7 @@ private actor GatedBrokerLauncher: CredentialBrokerSessionLaunching {
   }
 }
 
-private struct GatedBrokerSession: CredentialBrokerSessionHandle {
+private struct GatedBrokerSession: NamespaceCredentialBrokerSessionHandle {
   let namespaceID: UUID
   let launcher: GatedBrokerLauncher
 
@@ -283,6 +324,11 @@ private struct GatedBrokerSession: CredentialBrokerSessionHandle {
   }
 
   func signChallenge(_ challenge: Data) async throws -> Data { challenge }
+
+  func configureGitHubApp(appID: Int64, privateKeyFileURL: URL) async throws {}
+  func listGitHubInstallations() async throws -> [GitHubInstallationDescriptor] { [] }
+  func listGitHubRepositories(installationID: Int64) async throws
+    -> [GitHubRepositoryDescriptor] { [] }
 }
 
 private actor FailingPendingBrokerLauncher: CredentialBrokerSessionLaunching {
@@ -290,7 +336,7 @@ private actor FailingPendingBrokerLauncher: CredentialBrokerSessionLaunching {
   private var launchShouldFail = true
   private(set) var ownsSession = false
 
-  func unlock(namespaceID: UUID) async throws -> any CredentialBrokerSessionHandle {
+  func unlock(namespaceID: UUID) async throws -> any NamespaceCredentialBrokerSessionHandle {
     ownsSession = true
     if launchShouldFail {
       launchShouldFail = false
@@ -310,7 +356,7 @@ private actor FailingPendingBrokerLauncher: CredentialBrokerSessionLaunching {
   func purge(namespaceID: UUID) {}
 }
 
-private struct FailingPendingBrokerSession: CredentialBrokerSessionHandle {
+private struct FailingPendingBrokerSession: NamespaceCredentialBrokerSessionHandle {
   let namespaceID: UUID
   let launcher: FailingPendingBrokerLauncher
 
@@ -319,6 +365,11 @@ private struct FailingPendingBrokerSession: CredentialBrokerSessionHandle {
   }
 
   func signChallenge(_ challenge: Data) async throws -> Data { challenge }
+
+  func configureGitHubApp(appID: Int64, privateKeyFileURL: URL) async throws {}
+  func listGitHubInstallations() async throws -> [GitHubInstallationDescriptor] { [] }
+  func listGitHubRepositories(installationID: Int64) async throws
+    -> [GitHubRepositoryDescriptor] { [] }
 }
 
 private enum TestPendingBrokerError: LocalizedError {
@@ -339,7 +390,7 @@ private actor GatedCapabilityBrokerLauncher: CredentialBrokerSessionLaunching {
   private var lockContinuation: CheckedContinuation<Void, Never>?
   private(set) var capabilityCount = 0
 
-  func unlock(namespaceID: UUID) -> any CredentialBrokerSessionHandle {
+  func unlock(namespaceID: UUID) -> any NamespaceCredentialBrokerSessionHandle {
     GatedCapabilityBrokerSession(namespaceID: namespaceID, launcher: self)
   }
 
@@ -372,7 +423,7 @@ private actor GatedCapabilityBrokerLauncher: CredentialBrokerSessionLaunching {
   }
 }
 
-private struct GatedCapabilityBrokerSession: CredentialBrokerSessionHandle {
+private struct GatedCapabilityBrokerSession: NamespaceCredentialBrokerSessionHandle {
   let namespaceID: UUID
   let launcher: GatedCapabilityBrokerLauncher
 
@@ -384,4 +435,9 @@ private struct GatedCapabilityBrokerSession: CredentialBrokerSessionHandle {
     await launcher.recordCapability()
     return challenge
   }
+
+  func configureGitHubApp(appID: Int64, privateKeyFileURL: URL) async throws {}
+  func listGitHubInstallations() async throws -> [GitHubInstallationDescriptor] { [] }
+  func listGitHubRepositories(installationID: Int64) async throws
+    -> [GitHubRepositoryDescriptor] { [] }
 }

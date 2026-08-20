@@ -5,11 +5,11 @@ import SymphonyDesktopCore
 public actor NamespaceCredentialBroker {
   private struct PendingUnlock {
     let generation: UUID
-    let task: Task<any CredentialBrokerSessionHandle, Error>
+    let task: Task<any NamespaceCredentialBrokerSessionHandle, Error>
   }
 
   private let launcher: any CredentialBrokerSessionLaunching
-  private var sessions: [Namespace.ID: any CredentialBrokerSessionHandle] = [:]
+  private var sessions: [Namespace.ID: any NamespaceCredentialBrokerSessionHandle] = [:]
   private var pendingUnlocks: [Namespace.ID: PendingUnlock] = [:]
   private var lockingNamespaces: Set<Namespace.ID> = []
   private var startSuspensionCount = 0
@@ -97,19 +97,34 @@ public actor NamespaceCredentialBroker {
     try await session.configureGitHubApp(appID: appID, privateKeyFileURL: privateKeyFileURL)
   }
 
-  public func listGitHubInstallations(
+  public func discoverGitHubInstallations(
     namespaceID: Namespace.ID
-  ) async throws -> [GitHubInstallationDescriptor] {
+  ) async throws -> [GitHubInstallation] {
     let session = try availableSession(namespaceID)
-    return try await session.listGitHubInstallations()
+    return try await session.listGitHubInstallations().map {
+      GitHubInstallation(
+        id: $0.id,
+        accountLogin: $0.accountLogin,
+        accountType: $0.accountType,
+        permissions: $0.permissions,
+        isSuspended: $0.isSuspended
+      )
+    }
   }
 
-  public func listGitHubRepositories(
+  public func discoverGitHubRepositories(
     installationID: Int64,
     namespaceID: Namespace.ID
-  ) async throws -> [GitHubRepositoryDescriptor] {
+  ) async throws -> [GitHubRepository] {
     let session = try availableSession(namespaceID)
-    return try await session.listGitHubRepositories(installationID: installationID)
+    return try await session.listGitHubRepositories(installationID: installationID).map {
+      GitHubRepository(
+        id: $0.id,
+        fullName: $0.fullName,
+        htmlURL: $0.htmlURL,
+        isPrivate: $0.isPrivate
+      )
+    }
   }
 
   public func lockAll() async throws {
@@ -164,7 +179,7 @@ public actor NamespaceCredentialBroker {
 
   private func availableSession(
     _ namespaceID: Namespace.ID
-  ) throws -> any CredentialBrokerSessionHandle {
+  ) throws -> any NamespaceCredentialBrokerSessionHandle {
     guard
       let session = sessions[namespaceID],
       !lockingNamespaces.contains(namespaceID),

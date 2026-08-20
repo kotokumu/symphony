@@ -124,6 +124,8 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
     let directory = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
     let configureURL = directory.appendingPathComponent("configure-command")
+    let installationsURL = directory.appendingPathComponent("installations-command")
+    let repositoriesURL = directory.appendingPathComponent("repositories-command")
     let script = try executableScript(
       in: directory,
       contents: """
@@ -133,8 +135,10 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
         printf '%s' "$configure" > "$BROKER_CONFIGURE_FILE"
         printf '{"status":"githubAppConfigured"}\n'
         IFS= read -r installations
+        printf '%s' "$installations" > "$BROKER_INSTALLATIONS_FILE"
         printf '{"status":"githubInstallations","installations":[{"id":20,"accountLogin":"octo","accountType":"Organization","permissions":{"issues":"read","contents":"write"},"isSuspended":false}]}\n'
         IFS= read -r repositories
+        printf '%s' "$repositories" > "$BROKER_REPOSITORIES_FILE"
         printf '{"status":"githubRepositories","repositories":[{"id":30,"fullName":"octo/research","htmlURL":"https://github.com/octo/research","isPrivate":true}]}\n'
         IFS= read -r lock_command
         """
@@ -146,6 +150,8 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
       environment: [
         "PATH": "/usr/bin:/bin",
         "BROKER_CONFIGURE_FILE": configureURL.path,
+        "BROKER_INSTALLATIONS_FILE": installationsURL.path,
+        "BROKER_REPOSITORIES_FILE": repositoriesURL.path,
       ]
     )
     let session = try await launcher.unlock(namespaceID: UUID())
@@ -160,9 +166,83 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
       from: Data(contentsOf: configureURL)
     )
     XCTAssertEqual(configure, .configureGitHubApp(appID: 10, privateKeyFilePath: keyURL.path))
+    let installationCommand = try JSONDecoder().decode(
+      CredentialBrokerCommand.self,
+      from: Data(contentsOf: installationsURL)
+    )
+    let repositoryCommand = try JSONDecoder().decode(
+      CredentialBrokerCommand.self,
+      from: Data(contentsOf: repositoriesURL)
+    )
+    XCTAssertEqual(installationCommand, .listGitHubInstallations)
+    XCTAssertEqual(repositoryCommand, .listGitHubRepositories(installationID: 20))
     XCTAssertEqual(installations.first?.accountLogin, "octo")
     XCTAssertEqual(repositories.first?.fullName, "octo/research")
     try await session.lock()
+  }
+
+  func testGitHubCapabilityRejectsFailedWrongAndMalformedFrames() async throws {
+    let responses = [
+      ("{\"status\":\"failed\",\"message\":\"Installation revoked.\"}", "Installation revoked."),
+      ("{\"status\":\"githubRepositories\",\"repositories\":[]}", "invalid capability response"),
+      ("not-json", "invalid capability response"),
+    ]
+    for (response, expected) in responses {
+      let directory = try temporaryDirectory()
+      defer { try? FileManager.default.removeItem(at: directory) }
+      let script = try executableScript(
+        in: directory,
+        contents: """
+          #!/bin/sh
+          printf '{"status":"unlocked"}\n'
+          IFS= read -r command
+          printf '%s\n' '\(response)'
+          """
+      )
+      let launcher = CredentialBrokerProcessLauncher(
+        executableURL: script,
+        handshakeTimeout: 1,
+        stopTimeout: 1,
+        environment: ["PATH": "/usr/bin:/bin"]
+      )
+      let session = try await launcher.unlock(namespaceID: UUID())
+
+      do {
+        _ = try await session.listGitHubInstallations()
+        XCTFail("Expected broker frame rejection")
+      } catch {
+        XCTAssertTrue(error.localizedDescription.contains(expected), error.localizedDescription)
+      }
+    }
+  }
+
+  func testGitHubCapabilityRejectsOversizedFrame() async throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let script = try executableScript(
+      in: directory,
+      contents: """
+        #!/bin/sh
+        printf '{"status":"unlocked"}\n'
+        IFS= read -r command
+        /bin/dd if=/dev/zero bs=1048577 count=1 2>/dev/null | /usr/bin/tr '\\000' a
+        printf '\n'
+        """
+    )
+    let launcher = CredentialBrokerProcessLauncher(
+      executableURL: script,
+      handshakeTimeout: 2,
+      stopTimeout: 1,
+      environment: ["PATH": "/usr/bin:/bin"]
+    )
+    let session = try await launcher.unlock(namespaceID: UUID())
+
+    do {
+      _ = try await session.listGitHubInstallations()
+      XCTFail("Expected broker frame limit")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("safe limit"), error.localizedDescription)
+    }
   }
 
   func testMissingExecutableProducesActionableError() async {

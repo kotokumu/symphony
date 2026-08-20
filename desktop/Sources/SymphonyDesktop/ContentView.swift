@@ -1,7 +1,6 @@
 import SwiftUI
 import AppKit
 import SymphonyDesktopCore
-import SymphonyCredentialBrokerProtocol
 
 struct ContentView: View {
   @ObservedObject var controller: NamespaceController
@@ -635,7 +634,7 @@ private struct NamespaceDetailView: View {
 private struct GitHubConnectionSheet: View {
   let namespace: DesktopNamespace
   @ObservedObject var controller: GitHubConnectionController
-  let connect: (GitHubRepositoryDescriptor) async throws -> Void
+  let connect: (GitHubRepository) async throws -> Void
   let cancel: () async -> Void
 
   @State private var appID = ""

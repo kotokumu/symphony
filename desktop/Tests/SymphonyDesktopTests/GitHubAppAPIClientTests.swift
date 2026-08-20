@@ -72,6 +72,119 @@ final class GitHubAppAPIClientTests: XCTestCase {
       }
     }
   }
+
+  func testTransportUsesNoSharedCacheCookiesOrCredentialStorage() {
+    let configuration = URLSessionGitHubHTTPTransport.makeEphemeralConfiguration()
+
+    XCTAssertNil(configuration.urlCache)
+    XCTAssertNil(configuration.httpCookieStorage)
+    XCTAssertFalse(configuration.httpShouldSetCookies)
+    XCTAssertNil(configuration.urlCredentialStorage)
+    XCTAssertEqual(configuration.requestCachePolicy, .reloadIgnoringLocalCacheData)
+  }
+
+  func testRejectsPlaintextBaseURLBeforeSendingJWT() async {
+    let transport = StubGitHubTransport(responses: [])
+    let client = GitHubAppAPIClient(
+      baseURL: URL(string: "http://api.github.test")!,
+      transport: transport
+    )
+
+    do {
+      _ = try await client.listInstallations(jwt: "must-not-be-sent")
+      XCTFail("Expected HTTPS enforcement")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("HTTPS"))
+    }
+    let requests = await transport.requests
+    XCTAssertTrue(requests.isEmpty)
+  }
+
+  func testPaginatesInstallationsAndStopsOnShortPage() async throws {
+    let firstPage = installationPage(count: 100, startingAt: 1)
+    let transport = StubGitHubTransport(
+      responses: [
+        .json(status: 200, body: firstPage),
+        .json(status: 200, body: installationPage(count: 1, startingAt: 101)),
+      ]
+    )
+    let client = GitHubAppAPIClient(
+      baseURL: URL(string: "https://api.github.test")!,
+      transport: transport
+    )
+
+    let values = try await client.listInstallations(jwt: "jwt")
+
+    XCTAssertEqual(values.count, 101)
+    let requests = await transport.requests
+    XCTAssertEqual(requests[0].url?.query, "per_page=100&page=1")
+    XCTAssertEqual(requests[1].url?.query, "per_page=100&page=2")
+  }
+
+  func testRejectsMalformedAndOversizedResponses() async {
+    let cases: [(Data, String)] = [
+      (Data("not-json".utf8), "unreadable response"),
+      (Data(repeating: 0x20, count: 2 * 1_024 * 1_024 + 1), "more connection data"),
+    ]
+    for (data, expected) in cases {
+      let transport = StubGitHubTransport(responses: [.init(status: 200, data: data)])
+      let client = GitHubAppAPIClient(
+        baseURL: URL(string: "https://api.github.test")!,
+        transport: transport
+      )
+      do {
+        _ = try await client.listInstallations(jwt: "jwt")
+        XCTFail("Expected bounded response failure")
+      } catch {
+        XCTAssertTrue(error.localizedDescription.contains(expected), error.localizedDescription)
+      }
+    }
+  }
+
+  func testRejectsInvalidInstallationBeforeSendingRequest() async {
+    let transport = StubGitHubTransport(responses: [])
+    let client = GitHubAppAPIClient(
+      baseURL: URL(string: "https://api.github.test")!,
+      transport: transport
+    )
+
+    do {
+      _ = try await client.listRepositories(installationID: 0, jwt: "jwt")
+      XCTFail("Expected invalid installation")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("no longer accessible"))
+    }
+    let requests = await transport.requests
+    XCTAssertTrue(requests.isEmpty)
+  }
+
+  func testMapsTransportFailureWithoutLeakingJWT() async {
+    let client = GitHubAppAPIClient(
+      baseURL: URL(string: "https://api.github.test")!,
+      transport: FailingGitHubTransport()
+    )
+
+    do {
+      _ = try await client.listInstallations(jwt: "secret-jwt")
+      XCTFail("Expected transport failure")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("could not be reached"))
+      XCTAssertFalse(error.localizedDescription.contains("secret-jwt"))
+    }
+  }
+
+  private func installationPage(count: Int, startingAt firstID: Int) -> String {
+    let values = (firstID..<(firstID + count)).map { id in
+      "{\"id\":\(id),\"account\":{\"login\":\"account-\(id)\",\"type\":\"Organization\"},\"permissions\":{\"issues\":\"read\",\"contents\":\"write\"},\"suspended_at\":null}"
+    }
+    return "[\(values.joined(separator: ","))]"
+  }
+}
+
+private struct FailingGitHubTransport: GitHubHTTPTransporting {
+  func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+    throw URLError(.notConnectedToInternet)
+  }
 }
 
 private actor StubGitHubTransport: GitHubHTTPTransporting {

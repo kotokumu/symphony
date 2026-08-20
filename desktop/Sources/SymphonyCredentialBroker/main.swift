@@ -95,6 +95,13 @@ struct SymphonyCredentialBrokerMain {
   private static func write<Value: Encodable>(_ value: Value) {
     do {
       var data = try JSONEncoder().encode(value)
+      if data.count > CredentialBrokerProtocolLimits.maximumResponseBytes {
+        data = try JSONEncoder().encode(
+          CredentialBrokerResult.failed(
+            message: "The credential broker result exceeded the safe response limit."
+          )
+        )
+      }
       data.append(0x0A)
       FileHandle.standardOutput.write(data)
     } catch {

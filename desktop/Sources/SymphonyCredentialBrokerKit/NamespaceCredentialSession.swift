@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import Darwin
 import Security
 import SymphonyCredentialBrokerProtocol
 
@@ -99,13 +100,7 @@ public actor NamespaceCredentialSession {
     guard let authorization, credential != nil else {
       throw NamespaceCredentialSessionError.locked
     }
-    let fileURL = URL(fileURLWithPath: privateKeyFilePath)
-    let values = try? fileURL.resourceValues(forKeys: [.isRegularFileKey])
-    guard values?.isRegularFile == true else {
-      throw GitHubAppCredentialError.invalidPrivateKey
-    }
-
-    var pemData = try Data(contentsOf: fileURL)
+    var pemData = try Self.readPrivateKey(at: privateKeyFilePath)
     defer { pemData.resetBytes(in: pemData.startIndex..<pemData.endIndex) }
     var githubCredential = try StoredGitHubAppCredential(appID: appID, pemData: pemData)
     defer { githubCredential.clear() }
@@ -164,6 +159,35 @@ public actor NamespaceCredentialSession {
       defer { githubCredential.clear() }
       return try githubCredential.makeJWT()
     }
+  }
+
+  private static func readPrivateKey(at path: String) throws -> Data {
+    let maximumBytes = 128 * 1_024
+    let handle: FileHandle
+    do {
+      handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
+    } catch {
+      throw GitHubAppCredentialError.invalidPrivateKey
+    }
+    defer { try? handle.close() }
+
+    var information = stat()
+    guard fstat(handle.fileDescriptor, &information) == 0,
+      information.st_mode & S_IFMT == S_IFREG
+    else {
+      throw GitHubAppCredentialError.invalidPrivateKey
+    }
+    guard information.st_size <= maximumBytes else {
+      throw GitHubAppCredentialError.privateKeyTooLarge
+    }
+    guard var data = try handle.read(upToCount: maximumBytes + 1) else {
+      throw GitHubAppCredentialError.invalidPrivateKey
+    }
+    guard data.count <= maximumBytes else {
+      data.resetBytes(in: data.startIndex..<data.endIndex)
+      throw GitHubAppCredentialError.privateKeyTooLarge
+    }
+    return data
   }
 }
 
