@@ -864,7 +864,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       credential_output=$(printf 'protocol=https\nhost=github.com\npath=octo/repo\n\n' | \
         "\(systemGit.path)" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" credential fill)
       printf 'STEP=credential\n'
-      "\(systemGit.path)" init --quiet /dev/fd/4
+      "\(systemGit.path)" -C /dev/fd/4 init --quiet .
       touch /dev/fd/4/sandbox-write-probe
       printf 'STEP=workspace-write\n'
       if touch "$HOME/../sandbox-escape-$$" 2>/dev/null; then exit 91; fi

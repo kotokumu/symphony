@@ -556,7 +556,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       return GitExecutionAuthority(
         descriptor: descriptor,
         writeRoot: plan.targetURL.deletingLastPathComponent(),
-        arguments: ["clone", "--", plan.repositoryURL.absoluteString, "/dev/fd/4"]
+        arguments: ["-C", "/dev/fd/4", "clone", "--", plan.repositoryURL.absoluteString, "."]
       )
     case .fetch:
       return try existingRepositoryAuthority(
