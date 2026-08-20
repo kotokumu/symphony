@@ -59,7 +59,6 @@ codesign \
   --entitlements "$broker_entitlements" \
   --sign "$signing_identity" \
   "$credential_store_smoke"
-"$credential_store_smoke"
 
 signed_entitlements="$staging_directory/SymphonyCredentialBroker.signed-entitlements.plist"
 codesign -d --entitlements :- "$helper" > "$signed_entitlements" 2>/dev/null
@@ -73,6 +72,21 @@ if [ "$actual_application_identifier" != "$expected_application_identifier" ]; t
   echo "error: the credential broker is missing its Data Protection Keychain entitlement" >&2
   exit 1
 fi
+actual_keychain_group=$(
+  /usr/libexec/PlistBuddy \
+    -c "Print :keychain-access-groups:0" \
+    "$signed_entitlements"
+)
+if [ "$actual_keychain_group" != "$expected_application_identifier" ]; then
+  echo "error: the credential broker has an unexpected Keychain access group" >&2
+  exit 1
+fi
+if /usr/libexec/PlistBuddy -c "Print :keychain-access-groups:1" "$signed_entitlements" >/dev/null 2>&1; then
+  echo "error: the credential broker has more than one Keychain access group" >&2
+  exit 1
+fi
+
+"$credential_store_smoke"
 
 codesign \
   --force \
