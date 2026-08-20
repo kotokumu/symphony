@@ -622,11 +622,18 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
   ) -> [String] {
     [
       "-D", "WRITE_ROOT=\(authority.writeRoot.path)",
-      "-D", "WRITE_ROOT_REAL=\(authority.writeRoot.resolvingSymlinksInPath().path)",
+      "-D", "WRITE_ROOT_REAL=\(Self.canonicalSandboxPath(authority.writeRoot.path))",
       "-D", "TEMP_ROOT=\(temporaryDirectory.path)",
-      "-D", "TEMP_ROOT_REAL=\(temporaryDirectory.resolvingSymlinksInPath().path)",
+      "-D", "TEMP_ROOT_REAL=\(Self.canonicalSandboxPath(temporaryDirectory.path))",
       "-p", Self.sandboxProfile(proxyPort: proxyPort),
     ]
+  }
+
+  static func canonicalSandboxPath(_ path: String) -> String {
+    var buffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
+    guard realpath(path, &buffer) != nil else { return path }
+    let bytes = buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }
+    return String(decoding: bytes, as: UTF8.self)
   }
 
   static func sandboxProfile(proxyPort: UInt16) -> String {

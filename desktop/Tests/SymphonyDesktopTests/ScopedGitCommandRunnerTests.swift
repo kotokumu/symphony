@@ -6,6 +6,16 @@ import XCTest
 @testable import SymphonyCredentialBrokerProtocol
 
 final class ScopedGitCommandRunnerTests: XCTestCase {
+  func testCanonicalSandboxPathResolvesTheSystemTemporaryDirectoryAlias() {
+    let temporaryPath = FileManager.default.temporaryDirectory.path
+    let canonical = ScopedGitCommandRunner.canonicalSandboxPath(temporaryPath)
+
+    XCTAssertTrue(canonical.hasPrefix("/"))
+    if temporaryPath.hasPrefix("/var/") {
+      XCTAssertTrue(canonical.hasPrefix("/private/var/"), canonical)
+    }
+  }
+
   func testUnavailableGitFailsBeforeCredentialAcquisition() async throws {
     let fixture = try makeFixture()
     let credentialRequests = CredentialRequestCounter()
