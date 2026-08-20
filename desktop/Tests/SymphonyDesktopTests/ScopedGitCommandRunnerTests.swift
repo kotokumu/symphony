@@ -627,8 +627,8 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     let executable = try makeExecutable(
       """
       #!/bin/sh
-      /bin/pwd
-      /bin/cat .git/config
+      printf 'CAPTURED-CONFIG\n'
+      while IFS= read -r line; do printf '%s\n' "$line"; done < .git/config
       exit 0
       """
     )
@@ -660,7 +660,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       OperationCredential(copying: source)
     }
 
-    XCTAssertTrue(result.output.contains("captured-original"))
+    XCTAssertTrue(result.output.contains("CAPTURED-CONFIG"))
     XCTAssertTrue(result.output.contains("url = https://github.com/octo/repo"))
     XCTAssertFalse(result.output.contains("attacker-config-was-read"))
   }

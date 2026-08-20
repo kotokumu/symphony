@@ -609,8 +609,10 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     proxyPort: UInt16
   ) -> [String] {
     [
-      "-D", "WRITE_ROOT=\(authority.writeRoot.resolvingSymlinksInPath().path)",
-      "-D", "TEMP_ROOT=\(temporaryDirectory.resolvingSymlinksInPath().path)",
+      "-D", "WRITE_ROOT=\(authority.writeRoot.path)",
+      "-D", "WRITE_ROOT_REAL=\(authority.writeRoot.resolvingSymlinksInPath().path)",
+      "-D", "TEMP_ROOT=\(temporaryDirectory.path)",
+      "-D", "TEMP_ROOT_REAL=\(temporaryDirectory.resolvingSymlinksInPath().path)",
       "-p", Self.sandboxProfile(proxyPort: proxyPort),
     ]
   }
@@ -625,13 +627,17 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       file-write-flags file-write-xattr file-write-setugid file-write-times
       (require-all
         (require-not (subpath (param "WRITE_ROOT")))
+        (require-not (subpath (param "WRITE_ROOT_REAL")))
         (require-not (subpath (param "TEMP_ROOT")))
+        (require-not (subpath (param "TEMP_ROOT_REAL")))
         (require-not (literal "/dev/null"))))
     (deny file-write-data
       (require-all
         (vnode-type REGULAR-FILE)
         (require-not (subpath (param "WRITE_ROOT")))
+        (require-not (subpath (param "WRITE_ROOT_REAL")))
         (require-not (subpath (param "TEMP_ROOT")))
+        (require-not (subpath (param "TEMP_ROOT_REAL")))
         (require-not (literal "/dev/null"))))
     """
   }
