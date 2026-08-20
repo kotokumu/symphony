@@ -77,6 +77,26 @@ final class NamespaceController: ObservableObject {
     catalog = updatedCatalog
   }
 
+  func connectNamespace(_ id: Namespace.ID, to connection: GitHubConnection) async throws {
+    try beginChange()
+    defer { finishChange() }
+
+    var updatedCatalog = catalog
+    try updatedCatalog.connect(id, to: .github(connection))
+    try await repository.save(updatedCatalog)
+    catalog = updatedCatalog
+  }
+
+  func disconnectNamespacePlatform(_ id: Namespace.ID) async throws {
+    try beginChange()
+    defer { finishChange() }
+
+    var updatedCatalog = catalog
+    try updatedCatalog.disconnectPlatform(id)
+    try await repository.save(updatedCatalog)
+    catalog = updatedCatalog
+  }
+
   func deleteNamespace(_ id: Namespace.ID) async throws -> NamespaceDeletionOutcome {
     try beginChange()
     defer { finishChange() }

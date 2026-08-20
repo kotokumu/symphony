@@ -1,16 +1,28 @@
 import Foundation
+import SymphonyCredentialBrokerProtocol
 import SymphonyDesktopCore
 
 public actor NamespaceCredentialBroker {
   private struct PendingUnlock {
     let generation: UUID
-    let task: Task<any CredentialBrokerSessionHandle, Error>
+    let task: Task<any NamespaceCredentialBrokerSessionHandle, Error>
+  }
+
+  private struct PendingLock {
+    let generation: UUID
+    let task: Task<Void, Error>
+  }
+
+  private struct PendingRemoval {
+    let generation: UUID
+    let task: Task<Void, Error>
   }
 
   private let launcher: any CredentialBrokerSessionLaunching
-  private var sessions: [Namespace.ID: any CredentialBrokerSessionHandle] = [:]
+  private var sessions: [Namespace.ID: any NamespaceCredentialBrokerSessionHandle] = [:]
   private var pendingUnlocks: [Namespace.ID: PendingUnlock] = [:]
-  private var lockingNamespaces: Set<Namespace.ID> = []
+  private var pendingLocks: [Namespace.ID: PendingLock] = [:]
+  private var pendingRemovals: [Namespace.ID: PendingRemoval] = [:]
   private var startSuspensionCount = 0
   private var applicationTerminationRequested = false
 
@@ -24,7 +36,8 @@ public actor NamespaceCredentialBroker {
     }
     guard
       pendingUnlocks[namespaceID] == nil,
-      !lockingNamespaces.contains(namespaceID),
+      pendingLocks[namespaceID] == nil,
+      pendingRemovals[namespaceID] == nil,
       startSuspensionCount == 0,
       !applicationTerminationRequested
     else {
@@ -41,7 +54,8 @@ public actor NamespaceCredentialBroker {
       let session = try await task.value
       guard
         pendingUnlocks[namespaceID]?.generation == generation,
-        !lockingNamespaces.contains(namespaceID),
+        pendingLocks[namespaceID] == nil,
+        pendingRemovals[namespaceID] == nil,
         startSuspensionCount == 0,
         !applicationTerminationRequested
       else {
@@ -64,11 +78,30 @@ public actor NamespaceCredentialBroker {
   }
 
   public func lock(namespaceID: Namespace.ID) async throws {
-    guard lockingNamespaces.insert(namespaceID).inserted else {
-      throw NamespaceCredentialBrokerError.lockInProgress
+    if let pending = pendingLocks[namespaceID] {
+      try await pending.task.value
+      return
     }
-    defer { lockingNamespaces.remove(namespaceID) }
+    let generation = UUID()
+    let task = Task { [weak self] in
+      guard let self else { return }
+      try await self.performLock(namespaceID: namespaceID)
+    }
+    pendingLocks[namespaceID] = PendingLock(generation: generation, task: task)
+    do {
+      try await task.value
+    } catch {
+      if pendingLocks[namespaceID]?.generation == generation {
+        pendingLocks.removeValue(forKey: namespaceID)
+      }
+      throw error
+    }
+    if pendingLocks[namespaceID]?.generation == generation {
+      pendingLocks.removeValue(forKey: namespaceID)
+    }
+  }
 
+  private func performLock(namespaceID: Namespace.ID) async throws {
     if let pending = pendingUnlocks[namespaceID] {
       pending.task.cancel()
       _ = try? await pending.task.value
@@ -83,15 +116,47 @@ public actor NamespaceCredentialBroker {
   }
 
   public func signChallenge(_ challenge: Data, namespaceID: Namespace.ID) async throws -> Data {
-    guard
-      let session = sessions[namespaceID],
-      !lockingNamespaces.contains(namespaceID),
-      startSuspensionCount == 0,
-      !applicationTerminationRequested
-    else {
-      throw NamespaceCredentialBrokerError.locked
-    }
+    let session = try availableSession(namespaceID)
     return try await session.signChallenge(challenge)
+  }
+
+  public func configureGitHubApp(
+    appID: Int64,
+    privateKeyFileURL: URL,
+    namespaceID: Namespace.ID
+  ) async throws {
+    let session = try availableSession(namespaceID)
+    try await session.configureGitHubApp(appID: appID, privateKeyFileURL: privateKeyFileURL)
+  }
+
+  public func discoverGitHubInstallations(
+    namespaceID: Namespace.ID
+  ) async throws -> [GitHubInstallation] {
+    let session = try availableSession(namespaceID)
+    return try await session.listGitHubInstallations().map {
+      GitHubInstallation(
+        id: $0.id,
+        accountLogin: $0.accountLogin,
+        accountType: $0.accountType,
+        permissions: $0.permissions,
+        isSuspended: $0.isSuspended
+      )
+    }
+  }
+
+  public func discoverGitHubRepositories(
+    installationID: Int64,
+    namespaceID: Namespace.ID
+  ) async throws -> [GitHubRepository] {
+    let session = try availableSession(namespaceID)
+    return try await session.listGitHubRepositories(installationID: installationID).map {
+      GitHubRepository(
+        id: $0.id,
+        fullName: $0.fullName,
+        htmlURL: $0.htmlURL,
+        isPrivate: $0.isPrivate
+      )
+    }
   }
 
   public func lockAll() async throws {
@@ -115,22 +180,55 @@ public actor NamespaceCredentialBroker {
   }
 
   public func removeNamespace(_ namespaceID: Namespace.ID) async throws {
-    try await lock(namespaceID: namespaceID)
-    try await launcher.purge(namespaceID: namespaceID)
+    if let pending = pendingRemovals[namespaceID] {
+      try await pending.task.value
+      return
+    }
+    let generation = UUID()
+    let task = Task { [weak self] in
+      guard let self else { return }
+      try await self.performRemoval(namespaceID: namespaceID)
+    }
+    pendingRemovals[namespaceID] = PendingRemoval(generation: generation, task: task)
+    do {
+      try await task.value
+    } catch {
+      if pendingRemovals[namespaceID]?.generation == generation {
+        pendingRemovals.removeValue(forKey: namespaceID)
+      }
+      throw error
+    }
+    if pendingRemovals[namespaceID]?.generation == generation {
+      pendingRemovals.removeValue(forKey: namespaceID)
+    }
+  }
+
+  public func removeGitHubAppCredential(namespaceID: Namespace.ID) async throws {
+    try await removeNamespace(namespaceID)
   }
 
   public func isUnlocked(_ namespaceID: Namespace.ID) -> Bool {
     sessions[namespaceID] != nil
   }
 
+  private func performRemoval(namespaceID: Namespace.ID) async throws {
+    try await lock(namespaceID: namespaceID)
+    try await launcher.purge(namespaceID: namespaceID)
+  }
+
   private func lockAllOwnedSessions() async throws {
     var failures: [Namespace.ID: String] = [:]
     let namespaceIDs = Set(sessions.keys)
       .union(pendingUnlocks.keys)
-      .union(lockingNamespaces)
+      .union(pendingLocks.keys)
+      .union(pendingRemovals.keys)
     for namespaceID in namespaceIDs {
       do {
-        try await lock(namespaceID: namespaceID)
+        if let pendingRemoval = pendingRemovals[namespaceID] {
+          try await pendingRemoval.task.value
+        } else {
+          try await lock(namespaceID: namespaceID)
+        }
       } catch {
         failures[namespaceID] = error.localizedDescription
       }
@@ -139,12 +237,26 @@ public actor NamespaceCredentialBroker {
       throw NamespaceCredentialBrokerError.lockAllFailed(failures)
     }
   }
+
+  private func availableSession(
+    _ namespaceID: Namespace.ID
+  ) throws -> any NamespaceCredentialBrokerSessionHandle {
+    guard
+      let session = sessions[namespaceID],
+      pendingLocks[namespaceID] == nil,
+      pendingRemovals[namespaceID] == nil,
+      startSuspensionCount == 0,
+      !applicationTerminationRequested
+    else {
+      throw NamespaceCredentialBrokerError.locked
+    }
+    return session
+  }
 }
 
 public enum NamespaceCredentialBrokerError: LocalizedError, Sendable {
   case unlockUnavailable
   case unlockInterrupted
-  case lockInProgress
   case locked
   case lockAllFailed([Namespace.ID: String])
 
@@ -154,8 +266,6 @@ public enum NamespaceCredentialBrokerError: LocalizedError, Sendable {
       "Namespace credentials cannot be unlocked while another security operation is running."
     case .unlockInterrupted:
       "Namespace unlock was interrupted because the credentials were locked."
-    case .lockInProgress:
-      "Namespace credentials are already being locked."
     case .locked:
       "Protected namespace credentials are locked."
     case .lockAllFailed(let failures):

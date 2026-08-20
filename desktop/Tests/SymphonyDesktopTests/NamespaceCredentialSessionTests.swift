@@ -1,9 +1,11 @@
 import Foundation
 import CryptoKit
 import LocalAuthentication
+import Security
 import XCTest
 
 @testable import SymphonyCredentialBrokerKit
+@testable import SymphonyCredentialBrokerProtocol
 
 final class NamespaceCredentialSessionTests: XCTestCase {
   func testFirstUnlockAuthorizesStoresAndRetainsCredentialUntilLock() async throws {
@@ -152,6 +154,314 @@ final class NamespaceCredentialSessionTests: XCTestCase {
 
     XCTAssertEqual(generated.bytesForTesting, [0, 0, 0])
   }
+
+  func testConfiguresGitHubPrivateKeyAndExposesOnlyBrokeredDiscoveryResults() async throws {
+    let namespaceID = UUID()
+    let storage = RecordingCredentialStorage(credentials: [namespaceID: Data([1, 2, 3])])
+    let githubAPI = RecordingGitHubAppAPI()
+    let session = NamespaceCredentialSession(
+      namespaceID: namespaceID,
+      authorizer: RecordingUnlockAuthorizer(),
+      storage: storage,
+      githubAPI: githubAPI
+    )
+    let privateKeyURL = try makePrivateKeyPEM()
+    defer { try? FileManager.default.removeItem(at: privateKeyURL) }
+    try await session.unlock(reason: "Test unlock")
+
+    try await session.configureGitHubApp(
+      appID: 10,
+      privateKeyFilePath: privateKeyURL.path
+    )
+    let installations = try await session.listGitHubInstallations()
+    let repositories = try await session.listGitHubRepositories(installationID: 20)
+
+    XCTAssertEqual(installations.first?.accountLogin, "octo")
+    XCTAssertEqual(repositories.first?.fullName, "octo/research")
+    var stored = try StoredGitHubAppCredential.decode(
+      from: XCTUnwrap(storage.storedCredential(for: namespaceID))
+    )
+    XCTAssertEqual(stored.appID, 10)
+    stored.clear()
+    let jwtValues = await githubAPI.jwtValues
+    XCTAssertEqual(jwtValues.count, 2)
+    XCTAssertTrue(jwtValues.allSatisfy { $0.split(separator: ".").count == 3 })
+    let privateKeyText = try String(contentsOf: privateKeyURL, encoding: .utf8)
+    XCTAssertTrue(jwtValues.allSatisfy { !$0.contains(privateKeyText) })
+  }
+
+  func testInvalidGitHubPrivateKeyDoesNotReplaceStoredCredential() async throws {
+    let namespaceID = UUID()
+    let original = Data([9, 8, 7])
+    let storage = RecordingCredentialStorage(credentials: [namespaceID: original])
+    let session = NamespaceCredentialSession(
+      namespaceID: namespaceID,
+      authorizer: RecordingUnlockAuthorizer(),
+      storage: storage
+    )
+    let invalidURL = FileManager.default.temporaryDirectory
+      .appendingPathComponent("invalid-github-key-\(UUID().uuidString)")
+    try Data("not a private key".utf8).write(to: invalidURL)
+    defer { try? FileManager.default.removeItem(at: invalidURL) }
+    try await session.unlock(reason: "Test unlock")
+
+    do {
+      try await session.configureGitHubApp(appID: 10, privateKeyFilePath: invalidURL.path)
+      XCTFail("Expected invalid private key")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("not a valid RSA private key"))
+    }
+    XCTAssertEqual(storage.storedCredential(for: namespaceID), original)
+  }
+
+  func testGitHubJWTContainsRequiredClaimsAndValidRS256Signature() throws {
+    let attributes: [String: Any] = [
+      kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+      kSecAttrKeySizeInBits as String: 2_048,
+    ]
+    var error: Unmanaged<CFError>?
+    let privateKey = try XCTUnwrap(SecKeyCreateRandomKey(attributes as CFDictionary, &error))
+    let publicKey = try XCTUnwrap(SecKeyCopyPublicKey(privateKey))
+    let der = try XCTUnwrap(SecKeyCopyExternalRepresentation(privateKey, &error) as Data?)
+    let pem = Data(
+      "-----BEGIN RSA PRIVATE KEY-----\n\(der.base64EncodedString())\n-----END RSA PRIVATE KEY-----\n".utf8
+    )
+    var credential = try StoredGitHubAppCredential(appID: 12345, pemData: pem)
+    defer { credential.clear() }
+    let now = Date(timeIntervalSince1970: 2_000_000_000)
+
+    let jwt = try credential.makeJWT(now: now)
+    let parts = jwt.split(separator: ".")
+    XCTAssertEqual(parts.count, 3)
+    let header = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: try decodeBase64URL(parts[0])) as? [String: String]
+    )
+    let claims = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: try decodeBase64URL(parts[1])) as? [String: Any]
+    )
+    XCTAssertEqual(header["alg"], "RS256")
+    XCTAssertEqual(header["typ"], "JWT")
+    XCTAssertEqual((claims["iss"] as? NSNumber)?.int64Value, 12345)
+    XCTAssertEqual((claims["iat"] as? NSNumber)?.int64Value, 1_999_999_940)
+    XCTAssertEqual((claims["exp"] as? NSNumber)?.int64Value, 2_000_000_480)
+    let signingInput = Data("\(parts[0]).\(parts[1])".utf8)
+    let signature = try decodeBase64URL(parts[2])
+    XCTAssertTrue(
+      SecKeyVerifySignature(
+        publicKey,
+        .rsaSignatureMessagePKCS1v15SHA256,
+        signingInput as CFData,
+        signature as CFData,
+        &error
+      )
+    )
+  }
+
+  func testRejectsUnsupportedOrInvalidStoredGitHubCredential() throws {
+    let invalidValues = [
+      Data("{\"version\":2,\"appID\":10,\"privateKeyDER\":\"AQID\"}".utf8),
+      Data("{\"version\":1,\"appID\":10,\"privateKeyDER\":\"AQID\"}".utf8),
+    ]
+
+    for value in invalidValues {
+      XCTAssertThrowsError(try StoredGitHubAppCredential.decode(from: value)) { error in
+        XCTAssertTrue(error.localizedDescription.contains("stored GitHub App credential"))
+      }
+    }
+  }
+
+  func testReplacementStorageFailurePreservesStoredAndInMemoryCredential() async throws {
+    let namespaceID = UUID()
+    let original = Data([9, 8, 7])
+    let storage = RecordingCredentialStorage(
+      credentials: [namespaceID: original],
+      replaceError: TestCredentialStorageError.failed
+    )
+    let session = NamespaceCredentialSession(
+      namespaceID: namespaceID,
+      authorizer: RecordingUnlockAuthorizer(),
+      storage: storage
+    )
+    let privateKeyURL = try makePrivateKeyPEM()
+    defer { try? FileManager.default.removeItem(at: privateKeyURL) }
+    try await session.unlock(reason: "Test unlock")
+
+    do {
+      try await session.configureGitHubApp(appID: 10, privateKeyFilePath: privateKeyURL.path)
+      XCTFail("Expected replacement failure")
+    } catch {}
+
+    XCTAssertEqual(storage.storedCredential(for: namespaceID), original)
+    let signature = try await session.signChallenge(Data("challenge".utf8))
+    let expected = Data(
+      HMAC<SHA256>.authenticationCode(
+        for: Data("challenge".utf8),
+        using: SymmetricKey(data: original)
+      )
+    )
+    XCTAssertEqual(signature, expected)
+  }
+
+  func testOversizedPrivateKeyFileIsRejectedBeforeReplacement() async throws {
+    let namespaceID = UUID()
+    let original = Data([1, 2, 3])
+    let storage = RecordingCredentialStorage(credentials: [namespaceID: original])
+    let session = NamespaceCredentialSession(
+      namespaceID: namespaceID,
+      authorizer: RecordingUnlockAuthorizer(),
+      storage: storage
+    )
+    let url = FileManager.default.temporaryDirectory
+      .appendingPathComponent("oversized-github-key-\(UUID().uuidString)")
+    try Data(repeating: 0x41, count: 128 * 1_024 + 1).write(to: url)
+    defer { try? FileManager.default.removeItem(at: url) }
+    try await session.unlock(reason: "Test unlock")
+
+    do {
+      try await session.configureGitHubApp(appID: 10, privateKeyFilePath: url.path)
+      XCTFail("Expected bounded private key failure")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("unexpectedly large"))
+    }
+    XCTAssertEqual(storage.storedCredential(for: namespaceID), original)
+  }
+
+  func testDistinctGitHubCredentialsSurviveSessionRecreationWithoutCrossingNamespaces() async throws {
+    let firstID = UUID()
+    let secondID = UUID()
+    let storage = RecordingCredentialStorage()
+    let firstKey = try makePrivateKeyFixture()
+    let secondKey = try makePrivateKeyFixture()
+    defer {
+      try? FileManager.default.removeItem(at: firstKey.url)
+      try? FileManager.default.removeItem(at: secondKey.url)
+    }
+    let initialFirst = NamespaceCredentialSession(
+      namespaceID: firstID,
+      authorizer: RecordingUnlockAuthorizer(),
+      storage: storage
+    )
+    let initialSecond = NamespaceCredentialSession(
+      namespaceID: secondID,
+      authorizer: RecordingUnlockAuthorizer(),
+      storage: storage
+    )
+    try await initialFirst.unlock(reason: "First")
+    try await initialSecond.unlock(reason: "Second")
+    try await initialFirst.configureGitHubApp(appID: 10, privateKeyFilePath: firstKey.url.path)
+    try await initialSecond.configureGitHubApp(appID: 11, privateKeyFilePath: secondKey.url.path)
+    await initialFirst.lock()
+    await initialSecond.lock()
+
+    let firstAPI = RecordingGitHubAppAPI()
+    let secondAPI = RecordingGitHubAppAPI()
+    let restoredFirst = NamespaceCredentialSession(
+      namespaceID: firstID,
+      authorizer: RecordingUnlockAuthorizer(),
+      storage: storage,
+      githubAPI: firstAPI
+    )
+    let restoredSecond = NamespaceCredentialSession(
+      namespaceID: secondID,
+      authorizer: RecordingUnlockAuthorizer(),
+      storage: storage,
+      githubAPI: secondAPI
+    )
+    try await restoredFirst.unlock(reason: "First restored")
+    try await restoredSecond.unlock(reason: "Second restored")
+    _ = try await restoredFirst.listGitHubInstallations()
+    _ = try await restoredSecond.listGitHubInstallations()
+    let firstJWTValues = await firstAPI.jwtValues
+    let secondJWTValues = await secondAPI.jwtValues
+    let firstJWT = try XCTUnwrap(firstJWTValues.first)
+    let secondJWT = try XCTUnwrap(secondJWTValues.first)
+
+    XCTAssertTrue(try verifies(firstJWT, with: firstKey.publicKey))
+    XCTAssertFalse(try verifies(firstJWT, with: secondKey.publicKey))
+    XCTAssertTrue(try verifies(secondJWT, with: secondKey.publicKey))
+    XCTAssertFalse(try verifies(secondJWT, with: firstKey.publicKey))
+
+    try await restoredFirst.removeStoredCredential()
+    _ = try await restoredSecond.listGitHubInstallations()
+    XCTAssertNil(storage.storedCredential(for: firstID))
+    XCTAssertNotNil(storage.storedCredential(for: secondID))
+  }
+
+  private func decodeBase64URL(_ value: Substring) throws -> Data {
+    var base64 = String(value)
+      .replacingOccurrences(of: "-", with: "+")
+      .replacingOccurrences(of: "_", with: "/")
+    base64 += String(repeating: "=", count: (4 - base64.count % 4) % 4)
+    return try XCTUnwrap(Data(base64Encoded: base64))
+  }
+
+  private func makePrivateKeyPEM() throws -> URL {
+    try makePrivateKeyFixture().url
+  }
+
+  private func makePrivateKeyFixture() throws -> (url: URL, publicKey: SecKey) {
+    let attributes: [String: Any] = [
+      kSecAttrKeyType as String: kSecAttrKeyTypeRSA,
+      kSecAttrKeySizeInBits as String: 2_048,
+    ]
+    var error: Unmanaged<CFError>?
+    let key = try XCTUnwrap(SecKeyCreateRandomKey(attributes as CFDictionary, &error))
+    let publicKey = try XCTUnwrap(SecKeyCopyPublicKey(key))
+    let der = try XCTUnwrap(SecKeyCopyExternalRepresentation(key, &error) as Data?)
+    let base64 = der.base64EncodedString(options: [.lineLength64Characters])
+    let pem = "-----BEGIN RSA PRIVATE KEY-----\n\(base64)\n-----END RSA PRIVATE KEY-----\n"
+    let url = FileManager.default.temporaryDirectory
+      .appendingPathComponent("github-app-\(UUID().uuidString).pem")
+    try Data(pem.utf8).write(to: url, options: .atomic)
+    return (url, publicKey)
+  }
+
+  private func verifies(_ jwt: String, with publicKey: SecKey) throws -> Bool {
+    let parts = jwt.split(separator: ".")
+    guard parts.count == 3 else { return false }
+    let signingInput = Data("\(parts[0]).\(parts[1])".utf8)
+    let signature = try decodeBase64URL(parts[2])
+    var error: Unmanaged<CFError>?
+    return SecKeyVerifySignature(
+      publicKey,
+      .rsaSignatureMessagePKCS1v15SHA256,
+      signingInput as CFData,
+      signature as CFData,
+      &error
+    )
+  }
+}
+
+private actor RecordingGitHubAppAPI: GitHubAppAPIRequesting {
+  private(set) var jwtValues: [String] = []
+
+  func listInstallations(jwt: String) -> [GitHubInstallationDescriptor] {
+    jwtValues.append(jwt)
+    return [
+      GitHubInstallationDescriptor(
+        id: 20,
+        accountLogin: "octo",
+        accountType: "Organization",
+        permissions: ["issues": "read", "contents": "write"],
+        isSuspended: false
+      )
+    ]
+  }
+
+  func listRepositories(
+    installationID: Int64,
+    jwt: String
+  ) -> [GitHubRepositoryDescriptor] {
+    jwtValues.append(jwt)
+    return [
+      GitHubRepositoryDescriptor(
+        id: 30,
+        fullName: "octo/research",
+        htmlURL: URL(string: "https://github.com/octo/research")!,
+        isPrivate: true
+      )
+    ]
+  }
 }
 
 private actor RecordingUnlockAuthorizer: NamespaceUnlockAuthorizing {
@@ -176,10 +486,16 @@ private final class RecordingCredentialStorage: NamespaceCredentialStoring, @unc
   private var loadInvocations = 0
   private var storeInvocations = 0
   private let storeError: Error?
+  private let replaceError: Error?
 
-  init(credentials: [UUID: Data] = [:], storeError: Error? = nil) {
+  init(
+    credentials: [UUID: Data] = [:],
+    storeError: Error? = nil,
+    replaceError: Error? = nil
+  ) {
     self.credentials = credentials
     self.storeError = storeError
+    self.replaceError = replaceError
   }
 
   func load(
@@ -199,10 +515,21 @@ private final class RecordingCredentialStorage: NamespaceCredentialStoring, @unc
   ) throws {
     lock.withLock {
       storeInvocations += 1
-      if let storeError { return }
+      if storeError != nil { return }
       credentials[namespaceID] = credential
     }
     if let storeError { throw storeError }
+  }
+
+  func replace(
+    _ credential: Data,
+    namespaceID: UUID,
+    authorization: NamespaceUnlockAuthorization
+  ) throws {
+    if let replaceError { throw replaceError }
+    lock.withLock {
+      credentials[namespaceID] = credential
+    }
   }
 
   func removeAll(namespaceID: UUID) throws {

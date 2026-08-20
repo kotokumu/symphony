@@ -1,6 +1,8 @@
 import Foundation
 import CryptoKit
+import Darwin
 import Security
+import SymphonyCredentialBrokerProtocol
 
 public actor NamespaceCredentialSession {
   public typealias CredentialGenerator = @Sendable () throws -> SecureSecretBuffer
@@ -9,6 +11,7 @@ public actor NamespaceCredentialSession {
   private let authorizer: any NamespaceUnlockAuthorizing
   private let storage: any NamespaceCredentialStoring
   private let credentialGenerator: CredentialGenerator
+  private let githubAPI: any GitHubAppAPIRequesting
   private var authorization: NamespaceUnlockAuthorization?
   private var credential: SecureSecretBuffer?
 
@@ -16,12 +19,14 @@ public actor NamespaceCredentialSession {
     namespaceID: UUID,
     authorizer: any NamespaceUnlockAuthorizing = LocalAuthenticationNamespaceUnlockAuthorizer(),
     storage: any NamespaceCredentialStoring = KeychainNamespaceCredentialStorage(),
-    credentialGenerator: @escaping CredentialGenerator = NamespaceCredentialSession.randomCredential
+    credentialGenerator: @escaping CredentialGenerator = NamespaceCredentialSession.randomCredential,
+    githubAPI: any GitHubAppAPIRequesting = GitHubAppAPIClient()
   ) {
     self.namespaceID = namespaceID
     self.authorizer = authorizer
     self.storage = storage
     self.credentialGenerator = credentialGenerator
+    self.githubAPI = githubAPI
   }
 
   deinit {
@@ -91,6 +96,44 @@ public actor NamespaceCredentialSession {
     }
   }
 
+  public func configureGitHubApp(appID: Int64, privateKeyFilePath: String) throws {
+    guard let authorization, credential != nil else {
+      throw NamespaceCredentialSessionError.locked
+    }
+    var pemData = try Self.readPrivateKey(at: privateKeyFilePath)
+    defer { pemData.resetBytes(in: pemData.startIndex..<pemData.endIndex) }
+    var githubCredential = try StoredGitHubAppCredential(appID: appID, pemData: pemData)
+    defer { githubCredential.clear() }
+    var encoded = try githubCredential.encodeForStorage()
+    defer { encoded.resetBytes(in: encoded.startIndex..<encoded.endIndex) }
+    let replacement = SecureSecretBuffer(copying: encoded)
+
+    do {
+      try storage.replace(
+        encoded,
+        namespaceID: namespaceID,
+        authorization: authorization
+      )
+    } catch {
+      replacement.clear()
+      throw error
+    }
+    credential?.clear()
+    credential = replacement
+  }
+
+  public func listGitHubInstallations() async throws -> [GitHubInstallationDescriptor] {
+    let jwt = try githubJWT()
+    return try await githubAPI.listInstallations(jwt: jwt)
+  }
+
+  public func listGitHubRepositories(
+    installationID: Int64
+  ) async throws -> [GitHubRepositoryDescriptor] {
+    let jwt = try githubJWT()
+    return try await githubAPI.listRepositories(installationID: installationID, jwt: jwt)
+  }
+
   var retainedByteCount: Int {
     credential?.retainedByteCount ?? 0
   }
@@ -105,6 +148,46 @@ public actor NamespaceCredentialSession {
       throw NamespaceCredentialStorageError.keychain(status)
     }
     return SecureSecretBuffer(copying: data)
+  }
+
+  private func githubJWT() throws -> String {
+    guard let credential else {
+      throw NamespaceCredentialSessionError.locked
+    }
+    return try credential.withTemporaryData { data in
+      var githubCredential = try StoredGitHubAppCredential.decode(from: data)
+      defer { githubCredential.clear() }
+      return try githubCredential.makeJWT()
+    }
+  }
+
+  private static func readPrivateKey(at path: String) throws -> Data {
+    let maximumBytes = 128 * 1_024
+    let handle: FileHandle
+    do {
+      handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
+    } catch {
+      throw GitHubAppCredentialError.invalidPrivateKey
+    }
+    defer { try? handle.close() }
+
+    var information = stat()
+    guard fstat(handle.fileDescriptor, &information) == 0,
+      information.st_mode & S_IFMT == S_IFREG
+    else {
+      throw GitHubAppCredentialError.invalidPrivateKey
+    }
+    guard information.st_size <= maximumBytes else {
+      throw GitHubAppCredentialError.privateKeyTooLarge
+    }
+    guard var data = try handle.read(upToCount: maximumBytes + 1) else {
+      throw GitHubAppCredentialError.invalidPrivateKey
+    }
+    guard data.count <= maximumBytes else {
+      data.resetBytes(in: data.startIndex..<data.endIndex)
+      throw GitHubAppCredentialError.privateKeyTooLarge
+    }
+    return data
   }
 }
 

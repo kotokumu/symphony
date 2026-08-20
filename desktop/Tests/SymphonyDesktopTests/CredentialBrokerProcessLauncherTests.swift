@@ -86,6 +86,94 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
     }
   }
 
+  func testHandshakeTimeoutCleansUpRuntimeAndAllowsReplacement() async throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let firstAttemptURL = directory.appendingPathComponent("first-attempt")
+    let script = try executableScript(
+      in: directory,
+      contents: """
+        #!/bin/sh
+        if [ ! -e "$BROKER_FIRST_ATTEMPT_FILE" ]; then
+          : > "$BROKER_FIRST_ATTEMPT_FILE"
+          exec /usr/bin/tail -f /dev/null
+        fi
+        printf '{"status":"unlocked"}\n'
+        IFS= read -r lock_command
+        """
+    )
+    let namespaceID = UUID()
+    let launcher = CredentialBrokerProcessLauncher(
+      executableURL: script,
+      handshakeTimeout: 0.05,
+      stopTimeout: 0.1,
+      environment: [
+        "PATH": "/usr/bin:/bin",
+        "BROKER_FIRST_ATTEMPT_FILE": firstAttemptURL.path,
+      ]
+    )
+    let clock = ContinuousClock()
+    let started = clock.now
+
+    do {
+      _ = try await launcher.unlock(namespaceID: namespaceID)
+      XCTFail("Expected handshake timeout")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("unlock timed out"))
+    }
+    XCTAssertLessThan(started.duration(to: clock.now), .seconds(1))
+
+    let replacement = try await launcher.unlock(namespaceID: namespaceID)
+    try await replacement.lock()
+  }
+
+  func testCapabilityTimeoutCleansUpRuntimeAndAllowsReplacement() async throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let firstCapabilityURL = directory.appendingPathComponent("first-capability")
+    let script = try executableScript(
+      in: directory,
+      contents: """
+        #!/bin/sh
+        printf '{"status":"unlocked"}\n'
+        IFS= read -r command
+        if [ ! -e "$BROKER_FIRST_CAPABILITY_FILE" ]; then
+          : > "$BROKER_FIRST_CAPABILITY_FILE"
+          exec /usr/bin/tail -f /dev/null
+        fi
+        printf '{"status":"signature","payload":"AQ=="}\n'
+        IFS= read -r lock_command
+        """
+    )
+    let namespaceID = UUID()
+    let launcher = CredentialBrokerProcessLauncher(
+      executableURL: script,
+      handshakeTimeout: 0.2,
+      capabilityTimeout: 0.05,
+      stopTimeout: 0.1,
+      environment: [
+        "PATH": "/usr/bin:/bin",
+        "BROKER_FIRST_CAPABILITY_FILE": firstCapabilityURL.path,
+      ]
+    )
+    let session = try await launcher.unlock(namespaceID: namespaceID)
+    let clock = ContinuousClock()
+    let started = clock.now
+
+    do {
+      _ = try await session.signChallenge(Data([1]))
+      XCTFail("Expected capability timeout")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("operation timed out"))
+    }
+    XCTAssertLessThan(started.duration(to: clock.now), .seconds(1))
+
+    let replacement = try await launcher.unlock(namespaceID: namespaceID)
+    let signature = try await replacement.signChallenge(Data([1]))
+    XCTAssertEqual(signature, Data([1]))
+    try await replacement.lock()
+  }
+
   func testClosedBrokerInputReturnsAnErrorWithoutTerminatingDesktopProcess() async throws {
     let directory = try temporaryDirectory()
     defer { try? FileManager.default.removeItem(at: directory) }
@@ -117,6 +205,130 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
       XCTFail("Expected writing to the closed broker pipe to fail")
     } catch {
       XCTAssertFalse(error.localizedDescription.isEmpty)
+    }
+  }
+
+  func testGitHubCapabilitiesUseFramedRequestsAndReturnOnlyDescriptors() async throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let configureURL = directory.appendingPathComponent("configure-command")
+    let installationsURL = directory.appendingPathComponent("installations-command")
+    let repositoriesURL = directory.appendingPathComponent("repositories-command")
+    let script = try executableScript(
+      in: directory,
+      contents: """
+        #!/bin/sh
+        printf '{"status":"unlocked"}\n'
+        IFS= read -r configure
+        printf '%s' "$configure" > "$BROKER_CONFIGURE_FILE"
+        printf '{"status":"githubAppConfigured"}\n'
+        IFS= read -r installations
+        printf '%s' "$installations" > "$BROKER_INSTALLATIONS_FILE"
+        printf '{"status":"githubInstallations","installations":[{"id":20,"accountLogin":"octo","accountType":"Organization","permissions":{"issues":"read","contents":"write"},"isSuspended":false}]}\n'
+        IFS= read -r repositories
+        printf '%s' "$repositories" > "$BROKER_REPOSITORIES_FILE"
+        printf '{"status":"githubRepositories","repositories":[{"id":30,"fullName":"octo/research","htmlURL":"https://github.com/octo/research","isPrivate":true}]}\n'
+        IFS= read -r lock_command
+        """
+    )
+    let launcher = CredentialBrokerProcessLauncher(
+      executableURL: script,
+      handshakeTimeout: 1,
+      stopTimeout: 1,
+      environment: [
+        "PATH": "/usr/bin:/bin",
+        "BROKER_CONFIGURE_FILE": configureURL.path,
+        "BROKER_INSTALLATIONS_FILE": installationsURL.path,
+        "BROKER_REPOSITORIES_FILE": repositoriesURL.path,
+      ]
+    )
+    let session = try await launcher.unlock(namespaceID: UUID())
+    let keyURL = URL(fileURLWithPath: "/private/github-app.pem")
+
+    try await session.configureGitHubApp(appID: 10, privateKeyFileURL: keyURL)
+    let installations = try await session.listGitHubInstallations()
+    let repositories = try await session.listGitHubRepositories(installationID: 20)
+
+    let configure = try JSONDecoder().decode(
+      CredentialBrokerCommand.self,
+      from: Data(contentsOf: configureURL)
+    )
+    XCTAssertEqual(configure, .configureGitHubApp(appID: 10, privateKeyFilePath: keyURL.path))
+    let installationCommand = try JSONDecoder().decode(
+      CredentialBrokerCommand.self,
+      from: Data(contentsOf: installationsURL)
+    )
+    let repositoryCommand = try JSONDecoder().decode(
+      CredentialBrokerCommand.self,
+      from: Data(contentsOf: repositoriesURL)
+    )
+    XCTAssertEqual(installationCommand, .listGitHubInstallations)
+    XCTAssertEqual(repositoryCommand, .listGitHubRepositories(installationID: 20))
+    XCTAssertEqual(installations.first?.accountLogin, "octo")
+    XCTAssertEqual(repositories.first?.fullName, "octo/research")
+    try await session.lock()
+  }
+
+  func testGitHubCapabilityRejectsFailedWrongAndMalformedFrames() async throws {
+    let responses = [
+      ("{\"status\":\"failed\",\"message\":\"Installation revoked.\"}", "Installation revoked."),
+      ("{\"status\":\"githubRepositories\",\"repositories\":[]}", "invalid capability response"),
+      ("not-json", "invalid capability response"),
+    ]
+    for (response, expected) in responses {
+      let directory = try temporaryDirectory()
+      defer { try? FileManager.default.removeItem(at: directory) }
+      let script = try executableScript(
+        in: directory,
+        contents: """
+          #!/bin/sh
+          printf '{"status":"unlocked"}\n'
+          IFS= read -r command
+          printf '%s\n' '\(response)'
+          """
+      )
+      let launcher = CredentialBrokerProcessLauncher(
+        executableURL: script,
+        handshakeTimeout: 1,
+        stopTimeout: 1,
+        environment: ["PATH": "/usr/bin:/bin"]
+      )
+      let session = try await launcher.unlock(namespaceID: UUID())
+
+      do {
+        _ = try await session.listGitHubInstallations()
+        XCTFail("Expected broker frame rejection")
+      } catch {
+        XCTAssertTrue(error.localizedDescription.contains(expected), error.localizedDescription)
+      }
+    }
+  }
+
+  func testGitHubCapabilityRejectsOversizedFrame() async throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let script = try executableScript(
+      in: directory,
+      contents: """
+        #!/bin/sh
+        printf '{"status":"unlocked"}\n'
+        IFS= read -r command
+        /usr/bin/perl -e 'print "a" x 1048577, "\n"'
+        """
+    )
+    let launcher = CredentialBrokerProcessLauncher(
+      executableURL: script,
+      handshakeTimeout: 10,
+      stopTimeout: 1,
+      environment: ["PATH": "/usr/bin:/bin"]
+    )
+    let session = try await launcher.unlock(namespaceID: UUID())
+
+    do {
+      _ = try await session.listGitHubInstallations()
+      XCTFail("Expected broker frame limit")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("safe limit"), error.localizedDescription)
     }
   }
 
@@ -254,6 +466,7 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
     let launcher = CredentialBrokerProcessLauncher(
       executableURL: script,
       handshakeTimeout: 60,
+      capabilityTimeout: 2,
       stopTimeout: 0.1,
       environment: [
         "PATH": "/usr/bin:/bin",
@@ -304,6 +517,7 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
     let launcher = CredentialBrokerProcessLauncher(
       executableURL: script,
       handshakeTimeout: 60,
+      capabilityTimeout: 2,
       stopTimeout: 0.1,
       environment: [
         "PATH": "/usr/bin:/bin",

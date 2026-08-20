@@ -72,6 +72,27 @@ final class KeychainNamespaceCredentialStorageTests: XCTestCase {
     assertBaseQuery(deleteQuery, namespaceID: namespaceID)
   }
 
+  func testReplaceUpdatesOnlyProtectedValueWithTheAuthorizationContext() throws {
+    let keychain = RecordingNamespaceKeychain()
+    let storage = KeychainNamespaceCredentialStorage(keychain: keychain)
+    let namespaceID = UUID()
+    let authorization = NamespaceUnlockAuthorization(context: LAContext())
+
+    try storage.replace(
+      Data([4, 5, 6]),
+      namespaceID: namespaceID,
+      authorization: authorization
+    )
+
+    let (query, attributes) = try XCTUnwrap(keychain.updateQueries.first)
+    assertBaseQuery(query, namespaceID: namespaceID)
+    XCTAssertTrue(
+      query[kSecUseAuthenticationContext as String] as? LAContext === authorization.context
+    )
+    XCTAssertEqual(attributes.count, 1)
+    XCTAssertEqual(attributes[kSecValueData as String] as? Data, Data([4, 5, 6]))
+  }
+
   func testInvalidValueAndSecurityStatusesRemainVisible() throws {
     let namespaceID = UUID()
     let authorization = NamespaceUnlockAuthorization(context: LAContext())
@@ -103,6 +124,19 @@ final class KeychainNamespaceCredentialStorageTests: XCTestCase {
     XCTAssertThrowsError(
       try duplicate.store(
         Data([1]),
+        namespaceID: namespaceID,
+        authorization: authorization
+      )
+    ) { error in
+      XCTAssertTrue(error.localizedDescription.contains("Protected credential storage failed"))
+    }
+
+    let replacementFailure = KeychainNamespaceCredentialStorage(
+      keychain: RecordingNamespaceKeychain(updateStatus: errSecNotAvailable)
+    )
+    XCTAssertThrowsError(
+      try replacementFailure.replace(
+        Data([2]),
         namespaceID: namespaceID,
         authorization: authorization
       )
@@ -179,9 +213,11 @@ private final class RecordingNamespaceKeychain: NamespaceKeychainAccessing, @unc
   private let copyResult: CFTypeRef?
   private let addStatus: OSStatus
   private let deleteStatus: OSStatus
+  private let updateStatus: OSStatus
   private let accessControlError: Error?
   private(set) var copyQueries: [[String: Any]] = []
   private(set) var addQueries: [[String: Any]] = []
+  private(set) var updateQueries: [([String: Any], [String: Any])] = []
   private(set) var deleteQueries: [[String: Any]] = []
   private(set) var accessControlFlags: [SecAccessControlCreateFlags] = []
   private(set) var accessibilityMatchesThisDeviceOnly: [Bool] = []
@@ -190,12 +226,14 @@ private final class RecordingNamespaceKeychain: NamespaceKeychainAccessing, @unc
     copyStatus: OSStatus = errSecSuccess,
     copyResult: CFTypeRef? = Data([1]) as CFData,
     addStatus: OSStatus = errSecSuccess,
+    updateStatus: OSStatus = errSecSuccess,
     deleteStatus: OSStatus = errSecSuccess,
     accessControlError: Error? = nil
   ) {
     self.copyStatus = copyStatus
     self.copyResult = copyResult
     self.addStatus = addStatus
+    self.updateStatus = updateStatus
     self.deleteStatus = deleteStatus
     self.accessControlError = accessControlError
   }
@@ -225,6 +263,16 @@ private final class RecordingNamespaceKeychain: NamespaceKeychainAccessing, @unc
   func add(_ attributes: CFDictionary) -> OSStatus {
     addQueries.append(attributes as NSDictionary as! [String: Any])
     return addStatus
+  }
+
+  func update(_ query: CFDictionary, attributes: CFDictionary) -> OSStatus {
+    updateQueries.append(
+      (
+        query as NSDictionary as! [String: Any],
+        attributes as NSDictionary as! [String: Any]
+      )
+    )
+    return updateStatus
   }
 
   func delete(_ query: CFDictionary) -> OSStatus {

@@ -68,6 +68,24 @@ public struct NamespaceCatalog: Equatable, Sendable {
     selectedID = id
   }
 
+  public mutating func connect(
+    _ id: Namespace.ID,
+    to connection: PlatformConnection
+  ) throws {
+    guard let index = namespaces.firstIndex(where: { $0.id == id }) else {
+      throw NamespaceCatalogError.namespaceNotFound
+    }
+    try namespaces[index].connect(to: connection)
+  }
+
+  @discardableResult
+  public mutating func disconnectPlatform(_ id: Namespace.ID) throws -> PlatformConnection {
+    guard let index = namespaces.firstIndex(where: { $0.id == id }) else {
+      throw NamespaceCatalogError.namespaceNotFound
+    }
+    return try namespaces[index].disconnectPlatform()
+  }
+
   @discardableResult
   public mutating func delete(_ id: Namespace.ID) throws -> Namespace {
     guard let index = namespaces.firstIndex(where: { $0.id == id }) else {

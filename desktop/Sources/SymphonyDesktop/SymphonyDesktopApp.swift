@@ -12,6 +12,7 @@ struct SymphonyDesktopApp: App {
   @StateObject private var daemonController: NamespaceDaemonController
   @StateObject private var authenticationController: CodexAuthenticationController
   @StateObject private var lockController: NamespaceLockController
+  @StateObject private var githubConnectionController: GitHubConnectionController
   @StateObject private var sleepLockCoordinator: NamespaceSleepLockCoordinator
   @StateObject private var windowSecurityCoordinator: NamespaceWindowSecurityCoordinator
 
@@ -42,6 +43,7 @@ struct SymphonyDesktopApp: App {
     _lockController = StateObject(wrappedValue: namespaceLockController)
     _sleepLockCoordinator = StateObject(wrappedValue: namespaceSleepLockCoordinator)
     let namespaceWindowSecurityCoordinator: NamespaceWindowSecurityCoordinator
+    let githubConnectionControllerForShutdown: GitHubConnectionController
     do {
       let repository = try FileNamespaceRepository()
       let credentialCleanupCoordinator = NamespaceCredentialCleanupCoordinator(
@@ -50,6 +52,20 @@ struct SymphonyDesktopApp: App {
           try await namespaceLockController.removeNamespace(id)
         }
       )
+      let githubCredentialCleanupCoordinator = GitHubCredentialCleanupCoordinator(
+        store: try PendingCredentialCleanupStore(
+          fileName: "pending-github-credential-cleanup.json"
+        ),
+        purge: { id in
+          try await namespaceLockController.removeNamespace(id)
+        }
+      )
+      let githubController = GitHubConnectionController(
+        broker: credentialBroker,
+        credentialCleanup: githubCredentialCleanupCoordinator
+      )
+      githubConnectionControllerForShutdown = githubController
+      _githubConnectionController = StateObject(wrappedValue: githubController)
       let codexAuthenticationController = CodexAuthenticationController(
         authenticator: authenticationManager,
         directoryURL: { id in
@@ -76,6 +92,7 @@ struct SymphonyDesktopApp: App {
             try await credentialCleanupCoordinator.reconcile(
               existingNamespaceIDs: Set(catalog.namespaces.map(\.id))
             )
+            try await githubCredentialCleanupCoordinator.reconcile(catalog)
           },
           beforeDelete: { id in
             try await supervisor.stop(namespaceID: id)
@@ -105,7 +122,10 @@ struct SymphonyDesktopApp: App {
       )
       namespaceWindowSecurityCoordinator = NamespaceWindowSecurityCoordinator(
         lockCredentials: {
-          try await namespaceLockController.lockAll()
+          try await CredentialSecurityBarrier(
+            quiesceGitHub: { try await githubController.quiesceAll() },
+            lockCredentials: { try await namespaceLockController.lockAll() }
+          ).secure()
         },
         cancelAuthentication: {
           try await codexAuthenticationController.cancelAll()
@@ -142,9 +162,20 @@ struct SymphonyDesktopApp: App {
       _authenticationController = StateObject(
         wrappedValue: codexAuthenticationController
       )
+      let githubController = GitHubConnectionController(
+        broker: credentialBroker,
+        credentialCleanup: UnavailableGitHubCredentialCleanup(
+          message: error.localizedDescription
+        )
+      )
+      githubConnectionControllerForShutdown = githubController
+      _githubConnectionController = StateObject(wrappedValue: githubController)
       namespaceWindowSecurityCoordinator = NamespaceWindowSecurityCoordinator(
         lockCredentials: {
-          try await namespaceLockController.lockAll()
+          try await CredentialSecurityBarrier(
+            quiesceGitHub: { try await githubController.quiesceAll() },
+            lockCredentials: { try await namespaceLockController.lockAll() }
+          ).secure()
         },
         cancelAuthentication: {
           try await codexAuthenticationController.cancelAll()
@@ -172,7 +203,14 @@ struct SymphonyDesktopApp: App {
       try await ApplicationSecurityShutdownCoordinator(
         windowSecurity: namespaceWindowSecurityCoordinator,
         lockCredentials: {
-          try await namespaceLockController.shutdownForApplicationTermination()
+          try await CredentialSecurityBarrier(
+            quiesceGitHub: {
+              try await githubConnectionControllerForShutdown.quiesceAll()
+            },
+            lockCredentials: {
+              try await namespaceLockController.shutdownForApplicationTermination()
+            }
+          ).secure()
         },
         shutdownAuthentication: {
           try await authenticationManager.shutdownForApplicationTermination()
@@ -188,6 +226,7 @@ struct SymphonyDesktopApp: App {
         },
         resumeCredentials: {
           await namespaceLockController.resumeAfterApplicationTerminationFailure()
+          githubConnectionControllerForShutdown.resumeAfterSecurityOperation()
         }
       ).shutdown()
     }
@@ -200,6 +239,7 @@ struct SymphonyDesktopApp: App {
         daemonController: daemonController,
         authenticationController: authenticationController,
         lockController: lockController,
+        githubConnectionController: githubConnectionController,
         windowSecurityCoordinator: windowSecurityCoordinator
       )
     }
@@ -210,6 +250,8 @@ struct SymphonyDesktopApp: App {
 extension NamespaceDaemonSupervisor: NamespaceDaemonSupervising {}
 extension CodexAuthenticationManager: CodexAuthenticating {}
 extension NamespaceCredentialBroker: NamespaceCredentialBrokering {}
+extension NamespaceCredentialBroker: GitHubConnectionBrokering {}
+extension GitHubCredentialCleanupCoordinator: GitHubCredentialCleaning {}
 
 private actor UnavailableNamespaceRepository: NamespaceRepository {
   let message: String
@@ -243,5 +285,25 @@ private struct UnavailableNamespaceRepositoryError: LocalizedError {
 
   var errorDescription: String? {
     message
+  }
+}
+
+private actor UnavailableGitHubCredentialCleanup: GitHubCredentialCleaning {
+  let message: String
+
+  init(message: String) {
+    self.message = message
+  }
+
+  func setupStarted(_ namespaceID: UUID) throws {
+    throw UnavailableNamespaceRepositoryError(message: message)
+  }
+
+  func cleanup(_ namespaceID: UUID) throws -> String? {
+    throw UnavailableNamespaceRepositoryError(message: message)
+  }
+
+  func connectionCommitted(_ namespaceID: UUID) throws {
+    throw UnavailableNamespaceRepositoryError(message: message)
   }
 }

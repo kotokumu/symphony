@@ -2,7 +2,7 @@ import Foundation
 import SymphonyDesktopCore
 
 public actor FileNamespaceRepository: NamespaceRepository {
-  private static let documentVersion = 1
+  private static let documentVersion = 2
   private static let metadataFilename = "namespaces.json"
   private static let namespacesDirectoryName = "Namespaces"
   private static let pendingDeletionsDirectoryName = "PendingDeletions"
@@ -50,14 +50,18 @@ public actor FileNamespaceRepository: NamespaceRepository {
       throw NamespaceStorageError.unreadableData
     }
 
-    guard document.version == Self.documentVersion else {
+    guard document.version == 1 || document.version == Self.documentVersion else {
       throw NamespaceStorageError.unsupportedVersion(document.version)
     }
 
     let catalog: NamespaceCatalog
     do {
       let namespaces = try document.namespaces.map { record in
-        Namespace(id: record.id, name: try NamespaceName(validating: record.name))
+        Namespace(
+          id: record.id,
+          name: try NamespaceName(validating: record.name),
+          platformConnection: try record.platformConnection?.connection()
+        )
       }
       catalog = try NamespaceCatalog(
         validating: namespaces,
@@ -317,9 +321,84 @@ private struct NamespaceDocument: Codable {
 private struct NamespaceRecord: Codable {
   let id: Namespace.ID
   let name: String
+  let platformConnection: PlatformConnectionRecord?
 
   init(namespace: Namespace) {
     id = namespace.id
     name = namespace.name.value
+    platformConnection = namespace.platformConnection.map(PlatformConnectionRecord.init)
+  }
+}
+
+private enum PlatformConnectionRecord: Codable {
+  case github(GitHubConnectionRecord)
+
+  private enum CodingKeys: String, CodingKey {
+    case kind
+    case github
+  }
+
+  private enum Kind: String, Codable {
+    case github
+  }
+
+  init(_ connection: PlatformConnection) {
+    switch connection {
+    case .github(let github):
+      self = .github(GitHubConnectionRecord(github))
+    }
+  }
+
+  init(from decoder: any Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    switch try container.decode(Kind.self, forKey: .kind) {
+    case .github:
+      self = .github(try container.decode(GitHubConnectionRecord.self, forKey: .github))
+    }
+  }
+
+  func encode(to encoder: any Encoder) throws {
+    var container = encoder.container(keyedBy: CodingKeys.self)
+    switch self {
+    case .github(let github):
+      try container.encode(Kind.github, forKey: .kind)
+      try container.encode(github, forKey: .github)
+    }
+  }
+
+  func connection() throws -> PlatformConnection {
+    switch self {
+    case .github(let github):
+      return .github(try github.connection())
+    }
+  }
+}
+
+private struct GitHubConnectionRecord: Codable {
+  let appID: Int64
+  let installationID: Int64
+  let accountLogin: String
+  let repositoryID: Int64
+  let repositoryFullName: String
+  let repositoryURL: URL
+
+  init(_ connection: GitHubConnection) {
+    appID = connection.appID
+    installationID = connection.installationID
+    accountLogin = connection.accountLogin
+    repositoryID = connection.repositoryID
+    repositoryFullName = connection.repositoryFullName
+    repositoryURL = connection.repositoryURL
+  }
+
+  func connection() throws -> GitHubConnection {
+    try GitHubConnection(
+      appID: appID,
+      installationID: installationID,
+      accountLogin: accountLogin,
+      repositoryID: repositoryID,
+      repositoryFullName: repositoryFullName,
+      repositoryURL: repositoryURL
+    )
   }
 }

@@ -9,8 +9,19 @@ public protocol CredentialBrokerSessionHandle: Sendable {
   func lock() async throws
 }
 
+public protocol GitHubCredentialBrokerSessionHandle: Sendable {
+  func configureGitHubApp(appID: Int64, privateKeyFileURL: URL) async throws
+  func listGitHubInstallations() async throws -> [GitHubInstallationDescriptor]
+  func listGitHubRepositories(
+    installationID: Int64
+  ) async throws -> [GitHubRepositoryDescriptor]
+}
+
+public protocol NamespaceCredentialBrokerSessionHandle:
+  CredentialBrokerSessionHandle, GitHubCredentialBrokerSessionHandle {}
+
 public protocol CredentialBrokerSessionLaunching: Sendable {
-  func unlock(namespaceID: Namespace.ID) async throws -> any CredentialBrokerSessionHandle
+  func unlock(namespaceID: Namespace.ID) async throws -> any NamespaceCredentialBrokerSessionHandle
   /// Returns only after no broker process remains owned for `namespaceID`.
   func stop(namespaceID: Namespace.ID) async throws
   func purge(namespaceID: Namespace.ID) async throws
@@ -29,6 +40,7 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
 
   private let executableURL: URL?
   private let handshakeTimeout: TimeInterval
+  private let capabilityTimeout: TimeInterval
   private let stopTimeout: TimeInterval
   private let environment: [String: String]
   private let forceKill: ForceKill
@@ -39,12 +51,14 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
   public init(
     executableURL: URL?,
     handshakeTimeout: TimeInterval = 60,
+    capabilityTimeout: TimeInterval = CredentialBrokerProtocolLimits.defaultCapabilityTimeout,
     stopTimeout: TimeInterval = 2,
     environment: [String: String] = ProcessInfo.processInfo.environment,
     forceKill: @escaping ForceKill = { Darwin.kill($0, SIGKILL) }
   ) {
     self.executableURL = executableURL
     self.handshakeTimeout = handshakeTimeout
+    self.capabilityTimeout = capabilityTimeout
     self.stopTimeout = stopTimeout
     self.environment = NamespaceProcessEnvironment.sanitized(environment)
     self.forceKill = forceKill
@@ -54,6 +68,7 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
   init(
     executableURL: URL?,
     handshakeTimeout: TimeInterval,
+    capabilityTimeout: TimeInterval = CredentialBrokerProtocolLimits.defaultCapabilityTimeout,
     stopTimeout: TimeInterval,
     environment: [String: String],
     forceKill: @escaping ForceKill,
@@ -61,13 +76,16 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
   ) {
     self.executableURL = executableURL
     self.handshakeTimeout = handshakeTimeout
+    self.capabilityTimeout = capabilityTimeout
     self.stopTimeout = stopTimeout
     self.environment = NamespaceProcessEnvironment.sanitized(environment)
     self.forceKill = forceKill
     self.commandGate = commandGate
   }
 
-  public func unlock(namespaceID: Namespace.ID) async throws -> any CredentialBrokerSessionHandle {
+  public func unlock(
+    namespaceID: Namespace.ID
+  ) async throws -> any NamespaceCredentialBrokerSessionHandle {
     guard runtimes[namespaceID] == nil else {
       throw CredentialBrokerProcessError.sessionAlreadyRunning
     }
@@ -147,6 +165,82 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
     guard challenge.count <= 32_768 else {
       throw CredentialBrokerProcessError.requestTooLarge
     }
+    switch try await perform(
+      .signChallenge(challenge),
+      namespaceID: namespaceID,
+      generation: generation
+    ) {
+    case .signature(let signature):
+      return signature
+    case .failed(let message):
+      throw CredentialBrokerProcessError.capabilityFailed(message)
+    default:
+      throw CredentialBrokerProcessError.invalidCapabilityResponse
+    }
+  }
+
+  fileprivate func configureGitHubApp(
+    appID: Int64,
+    privateKeyFileURL: URL,
+    namespaceID: Namespace.ID,
+    generation: UUID
+  ) async throws {
+    switch try await perform(
+      .configureGitHubApp(appID: appID, privateKeyFilePath: privateKeyFileURL.path),
+      namespaceID: namespaceID,
+      generation: generation
+    ) {
+    case .githubAppConfigured:
+      return
+    case .failed(let message):
+      throw CredentialBrokerProcessError.capabilityFailed(message)
+    default:
+      throw CredentialBrokerProcessError.invalidCapabilityResponse
+    }
+  }
+
+  fileprivate func listGitHubInstallations(
+    namespaceID: Namespace.ID,
+    generation: UUID
+  ) async throws -> [GitHubInstallationDescriptor] {
+    switch try await perform(
+      .listGitHubInstallations,
+      namespaceID: namespaceID,
+      generation: generation
+    ) {
+    case .githubInstallations(let installations):
+      return installations
+    case .failed(let message):
+      throw CredentialBrokerProcessError.capabilityFailed(message)
+    default:
+      throw CredentialBrokerProcessError.invalidCapabilityResponse
+    }
+  }
+
+  fileprivate func listGitHubRepositories(
+    installationID: Int64,
+    namespaceID: Namespace.ID,
+    generation: UUID
+  ) async throws -> [GitHubRepositoryDescriptor] {
+    switch try await perform(
+      .listGitHubRepositories(installationID: installationID),
+      namespaceID: namespaceID,
+      generation: generation
+    ) {
+    case .githubRepositories(let repositories):
+      return repositories
+    case .failed(let message):
+      throw CredentialBrokerProcessError.capabilityFailed(message)
+    default:
+      throw CredentialBrokerProcessError.invalidCapabilityResponse
+    }
+  }
+
+  private func perform(
+    _ command: CredentialBrokerCommand,
+    namespaceID: Namespace.ID,
+    generation: UUID
+  ) async throws -> CredentialBrokerResult {
     try await acquireCommand(for: namespaceID)
     defer { commandGate.release(namespaceID) }
     guard let runtime = runtimes[namespaceID], runtime.generation == generation else {
@@ -156,25 +250,26 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
       throw CredentialBrokerProcessError.sessionNotRunning
     }
     let outputDescriptor = output.fileDescriptor
-    let responseTimeout = handshakeTimeout
+    let responseTimeout = capabilityTimeout
     do {
-      var command = try JSONEncoder().encode(CredentialBrokerCommand.signChallenge(challenge))
-      command.append(0x0A)
-      try input.write(contentsOf: command)
+      var requestData = try JSONEncoder().encode(command)
+      guard requestData.count <= CredentialBrokerProtocolLimits.maximumCommandBytes else {
+        throw CredentialBrokerProcessError.requestTooLarge
+      }
+      requestData.append(0x0A)
+      try input.write(contentsOf: requestData)
       let responseData = try await Task.detached {
         try BrokerPipeReader.readLine(
           from: outputDescriptor,
           timeout: responseTimeout,
-          maximumBytes: 65_536
+          maximumBytes: CredentialBrokerProtocolLimits.maximumResponseBytes,
+          context: .capability
         )
       }.value
-      switch try JSONDecoder().decode(CredentialBrokerResult.self, from: responseData) {
-      case .signature(let signature):
-        return signature
-      case .failed(let message):
-        throw CredentialBrokerProcessError.capabilityFailed(message)
-      case .locked:
-        throw CredentialBrokerProcessError.handshakeFailed
+      do {
+        return try JSONDecoder().decode(CredentialBrokerResult.self, from: responseData)
+      } catch {
+        throw CredentialBrokerProcessError.invalidCapabilityResponse
       }
     } catch {
       if stopTasks[namespaceID] == nil {
@@ -372,7 +467,7 @@ final class NamespaceCommandGate: @unchecked Sendable {
   }
 }
 
-private struct ProcessCredentialBrokerSession: CredentialBrokerSessionHandle {
+private struct ProcessCredentialBrokerSession: NamespaceCredentialBrokerSessionHandle {
   private let namespaceID: Namespace.ID
   private let generation: UUID
   private let launcher: CredentialBrokerProcessLauncher
@@ -398,6 +493,32 @@ private struct ProcessCredentialBrokerSession: CredentialBrokerSessionHandle {
       generation: generation
     )
   }
+
+  func configureGitHubApp(appID: Int64, privateKeyFileURL: URL) async throws {
+    try await launcher.configureGitHubApp(
+      appID: appID,
+      privateKeyFileURL: privateKeyFileURL,
+      namespaceID: namespaceID,
+      generation: generation
+    )
+  }
+
+  func listGitHubInstallations() async throws -> [GitHubInstallationDescriptor] {
+    try await launcher.listGitHubInstallations(
+      namespaceID: namespaceID,
+      generation: generation
+    )
+  }
+
+  func listGitHubRepositories(
+    installationID: Int64
+  ) async throws -> [GitHubRepositoryDescriptor] {
+    try await launcher.listGitHubRepositories(
+      installationID: installationID,
+      namespaceID: namespaceID,
+      generation: generation
+    )
+  }
 }
 
 private final class UnsafeProcessReference: @unchecked Sendable {
@@ -414,40 +535,79 @@ private final class UnsafeProcessReference: @unchecked Sendable {
 }
 
 private enum BrokerPipeReader {
+  enum Context {
+    case handshake
+    case capability
+  }
+
   static func readLine(
     from descriptor: Int32,
     timeout: TimeInterval,
-    maximumBytes: Int = 16_384
+    maximumBytes: Int = 16_384,
+    context: Context = .handshake
   ) throws -> Data {
-    let deadline = Date().addingTimeInterval(timeout)
+    let clock = ContinuousClock()
+    let timeoutMilliseconds = max(Int64(1), Int64((timeout * 1_000).rounded(.up)))
+    let deadline = clock.now.advanced(by: .milliseconds(timeoutMilliseconds))
     var accumulated = Data()
 
-    while Date() < deadline {
-      let remaining = max(0, deadline.timeIntervalSinceNow)
+    while clock.now < deadline {
+      let remaining = clock.now.duration(to: deadline).components
+      let remainingMilliseconds =
+        Double(remaining.seconds) * 1_000
+        + Double(remaining.attoseconds) / 1_000_000_000_000_000
+      let pollTimeout = Int32(
+        max(1, min(remainingMilliseconds.rounded(.up), Double(Int32.max)))
+      )
       var pollDescriptor = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
-      let result = Darwin.poll(&pollDescriptor, 1, Int32(remaining * 1_000))
+      let result = Darwin.poll(&pollDescriptor, 1, pollTimeout)
       if result == 0 {
         break
       }
       if result < 0 {
         if errno == EINTR { continue }
-        throw CredentialBrokerProcessError.handshakeFailed
+        throw failure(for: context)
       }
 
       var buffer = [UInt8](repeating: 0, count: 1_024)
       let count = Darwin.read(descriptor, &buffer, buffer.count)
       if count <= 0 {
-        throw CredentialBrokerProcessError.handshakeFailed
+        throw failure(for: context)
       }
       accumulated.append(contentsOf: buffer.prefix(count))
       if let newline = accumulated.firstIndex(of: 0x0A) {
+        guard newline <= maximumBytes else {
+          switch context {
+          case .handshake:
+            throw CredentialBrokerProcessError.handshakeFailed
+          case .capability:
+            throw CredentialBrokerProcessError.capabilityResponseTooLarge
+          }
+        }
         return accumulated[..<newline]
       }
       guard accumulated.count <= maximumBytes else {
-        throw CredentialBrokerProcessError.handshakeFailed
+        switch context {
+        case .handshake:
+          throw CredentialBrokerProcessError.handshakeFailed
+        case .capability:
+          throw CredentialBrokerProcessError.capabilityResponseTooLarge
+        }
       }
     }
-    throw CredentialBrokerProcessError.handshakeTimedOut
+    switch context {
+    case .handshake:
+      throw CredentialBrokerProcessError.handshakeTimedOut
+    case .capability:
+      throw CredentialBrokerProcessError.capabilityTimedOut
+    }
+  }
+
+  private static func failure(for context: Context) -> CredentialBrokerProcessError {
+    switch context {
+    case .handshake: .handshakeFailed
+    case .capability: .invalidCapabilityResponse
+    }
   }
 }
 
@@ -457,8 +617,12 @@ public enum CredentialBrokerProcessError: LocalizedError, Sendable {
   case sessionAlreadyRunning
   case sessionNotRunning
   case requestTooLarge
+  case capabilityUnavailable
   case pipeConfigurationFailed
   case capabilityFailed(String)
+  case invalidCapabilityResponse
+  case capabilityResponseTooLarge
+  case capabilityTimedOut
   case launchFailed(String)
   case handshakeFailed
   case handshakeTimedOut
@@ -478,10 +642,18 @@ public enum CredentialBrokerProcessError: LocalizedError, Sendable {
       "The namespace credential broker is not running. Unlock the namespace and try again."
     case .requestTooLarge:
       "The credential capability request is too large."
+    case .capabilityUnavailable:
+      "This credential broker does not support the requested GitHub capability."
     case .pipeConfigurationFailed:
       "The credential broker pipe could not be configured safely."
     case .capabilityFailed(let message):
       message
+    case .invalidCapabilityResponse:
+      "The credential broker returned an invalid capability response. Lock the namespace and try again."
+    case .capabilityResponseTooLarge:
+      "The credential broker response exceeded the safe limit. Narrow the GitHub App installation and try again."
+    case .capabilityTimedOut:
+      "The credential broker operation timed out. Try again."
     case .launchFailed(let message):
       "The native credential broker could not start: \(message)"
     case .handshakeFailed:

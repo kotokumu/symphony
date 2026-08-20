@@ -58,4 +58,9 @@ final class NamespaceWindowSecurityCoordinator: ObservableObject {
   func waitForCurrentOperation() async {
     await task?.value
   }
+
+  func waitUntilSafeToResumeAdmission() async -> Bool {
+    await task?.value
+    return state == .idle
+  }
 }

@@ -46,6 +46,67 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     XCTAssertFalse(directory.path.contains(namespace.name.value))
   }
 
+  func testPersistsGitHubConnectionAndMigratesVersionOneMetadata() async throws {
+    let repository = FileNamespaceRepository(storageDirectory: storageDirectory)
+    var catalog = NamespaceCatalog()
+    let namespace = try catalog.create(named: "Research")
+    try await repository.create(namespace, saving: catalog)
+    let connection = try GitHubConnection(
+      appID: 10,
+      installationID: 20,
+      accountLogin: "octo",
+      repositoryID: 30,
+      repositoryFullName: "octo/research",
+      repositoryURL: URL(string: "https://github.com/octo/research")!
+    )
+    try catalog.connect(namespace.id, to: .github(connection))
+    try await repository.save(catalog)
+
+    let connected = try await repository.load()
+
+    XCTAssertEqual(connected.selectedNamespace?.platformConnection, .github(connection))
+    let metadataURL = storageDirectory.appendingPathComponent("namespaces.json")
+    let metadata = try Data(contentsOf: metadataURL)
+    let document = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: metadata) as? [String: Any]
+    )
+    XCTAssertEqual(Set(document.keys), ["namespaces", "selectedID", "version"])
+    XCTAssertEqual((document["version"] as? NSNumber)?.intValue, 2)
+    let records = try XCTUnwrap(document["namespaces"] as? [[String: Any]])
+    let record = try XCTUnwrap(records.first)
+    XCTAssertEqual(Set(record.keys), ["id", "name", "platformConnection"])
+    let platform = try XCTUnwrap(record["platformConnection"] as? [String: Any])
+    XCTAssertEqual(Set(platform.keys), ["github", "kind"])
+    XCTAssertEqual(platform["kind"] as? String, "github")
+    let github = try XCTUnwrap(platform["github"] as? [String: Any])
+    XCTAssertEqual(
+      Set(github.keys),
+      [
+        "accountLogin", "appID", "installationID", "repositoryFullName", "repositoryID",
+        "repositoryURL",
+      ]
+    )
+    XCTAssertEqual(github["repositoryFullName"] as? String, "octo/research")
+    let oldNamespaceID = UUID()
+    let oldDirectory = repository.directoryURL(for: oldNamespaceID)
+    try FileManager.default.createDirectory(at: oldDirectory, withIntermediateDirectories: true)
+    try Data(
+      """
+      {"version":1,"namespaces":[{"id":"\(oldNamespaceID.uuidString)","name":"Legacy"}],"selectedID":"\(oldNamespaceID.uuidString)"}
+      """.utf8
+    ).write(to: metadataURL, options: .atomic)
+
+    let migrated = try await repository.load()
+
+    XCTAssertEqual(migrated.selectedNamespace?.name.value, "Legacy")
+    XCTAssertNil(migrated.selectedNamespace?.platformConnection)
+    try await repository.save(migrated)
+    let rewritten = try XCTUnwrap(
+      JSONSerialization.jsonObject(with: Data(contentsOf: metadataURL)) as? [String: Any]
+    )
+    XCTAssertEqual((rewritten["version"] as? NSNumber)?.intValue, 2)
+  }
+
   func testDoesNotOverwriteCorruptMetadata() async throws {
     let metadataURL = storageDirectory.appendingPathComponent("namespaces.json")
     let corruptData = Data("{not-json".utf8)
@@ -82,14 +143,14 @@ final class FileNamespaceRepositoryTests: XCTestCase {
 
   func testRejectsUnsupportedMetadataWithoutOverwritingIt() async throws {
     let metadataURL = storageDirectory.appendingPathComponent("namespaces.json")
-    let unsupportedData = Data("{\"version\":2,\"namespaces\":[],\"selectedID\":null}".utf8)
+    let unsupportedData = Data("{\"version\":3,\"namespaces\":[],\"selectedID\":null}".utf8)
     try unsupportedData.write(to: metadataURL)
     let repository = FileNamespaceRepository(storageDirectory: storageDirectory)
 
     await assertThrowsErrorAsync(try await repository.load()) { error in
       XCTAssertEqual(
         error.localizedDescription,
-        "Namespace data version 2 is not supported. The file was not changed."
+        "Namespace data version 3 is not supported. The file was not changed."
       )
     }
     XCTAssertEqual(try Data(contentsOf: metadataURL), unsupportedData)
@@ -346,6 +407,15 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     let researchID = try XCTUnwrap(firstController.catalog.selectedID)
     try await firstController.createNamespace(named: "Operations")
     let operationsID = try XCTUnwrap(firstController.catalog.selectedID)
+    let connection = try GitHubConnection(
+      appID: 10,
+      installationID: 20,
+      accountLogin: "octo",
+      repositoryID: 30,
+      repositoryFullName: "octo/research",
+      repositoryURL: URL(string: "https://github.com/octo/research")!
+    )
+    try await firstController.connectNamespace(researchID, to: connection)
     try await firstController.renameNamespace(researchID, to: "Market Research")
     try await firstController.selectNamespace(researchID)
 
@@ -357,6 +427,10 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     let restoredCatalog = restoredController.catalog
     XCTAssertEqual(restoredCatalog.namespaces.map(\.name.value), ["Market Research", "Operations"])
     XCTAssertEqual(restoredCatalog.selectedID, researchID)
+    XCTAssertEqual(
+      restoredCatalog.namespaces.first(where: { $0.id == researchID })?.platformConnection,
+      .github(connection)
+    )
 
     _ = try await restoredController.deleteNamespace(operationsID)
     let finalController = NamespaceController(
@@ -367,6 +441,7 @@ final class FileNamespaceRepositoryTests: XCTestCase {
     let finalCatalog = finalController.catalog
     XCTAssertEqual(finalCatalog.namespaces.map(\.name.value), ["Market Research"])
     XCTAssertEqual(finalCatalog.selectedID, researchID)
+    XCTAssertEqual(finalCatalog.selectedNamespace?.platformConnection, .github(connection))
   }
 }
 

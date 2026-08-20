@@ -12,6 +12,11 @@ public protocol NamespaceCredentialStoring: Sendable {
     namespaceID: UUID,
     authorization: NamespaceUnlockAuthorization
   ) throws
+  func replace(
+    _ credential: Data,
+    namespaceID: UUID,
+    authorization: NamespaceUnlockAuthorization
+  ) throws
   func removeAll(namespaceID: UUID) throws
 }
 
@@ -22,6 +27,7 @@ public protocol NamespaceKeychainAccessing: Sendable {
   ) throws -> SecAccessControl
   func copyMatching(_ query: CFDictionary) -> (status: OSStatus, result: CFTypeRef?)
   func add(_ attributes: CFDictionary) -> OSStatus
+  func update(_ query: CFDictionary, attributes: CFDictionary) -> OSStatus
   func delete(_ query: CFDictionary) -> OSStatus
 }
 
@@ -58,6 +64,10 @@ public struct SystemNamespaceKeychainClient: NamespaceKeychainAccessing {
 
   public func add(_ attributes: CFDictionary) -> OSStatus {
     SecItemAdd(attributes, nil)
+  }
+
+  public func update(_ query: CFDictionary, attributes: CFDictionary) -> OSStatus {
+    SecItemUpdate(query, attributes)
   }
 
   public func delete(_ query: CFDictionary) -> OSStatus {
@@ -120,6 +130,20 @@ public struct KeychainNamespaceCredentialStorage: NamespaceCredentialStoring {
   public func removeAll(namespaceID: UUID) throws {
     let status = keychain.delete(baseQuery(namespaceID: namespaceID) as CFDictionary)
     guard status == errSecSuccess || status == errSecItemNotFound else {
+      throw NamespaceCredentialStorageError.keychain(status)
+    }
+  }
+
+  public func replace(
+    _ credential: Data,
+    namespaceID: UUID,
+    authorization: NamespaceUnlockAuthorization
+  ) throws {
+    var query = baseQuery(namespaceID: namespaceID)
+    query[kSecUseAuthenticationContext as String] = authorization.context
+    let attributes = [kSecValueData as String: credential]
+    let status = keychain.update(query as CFDictionary, attributes: attributes as CFDictionary)
+    guard status == errSecSuccess else {
       throw NamespaceCredentialStorageError.keychain(status)
     }
   }
