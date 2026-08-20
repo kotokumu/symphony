@@ -151,6 +151,132 @@ final class NamespaceGitHubAccessSessionTests: XCTestCase {
     }
   }
 
+  func testSecondRead401StopsRetryAndPermissionFailureForcesNextRequestToRemint() async throws {
+    let root = try makeDirectory()
+    let now = Date()
+    let expired = GitHubRepositoryAPIError.failure(
+      GitHubCapabilityFailure(category: .authExpired, message: "expired", status: 401),
+      invalidatesLease: true,
+      retryGET: true
+    )
+    let repeatedAPI = RecordingRepositoryAPI(
+      expirations: [now.addingTimeInterval(3_600), now.addingTimeInterval(3_600)],
+      issueResults: [.failure(expired), .failure(expired)]
+    )
+    let repeated = NamespaceGitHubAccessSession(api: repeatedAPI, now: { now })
+    try await repeated.authorize(makeAuthorization(root: root), storedAppID: 10)
+    do {
+      _ = try await repeated.performIssueRequest(.getIssue(issueNumber: 1), jwt: "jwt")
+      XCTFail("Expected refreshed App authentication rejection")
+    } catch let error as GitHubRepositoryAPIError {
+      XCTAssertEqual(error.failure.category, .appCredentialRejected)
+    }
+    let repeatedIssueCount = await repeatedAPI.issueCount
+    let repeatedMintCount = await repeatedAPI.mintCount
+    XCTAssertEqual(repeatedIssueCount, 2)
+    XCTAssertEqual(repeatedMintCount, 2)
+
+    let deniedAPI = RecordingRepositoryAPI(
+      expirations: [now.addingTimeInterval(3_600), now.addingTimeInterval(3_600)],
+      issueResults: [.failure(.failure(
+        GitHubCapabilityFailure(category: .permissionDenied, message: "denied", status: 403),
+        invalidatesLease: true,
+        retryGET: false
+      ))]
+    )
+    let denied = NamespaceGitHubAccessSession(api: deniedAPI, now: { now })
+    try await denied.authorize(makeAuthorization(root: root), storedAppID: 10)
+    do {
+      _ = try await denied.performIssueRequest(.getIssue(issueNumber: 1), jwt: "jwt")
+      XCTFail("Expected permission denial")
+    } catch let error as GitHubRepositoryAPIError {
+      XCTAssertEqual(error.failure.category, .permissionDenied)
+    }
+    _ = try await denied.performIssueRequest(.getIssue(issueNumber: 2), jwt: "jwt")
+    let deniedMintCount = await deniedAPI.mintCount
+    XCTAssertEqual(deniedMintCount, 2)
+  }
+
+  func testGitCredentialEraseFailureClearsLeaseBeforeManualRetry() async throws {
+    let root = try makeDirectory()
+    let now = Date()
+    let api = RecordingRepositoryAPI(
+      expirations: [now.addingTimeInterval(3_600), now.addingTimeInterval(3_600)]
+    )
+    let git = RecordingGitRunner(results: [
+      .failure(GitCommandRunnerError.authenticationRejected),
+      .success(GitRepositoryCapabilityResult(exitStatus: 0, output: "", wasTruncated: false)),
+    ])
+    let session = NamespaceGitHubAccessSession(api: api, git: git, now: { now })
+    try await session.authorize(makeAuthorization(root: root), storedAppID: 10)
+    do {
+      _ = try await session.performGitOperation(.clone(targetName: "first"), jwt: "jwt")
+      XCTFail("Expected helper erase rejection")
+    } catch let error as GitHubRepositoryAPIError {
+      XCTAssertEqual(error.failure.category, .gitAuthenticationRejected)
+    }
+    _ = try await session.performGitOperation(.clone(targetName: "second"), jwt: "jwt")
+    let mintCount = await api.mintCount
+    XCTAssertEqual(mintCount, 2)
+  }
+
+  func testGitStopFailureKeepsAdmissionClosedUntilCleanupRetrySucceeds() async throws {
+    let root = try makeDirectory()
+    let git = FailOnceStopGitRunner()
+    let session = NamespaceGitHubAccessSession(api: RecordingRepositoryAPI(), git: git)
+    try await session.authorize(makeAuthorization(root: root), storedAppID: 10)
+
+    do {
+      try await session.quiesceAndClear()
+      XCTFail("Expected retained Git cleanup failure")
+    } catch let error as GitCommandRunnerError {
+      XCTAssertEqual(error.failure.category, .cleanupRequired)
+    }
+    do {
+      _ = try await session.performGitOperation(.clone(targetName: "blocked"), jwt: "jwt")
+      XCTFail("Expected admission to remain closed")
+    } catch let error as GitHubRepositoryAccessError {
+      XCTAssertEqual(error.failure.category, .locked)
+    }
+    do {
+      try await session.authorize(makeAuthorization(root: root), storedAppID: 10)
+      XCTFail("Expected replacement authorization to remain closed")
+    } catch let error as GitHubRepositoryAccessError {
+      XCTAssertEqual(error.failure.category, .locked)
+    }
+
+    try await session.quiesceAndClear()
+    let stopCount = await git.stopCount
+    let hasScope = await session.hasAuthorizedScope
+    XCTAssertEqual(stopCount, 2)
+    XCTAssertFalse(hasScope)
+  }
+
+  func testRedactsCredentialCanariesFromEveryTypedIssueTextField() async throws {
+    let root = try makeDirectory()
+    let now = Date()
+    let api = RecordingRepositoryAPI(
+      expirations: [now.addingTimeInterval(3_600)],
+      issueResults: [.success(.issue(GitHubIssueRecord(
+        number: 1,
+        title: "token-1",
+        body: "Bearer token-1",
+        authorLogin: "token-1",
+        labels: ["prefix-token-1"],
+        assigneeLogins: [Data("token-1".utf8).base64EncodedString()]
+      )))]
+    )
+    let session = NamespaceGitHubAccessSession(api: api, now: { now })
+    try await session.authorize(makeAuthorization(root: root), storedAppID: 10)
+
+    let response = try await session.performIssueRequest(.getIssue(issueNumber: 1), jwt: "jwt")
+    let encoded = try JSONEncoder().encode(response)
+    let text = String(decoding: encoded, as: UTF8.self)
+    XCTAssertFalse(text.contains("token-1"))
+    XCTAssertFalse(text.contains(Data("token-1".utf8).base64EncodedString()))
+    XCTAssertTrue(text.contains("REDACTED"))
+  }
+
   func testRetriesOneReadAfter401ButNeverRedispatchesMutation() async throws {
     let root = try makeDirectory()
     let now = Date()
@@ -296,5 +422,42 @@ private actor CancellableRepositoryAPI: GitHubRepositoryAPIRequesting {
   func waitUntilIssueStarted() async {
     if issueStarted { return }
     await withCheckedContinuation { waiters.append($0) }
+  }
+}
+
+private actor RecordingGitRunner: ScopedGitRunning {
+  private var results: [Result<GitRepositoryCapabilityResult, GitCommandRunnerError>]
+
+  init(results: [Result<GitRepositoryCapabilityResult, GitCommandRunnerError>]) {
+    self.results = results
+  }
+
+  func run(
+    _ request: GitRepositoryCapabilityRequest,
+    in scope: AuthorizedGitHubRepositoryScope,
+    acquireCredential: @escaping @Sendable () async throws -> OperationCredential
+  ) async throws -> GitRepositoryCapabilityResult {
+    let credential = try await acquireCredential()
+    defer { credential.clear() }
+    return try results.removeFirst().get()
+  }
+
+  func stopRetainedOperation() async throws {}
+}
+
+private actor FailOnceStopGitRunner: ScopedGitRunning {
+  private(set) var stopCount = 0
+
+  func run(
+    _ request: GitRepositoryCapabilityRequest,
+    in scope: AuthorizedGitHubRepositoryScope,
+    acquireCredential: @escaping @Sendable () async throws -> OperationCredential
+  ) async throws -> GitRepositoryCapabilityResult {
+    throw GitCommandRunnerError.cleanupRequired
+  }
+
+  func stopRetainedOperation() throws {
+    stopCount += 1
+    if stopCount == 1 { throw GitCommandRunnerError.cleanupRequired }
   }
 }

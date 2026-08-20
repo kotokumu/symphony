@@ -21,16 +21,14 @@ public actor NamespaceCredentialSession {
     authorizer: any NamespaceUnlockAuthorizing = LocalAuthenticationNamespaceUnlockAuthorizer(),
     storage: any NamespaceCredentialStoring = KeychainNamespaceCredentialStorage(),
     credentialGenerator: @escaping CredentialGenerator = NamespaceCredentialSession.randomCredential,
-    githubAPI: any GitHubAppAPIRequesting = GitHubAppAPIClient()
+    githubService: GitHubAppAPIClient = GitHubAppAPIClient()
   ) {
     self.namespaceID = namespaceID
     self.authorizer = authorizer
     self.storage = storage
     self.credentialGenerator = credentialGenerator
-    self.githubAPI = githubAPI
-    githubAccess = NamespaceGitHubAccessSession(
-      api: (githubAPI as? any GitHubRepositoryAPIRequesting) ?? GitHubAppAPIClient()
-    )
+    githubAPI = githubService
+    githubAccess = NamespaceGitHubAccessSession(api: githubService)
   }
 
   init(

@@ -613,6 +613,64 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
     first.cancel()
   }
 
+  func testForcedBrokerTerminationWaitsForRealGitRunnerDescendants() async throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let realBroker = try brokerExecutable()
+    let gitParentURL = directory.appendingPathComponent("git-parent")
+    let gitChildURL = directory.appendingPathComponent("git-child")
+    let longRunningGit = try executableScript(
+      in: directory,
+      name: "long-running-git",
+      contents: """
+        #!/bin/sh
+        echo $$ > "$BROKER_GIT_PARENT_FILE"
+        sleep 60 &
+        child=$!
+        echo $child > "$BROKER_GIT_CHILD_FILE"
+        wait $child
+        """
+    )
+    let script = try executableScript(
+      in: directory,
+      contents: """
+        #!/bin/sh
+        exec 3<&0
+        "$BROKER_REAL_EXECUTABLE" git-runner "$BROKER_LONG_GIT_EXECUTABLE" <&3 &
+        printf '{"status":"unlocked"}\n'
+        IFS= read -r command
+        trap '' TERM
+        exec /usr/bin/tail -f /dev/null
+        """
+    )
+    let launcher = CredentialBrokerProcessLauncher(
+      executableURL: script,
+      handshakeTimeout: 2,
+      stopTimeout: 0.1,
+      environment: [
+        "PATH": "/usr/bin:/bin",
+        "BROKER_REAL_EXECUTABLE": realBroker.path,
+        "BROKER_LONG_GIT_EXECUTABLE": longRunningGit.path,
+        "BROKER_GIT_PARENT_FILE": gitParentURL.path,
+        "BROKER_GIT_CHILD_FILE": gitChildURL.path,
+      ]
+    )
+    let session = try await launcher.unlock(namespaceID: UUID())
+    await eventually { FileManager.default.fileExists(atPath: gitParentURL.path) }
+    await eventually { FileManager.default.fileExists(atPath: gitChildURL.path) }
+    let gitParent = try XCTUnwrap(
+      Int32(String(contentsOf: gitParentURL).trimmingCharacters(in: .whitespacesAndNewlines))
+    )
+    let gitChild = try XCTUnwrap(
+      Int32(String(contentsOf: gitChildURL).trimmingCharacters(in: .whitespacesAndNewlines))
+    )
+
+    try await session.lock()
+
+    XCTAssertFalse(processExists(gitParent))
+    XCTAssertFalse(processExists(gitChild))
+  }
+
   private func temporaryDirectory() throws -> URL {
     let url = FileManager.default.temporaryDirectory
       .appendingPathComponent("CredentialBrokerProcessLauncherTests-\(UUID().uuidString)")
@@ -620,11 +678,36 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
     return url
   }
 
-  private func executableScript(in directory: URL, contents: String) throws -> URL {
-    let url = directory.appendingPathComponent("broker-fixture")
+  private func executableScript(
+    in directory: URL,
+    name: String = "broker-fixture",
+    contents: String
+  ) throws -> URL {
+    let url = directory.appendingPathComponent(name)
     try Data(contents.utf8).write(to: url)
     try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: url.path)
     return url
+  }
+
+  private func brokerExecutable() throws -> URL {
+    let starts = [
+      Bundle(for: CredentialBrokerProcessLauncherTests.self).bundleURL,
+      URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent(),
+    ]
+    for start in starts {
+      var directory = start
+      for _ in 0..<8 {
+        let candidate = directory.appendingPathComponent("SymphonyCredentialBroker")
+        if FileManager.default.isExecutableFile(atPath: candidate.path) { return candidate }
+        directory.deleteLastPathComponent()
+      }
+    }
+    throw CredentialBrokerProcessLauncherError.executableNotFound
+  }
+
+  private func processExists(_ pid: Int32) -> Bool {
+    let result = Darwin.kill(pid, 0)
+    return result == 0 || errno == EPERM
   }
 
   private func eventually(

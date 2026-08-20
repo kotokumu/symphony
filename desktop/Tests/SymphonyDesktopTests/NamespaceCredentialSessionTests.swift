@@ -163,7 +163,10 @@ final class NamespaceCredentialSessionTests: XCTestCase {
       namespaceID: namespaceID,
       authorizer: RecordingUnlockAuthorizer(),
       storage: storage,
-      githubAPI: githubAPI
+      credentialGenerator: NamespaceCredentialSession.randomCredential,
+      githubAPI: githubAPI,
+      githubRepositoryAPI: UnavailableRepositoryAPI(),
+      now: Date.init
     )
     let privateKeyURL = try makePrivateKeyPEM()
     defer { try? FileManager.default.removeItem(at: privateKeyURL) }
@@ -180,27 +183,54 @@ final class NamespaceCredentialSessionTests: XCTestCase {
       .appendingPathComponent("symphony-scope-\(UUID().uuidString)", isDirectory: true)
     try FileManager.default.createDirectory(at: workspacesRoot, withIntermediateDirectories: false)
     defer { try? FileManager.default.removeItem(at: workspacesRoot) }
-    do {
-      try await session.authorizeGitHubRepository(
-        GitHubRepositoryAuthorization(
-          appID: 10,
-          installationID: 20,
-          repositoryID: 31,
-          repositoryFullName: "octo/other",
-          repositoryURL: URL(string: "https://github.com/octo/other")!,
-          workspacesRoot: workspacesRoot
-        )
-      )
-      XCTFail("Expected repository claims absent from GitHub discovery to be rejected")
-    } catch let error as GitHubRepositoryAccessError {
-      XCTAssertEqual(error.failure.category, .unauthorizedScope)
+    let rejectedClaims = [
+      GitHubRepositoryAuthorization(
+        appID: 10,
+        installationID: 21,
+        repositoryID: 30,
+        repositoryFullName: "octo/research",
+        repositoryURL: URL(string: "https://github.com/octo/research")!,
+        workspacesRoot: workspacesRoot
+      ),
+      GitHubRepositoryAuthorization(
+        appID: 10,
+        installationID: 20,
+        repositoryID: 31,
+        repositoryFullName: "octo/research",
+        repositoryURL: URL(string: "https://github.com/octo/research")!,
+        workspacesRoot: workspacesRoot
+      ),
+      GitHubRepositoryAuthorization(
+        appID: 10,
+        installationID: 20,
+        repositoryID: 30,
+        repositoryFullName: "octo/other",
+        repositoryURL: URL(string: "https://github.com/octo/other")!,
+        workspacesRoot: workspacesRoot
+      ),
+      GitHubRepositoryAuthorization(
+        appID: 11,
+        installationID: 20,
+        repositoryID: 30,
+        repositoryFullName: "octo/research",
+        repositoryURL: URL(string: "https://github.com/octo/research")!,
+        workspacesRoot: workspacesRoot
+      ),
+    ]
+    for authorization in rejectedClaims {
+      do {
+        try await session.authorizeGitHubRepository(authorization)
+        XCTFail("Expected repository claims absent from GitHub discovery to be rejected")
+      } catch let error as GitHubRepositoryAccessError {
+        XCTAssertEqual(error.failure.category, .unauthorizedScope)
+      }
     }
     try await session.authorizeGitHubRepository(
       GitHubRepositoryAuthorization(
         appID: 10,
         installationID: 20,
         repositoryID: 30,
-        repositoryFullName: "octo/research",
+        repositoryFullName: "OCTO/RESEARCH",
         repositoryURL: URL(string: "https://github.com/octo/research")!,
         workspacesRoot: workspacesRoot
       )
@@ -214,7 +244,7 @@ final class NamespaceCredentialSessionTests: XCTestCase {
     XCTAssertEqual(stored.appID, 10)
     stored.clear()
     let jwtValues = await githubAPI.jwtValues
-    XCTAssertEqual(jwtValues.count, 4)
+    XCTAssertEqual(jwtValues.count, 7)
     XCTAssertTrue(jwtValues.allSatisfy { $0.split(separator: ".").count == 3 })
     let privateKeyText = try String(contentsOf: privateKeyURL, encoding: .utf8)
     XCTAssertTrue(jwtValues.allSatisfy { !$0.contains(privateKeyText) })
@@ -389,13 +419,19 @@ final class NamespaceCredentialSessionTests: XCTestCase {
       namespaceID: firstID,
       authorizer: RecordingUnlockAuthorizer(),
       storage: storage,
-      githubAPI: firstAPI
+      credentialGenerator: NamespaceCredentialSession.randomCredential,
+      githubAPI: firstAPI,
+      githubRepositoryAPI: UnavailableRepositoryAPI(),
+      now: Date.init
     )
     let restoredSecond = NamespaceCredentialSession(
       namespaceID: secondID,
       authorizer: RecordingUnlockAuthorizer(),
       storage: storage,
-      githubAPI: secondAPI
+      credentialGenerator: NamespaceCredentialSession.randomCredential,
+      githubAPI: secondAPI,
+      githubRepositoryAPI: UnavailableRepositoryAPI(),
+      now: Date.init
     )
     try await restoredFirst.unlock(reason: "First restored")
     try await restoredSecond.unlock(reason: "Second restored")
@@ -483,6 +519,7 @@ private actor RecordingGitHubAppAPI: GitHubAppAPIRequesting {
     jwt: String
   ) -> [GitHubRepositoryDescriptor] {
     jwtValues.append(jwt)
+    guard installationID == 20 else { return [] }
     return [
       GitHubRepositoryDescriptor(
         id: 30,
@@ -491,6 +528,23 @@ private actor RecordingGitHubAppAPI: GitHubAppAPIRequesting {
         isPrivate: true
       )
     ]
+  }
+}
+
+private actor UnavailableRepositoryAPI: GitHubRepositoryAPIRequesting {
+  func mintInstallationToken(
+    scope: AuthorizedGitHubRepositoryScope,
+    jwt: String
+  ) throws -> InstallationTokenLease {
+    throw GitHubRepositoryAccessError.locked
+  }
+
+  func performIssueRequest(
+    _ request: GitHubIssueCapabilityRequest,
+    scope: AuthorizedGitHubRepositoryScope,
+    token: SecureSecretBuffer
+  ) throws -> GitHubIssueCapabilityResponse {
+    throw GitHubRepositoryAccessError.locked
   }
 }
 

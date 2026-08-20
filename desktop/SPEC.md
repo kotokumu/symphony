@@ -134,7 +134,9 @@ repositories, rejected credentials, and GitHub service failures produce actionab
 After the namespace is unlocked, Symphony can list issues, read an issue and its comments, add an
 issue comment, and open or close an issue in the selected repository. Requests for another
 installation or repository, unsupported GitHub operations, and malformed or oversized requests are
-rejected before GitHub credentials are used. Read requests recover once from an expired credential.
+rejected before GitHub credentials are used. Pull requests returned by GitHub's issues endpoints are
+excluded and cannot be read or mutated through issue capabilities. Read requests recover once from
+an expired credential.
 Issue mutations are not repeated automatically after dispatch because their effect may already have
 occurred. Successful operations return typed issue or comment records rather than raw GitHub REST
 response bytes.
@@ -151,8 +153,9 @@ repositories whose origin does not match the selected repository, unsafe Git con
 unsupported push destinations. Git receives its short-lived credential through an operation-scoped
 credential helper over an inherited socket capability that is unavailable to unrelated processes.
 Repository URLs and configuration remain credential-free. A failed clone removes the partial
-workspace only while its recorded filesystem identity still matches; otherwise Symphony preserves
-the replacement and reports that cleanup is required before access can resume.
+workspace through its broker-owned directory descriptor only while its recorded filesystem identity
+still matches; otherwise Symphony preserves the replacement and reports that cleanup is required
+before access can resume.
 
 Locking protected credentials stops active GitHub and Git access, cancels queued access, clears
 short-lived credentials, and prevents replacement access until owned processes have exited. A stop

@@ -243,6 +243,22 @@ public struct GitHubInstallationDescriptor: Codable, Equatable, Identifiable, Se
     self.permissions = permissions
     self.isSuspended = isSuspended
   }
+
+  public init(from decoder: any Decoder) throws {
+    try StrictProtocolCoding.rejectUnknownKeys(in: decoder, allowed: CodingKeys.allCases.map(\.stringValue))
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    self.init(
+      id: try container.decode(Int64.self, forKey: .id),
+      accountLogin: try container.decode(String.self, forKey: .accountLogin),
+      accountType: try container.decode(String.self, forKey: .accountType),
+      permissions: try container.decode([String: String].self, forKey: .permissions),
+      isSuspended: try container.decode(Bool.self, forKey: .isSuspended)
+    )
+  }
+
+  private enum CodingKeys: String, CodingKey, CaseIterable {
+    case id, accountLogin, accountType, permissions, isSuspended
+  }
 }
 
 public struct GitHubRepositoryDescriptor: Codable, Equatable, Identifiable, Sendable {
@@ -256,6 +272,21 @@ public struct GitHubRepositoryDescriptor: Codable, Equatable, Identifiable, Send
     self.fullName = fullName
     self.htmlURL = htmlURL
     self.isPrivate = isPrivate
+  }
+
+  public init(from decoder: any Decoder) throws {
+    try StrictProtocolCoding.rejectUnknownKeys(in: decoder, allowed: CodingKeys.allCases.map(\.stringValue))
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    self.init(
+      id: try container.decode(Int64.self, forKey: .id),
+      fullName: try container.decode(String.self, forKey: .fullName),
+      htmlURL: try container.decode(URL.self, forKey: .htmlURL),
+      isPrivate: try container.decode(Bool.self, forKey: .isPrivate)
+    )
+  }
+
+  private enum CodingKeys: String, CodingKey, CaseIterable {
+    case id, fullName, htmlURL, isPrivate
   }
 }
 

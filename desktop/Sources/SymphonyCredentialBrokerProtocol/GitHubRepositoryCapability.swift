@@ -266,6 +266,7 @@ public enum GitHubIssueCapabilityRequest: Codable, Equatable, Sendable {
   }
 }
 
+
 public struct GitHubIssueRecord: Codable, Equatable, Sendable {
   public let number: Int32
   public let title: String?

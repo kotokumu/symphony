@@ -65,6 +65,21 @@ struct GitRepositoryTrustPolicy: Sendable {
     }
   }
 
+  func revalidate(
+    _ plan: ValidatedGitOperationPlan,
+    in scope: AuthorizedGitHubRepositoryScope,
+    preparedCloneIdentity: FileIdentity?
+  ) throws {
+    if case .clone = plan.request, let preparedCloneIdentity {
+      try requireRootIdentity(scope)
+      guard try directoryIdentity(plan.targetURL) == preparedCloneIdentity else {
+        throw GitRepositoryTrustError.filesystemChanged
+      }
+      return
+    }
+    try revalidate(plan, in: scope)
+  }
+
   static func isValidBranch(_ value: String) -> Bool {
     guard !value.isEmpty, value.utf8.count <= 244, value != "@",
       !value.hasPrefix("-"), !value.hasPrefix("/"),

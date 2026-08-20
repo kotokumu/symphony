@@ -368,6 +368,14 @@ public struct GitHubAppAPIClient: GitHubAppAPIRequesting, GitHubRepositoryAPIReq
     token: SecureSecretBuffer
   ) async throws -> GitHubIssueCapabilityResponse {
     let deadline = ContinuousClock.now.advanced(by: operationTimeout)
+    if let issueNumber = request.issueNumberRequiringTypeValidation {
+      try await requireIssueTarget(
+        issueNumber,
+        scope: scope,
+        token: token,
+        deadline: deadline
+      )
+    }
     let rendered = try render(request, scope: scope)
     let bearer = token.withTemporaryData { String(decoding: $0, as: UTF8.self) }
     var urlRequest = try makeRequest(
@@ -390,11 +398,15 @@ public struct GitHubAppAPIClient: GitHubAppAPIRequesting, GitHubRepositoryAPIReq
       let decoder = JSONDecoder()
       switch request {
       case .listIssues:
-        let values = try decoder.decode([GitHubIssueAPIResponse].self, from: data).map(\.record)
+        let values = try decoder.decode([GitHubIssueAPIResponse].self, from: data)
+          .filter { !$0.isPullRequest }
+          .map(\.record)
         guard values.allSatisfy({ $0.number > 0 }) else { throw GitHubAppAPIError.invalidResponse }
         return .issueList(values)
       case .getIssue:
-        let value = try decoder.decode(GitHubIssueAPIResponse.self, from: data).record
+        let response = try decoder.decode(GitHubIssueAPIResponse.self, from: data)
+        guard !response.isPullRequest else { throw GitHubAppAPIError.invalidResponse }
+        let value = response.record
         guard value.number > 0 else { throw GitHubAppAPIError.invalidResponse }
         return .issue(value)
       case .listComments:
@@ -406,7 +418,9 @@ public struct GitHubAppAPIClient: GitHubAppAPIRequesting, GitHubRepositoryAPIReq
         guard value.id > 0 else { throw GitHubAppAPIError.invalidResponse }
         return .comment(value)
       case .setIssueState:
-        let value = try decoder.decode(GitHubIssueAPIResponse.self, from: data).record
+        let response = try decoder.decode(GitHubIssueAPIResponse.self, from: data)
+        guard !response.isPullRequest else { throw GitHubAppAPIError.invalidResponse }
+        let value = response.record
         guard value.number > 0 else { throw GitHubAppAPIError.invalidResponse }
         return .stateChanged(value)
       }
@@ -415,6 +429,43 @@ public struct GitHubAppAPIClient: GitHubAppAPIRequesting, GitHubRepositoryAPIReq
         GitHubCapabilityFailure(
           category: .invalidServiceResponse,
           message: "GitHub returned an unreadable issue response."
+        ),
+        invalidatesLease: false,
+        retryGET: false
+      )
+    }
+  }
+
+  private func requireIssueTarget(
+    _ issueNumber: Int32,
+    scope: AuthorizedGitHubRepositoryScope,
+    token: SecureSecretBuffer,
+    deadline: ContinuousClock.Instant
+  ) async throws {
+    let bearer = token.withTemporaryData { String(decoding: $0, as: UTF8.self) }
+    let request = try makeRequest(
+      path: "/repos/\(scope.owner)/\(scope.repository)/issues/\(issueNumber)",
+      bearer: bearer,
+      deadline: deadline
+    )
+    let (data, response) = try await sendRepositoryRequest(
+      request,
+      deadline: deadline,
+      isMint: false
+    )
+    guard (200..<300).contains(response.statusCode) else {
+      throw repositoryError(response: response, isMint: false)
+    }
+    do {
+      let target = try JSONDecoder().decode(GitHubIssueAPIResponse.self, from: data)
+      guard target.number == issueNumber, !target.isPullRequest else {
+        throw GitHubAppAPIError.invalidResponse
+      }
+    } catch {
+      throw GitHubRepositoryAPIError.failure(
+        GitHubCapabilityFailure(
+          category: .invalidRequest,
+          message: "The selected number is not a GitHub issue."
         ),
         invalidatesLease: false,
         retryGET: false
@@ -782,11 +833,17 @@ private struct GitHubIssueAPIResponse: Decodable {
   let user: User?
   let labels: [Label]?
   let assignees: [User]?
+  let pullRequest: PullRequest?
+
+  struct PullRequest: Decodable {}
 
   enum CodingKeys: String, CodingKey {
     case number, title, body, state, user, labels, assignees
     case htmlURL = "html_url"
+    case pullRequest = "pull_request"
   }
+
+  var isPullRequest: Bool { pullRequest != nil }
 
   var record: GitHubIssueRecord {
     GitHubIssueRecord(
@@ -799,6 +856,18 @@ private struct GitHubIssueAPIResponse: Decodable {
       labels: labels?.map(\.name) ?? [],
       assigneeLogins: assignees?.map(\.login) ?? []
     )
+  }
+}
+
+private extension GitHubIssueCapabilityRequest {
+  var issueNumberRequiringTypeValidation: Int32? {
+    switch self {
+    case .listComments(let issueNumber, _), .createComment(let issueNumber, _),
+      .setIssueState(let issueNumber, _):
+      return issueNumber
+    case .listIssues, .getIssue:
+      return nil
+    }
   }
 }
 

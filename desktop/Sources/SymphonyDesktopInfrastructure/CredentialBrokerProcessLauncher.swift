@@ -512,14 +512,14 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
     var groups: Set<Int32> = []
     while let current = pending.popLast() {
       guard visited.insert(current).inserted else { continue }
-      let byteCount = Int(symphonyListChildProcessIDs(current, nil, 0))
-      guard byteCount > 0 else { continue }
-      var children = [pid_t](repeating: 0, count: byteCount / MemoryLayout<pid_t>.size)
-      let written = children.withUnsafeMutableBytes {
+      let childCount = Int(symphonyListChildProcessIDs(current, nil, 0))
+      guard childCount > 0 else { continue }
+      var children = [pid_t](repeating: 0, count: childCount)
+      let writtenCount = children.withUnsafeMutableBytes {
         symphonyListChildProcessIDs(current, $0.baseAddress, Int32($0.count))
       }
-      guard written > 0 else { continue }
-      for child in children.prefix(Int(written) / MemoryLayout<pid_t>.size) where child > 0 {
+      guard writtenCount > 0 else { continue }
+      for child in children.prefix(Int(writtenCount)) where child > 0 {
         pending.append(child)
         let group = Darwin.getpgid(child)
         if group > 0, group != Darwin.getpgid(parent) { groups.insert(group) }

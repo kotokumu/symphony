@@ -84,6 +84,8 @@ final class GitHubRepositoryCapabilityProtocolTests: XCTestCase {
       #"{"status":"locked","payload":"c2VjcmV0"}"#,
       #"{"status":"githubGitResult","githubGitResult":{"exitStatus":0,"output":"","wasTruncated":false,"token":"secret"}}"#,
       #"{"status":"githubCapabilityFailed","githubCapabilityFailure":{"category":"locked","message":"locked","effectMayHaveOccurred":false,"repository":"other"}}"#,
+      #"{"status":"githubInstallations","installations":[{"id":20,"accountLogin":"octo","accountType":"Organization","permissions":{},"isSuspended":false,"token":"secret"}]}"#,
+      #"{"status":"githubRepositories","repositories":[{"id":30,"fullName":"octo/repo","htmlURL":"https:\/\/github.com\/octo\/repo","isPrivate":true,"token":"secret"}]}"#,
     ]
     for frame in resultFrames {
       XCTAssertThrowsError(
