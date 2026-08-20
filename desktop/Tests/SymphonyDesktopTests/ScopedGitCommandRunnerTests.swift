@@ -6,6 +6,27 @@ import XCTest
 @testable import SymphonyCredentialBrokerProtocol
 
 final class ScopedGitCommandRunnerTests: XCTestCase {
+  func testUnavailableGitFailsBeforeCredentialAcquisition() async throws {
+    let fixture = try makeFixture()
+    let credentialRequests = CredentialRequestCounter()
+    let runner = ScopedGitCommandRunner(
+      gitExecutableURL: URL(fileURLWithPath: "/nonexistent/symphony-git")
+    )
+
+    do {
+      _ = try await runner.run(.clone(targetName: "missing-git"), in: fixture.scope) {
+        credentialRequests.increment()
+        let source = SecureSecretBuffer(copying: Data("token".utf8))
+        defer { source.clear() }
+        return OperationCredential(copying: source)
+      }
+      XCTFail("Expected unavailable Git to fail")
+    } catch let error as GitCommandRunnerError {
+      XCTAssertEqual(error.failure.category, .gitFailed)
+    }
+    XCTAssertEqual(credentialRequests.value, 0)
+  }
+
   func testSandboxProfileAllowsOnlyTheBrokerOwnedLoopbackTunnel() {
     let profile = ScopedGitCommandRunner.sandboxProfile(proxyPort: 43_123)
     XCTAssertTrue(profile.contains("(deny default)"))
@@ -832,6 +853,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
   func testInheritedSocketCapabilityWorksThroughTheRealBrokerHelperExecutable() async throws {
     let fixture = try makeFixture()
     let broker = try brokerExecutable()
+    let systemGit = try XCTUnwrap(TrustedSystemGitExecutable.locate())
     let groupObservation = ProcessGroupObservation()
     let executable = try makeExecutable(
       """
@@ -839,7 +861,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       set -e
       printf 'STEP=started\n'
       credential_output=$(printf 'protocol=https\nhost=github.com\npath=octo/repo\n\n' | \
-        /usr/bin/git "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" credential fill)
+        "\(systemGit.path)" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" credential fill)
       printf 'STEP=credential\n'
       touch sandbox-write-probe
       printf 'STEP=workspace-write\n'

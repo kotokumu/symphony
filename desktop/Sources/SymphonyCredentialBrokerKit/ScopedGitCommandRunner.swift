@@ -92,7 +92,8 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
 
   init(
     policy: GitRepositoryTrustPolicy = GitRepositoryTrustPolicy(),
-    gitExecutableURL: URL = URL(fileURLWithPath: "/usr/bin/git"),
+    gitExecutableURL: URL = TrustedSystemGitExecutable.locate()
+      ?? URL(fileURLWithPath: "/nonexistent/symphony-git"),
     brokerExecutableURL: URL = URL(fileURLWithPath: CommandLine.arguments[0]),
     sandboxExecutableURL: URL = URL(fileURLWithPath: "/usr/bin/sandbox-exec"),
     operationTimeout: TimeInterval = 300,
@@ -150,6 +151,9 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       }
     }
     let plan = try policy.validate(request, in: scope)
+    guard Darwin.access(gitExecutableURL.path, X_OK) == 0 else {
+      throw GitCommandRunnerError.launchFailed
+    }
     try requireNoOrphanedCloneResidue(in: scope.workspacesRoot)
     try requireAdmission()
     let isolated: (environment: [String: String], temporaryDirectory: URL)
@@ -1363,6 +1367,25 @@ private final class GitProcessReference: @unchecked Sendable {
   var terminationStatus: Int32 { process.terminationStatus }
   func terminateGroup(_ signal: Int32) {
     controller.signal(process.processIdentifier, signal)
+  }
+}
+
+enum TrustedSystemGitExecutable {
+  static func locate() -> URL? {
+    let candidates = ["/Library/Developer/CommandLineTools/usr/bin/git"]
+    return candidates.lazy.compactMap { validatedExecutable(at: $0) }.first
+  }
+
+  private static func validatedExecutable(at path: String) -> URL? {
+    let candidate = URL(fileURLWithPath: path).resolvingSymlinksInPath()
+    var information = stat()
+    guard Darwin.stat(candidate.path, &information) == 0,
+      information.st_mode & S_IFMT == S_IFREG,
+      information.st_uid == 0,
+      information.st_mode & (S_IWGRP | S_IWOTH) == 0,
+      Darwin.access(candidate.path, X_OK) == 0
+    else { return nil }
+    return candidate
   }
 }
 
