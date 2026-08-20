@@ -81,7 +81,6 @@ struct SymphonyCredentialBrokerMain {
     guard Darwin.dup2(nullDescriptor, STDIN_FILENO) == STDIN_FILENO else { return 1 }
     guard setenv("SYMPHONY_GIT_HELPER_FD", String(credentialDescriptor), 1) == 0 else { return 1 }
 
-    let gitProcessID = getpid()
     let watchdog = Process()
     let readiness = Pipe()
     watchdog.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])

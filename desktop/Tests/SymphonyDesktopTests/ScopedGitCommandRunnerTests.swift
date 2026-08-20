@@ -564,7 +564,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     }
     try await waitForFile(ready)
     let temporaryHome = URL(
-      fileURLWithPath: String(contentsOf: homePath, encoding: .utf8)
+      fileURLWithPath: try String(contentsOf: homePath, encoding: .utf8)
     )
     try assertNoCredentialRepresentations("socket-canary-token", under: fixture.root)
     try assertNoCredentialRepresentations("socket-canary-token", under: temporaryHome)
