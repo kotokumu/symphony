@@ -192,8 +192,9 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
         printf '{"status":"unlocked"}\\n'
         IFS= read -r first
         printf '%s' "$first" > "$BROKER_FIRST_RECEIVED_FILE"
+        exec 3<&0
         (
-          IFS= read -r second
+          IFS= read -r second <&3
           printf '%s' "$second" > "$BROKER_SECOND_RECEIVED_FILE"
           while [ ! -e "$BROKER_RELEASE_SECOND_FILE" ]; do sleep 0.01; done
           printf '{"status":"signature","payload":"Ag=="}\\n'
@@ -288,8 +289,9 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
         printf '{"status":"unlocked"}\\n'
         IFS= read -r first
         : > "$BROKER_FIRST_RECEIVED_FILE"
+        exec 3<&0
         (
-          IFS= read -r second
+          IFS= read -r second <&3
           case "$second" in
             *'Ag=='*) : > "$BROKER_SECOND_RECEIVED_FILE" ;;
           esac
