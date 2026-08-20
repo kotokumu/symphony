@@ -109,7 +109,7 @@ actor NamespaceGitHubAccessSession {
           return response.redacting(replacement)
         } catch let retryError as GitHubRepositoryAPIError {
           if retryError.invalidatesLease { clearLease() }
-          throw retryError.afterRetry
+          throw retryError.forRequest(request).afterRetry
         }
       }
       throw error.forRequest(request)
@@ -337,9 +337,14 @@ public enum GitHubRepositoryAPIError: Error, Sendable {
       if failure.category == .authExpired {
         return .failure(
           GitHubCapabilityFailure(
-            category: .appCredentialRejected,
-            message: "GitHub rejected refreshed App authentication. Reconnect this namespace.",
-            status: failure.status
+            category: failure.effectMayHaveOccurred
+              ? .ambiguousMutationAuthenticationFailure
+              : .appCredentialRejected,
+            message: failure.effectMayHaveOccurred
+              ? "The GitHub mutation may have completed before refreshed authentication failed. Inspect the issue before retrying."
+              : "GitHub rejected refreshed App authentication. Reconnect this namespace.",
+            status: failure.status,
+            effectMayHaveOccurred: failure.effectMayHaveOccurred
           ),
           invalidatesLease: true,
           retryGET: false

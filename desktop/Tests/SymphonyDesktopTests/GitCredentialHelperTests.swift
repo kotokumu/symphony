@@ -115,6 +115,59 @@ final class GitCredentialHelperTests: XCTestCase {
     XCTAssertTrue(oversized.output.isEmpty)
   }
 
+  func testOversizedWireRequestAndPeerResponseFailWithinTheFrameDeadline() async throws {
+    let fixture = try makeServer()
+    let serverTask = Task.detached { fixture.server.serve() }
+    let requestStart = ContinuousClock.now
+    try writeSocketLine(
+      Data(repeating: 0x61, count: 32_769),
+      to: fixture.server.clientHandle.fileDescriptor
+    )
+    let failureData = try readSocketLine(from: fixture.server.clientHandle.fileDescriptor)
+    let failure = try JSONDecoder().decode(GitCredentialWireResponse.self, from: failureData)
+    XCTAssertFalse(failure.succeeded)
+    XCTAssertTrue(failure.output.isEmpty)
+    XCTAssertLessThan(requestStart.duration(to: .now), .seconds(1))
+    fixture.server.stop()
+    _ = await serverTask.value
+
+    var descriptors: [Int32] = [0, 0]
+    XCTAssertEqual(Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors), 0)
+    let clientDescriptor = descriptors[0]
+    let peerDescriptor = descriptors[1]
+    let peer = Task.detached {
+      defer { Darwin.close(peerDescriptor) }
+      var byte: UInt8 = 0
+      while Darwin.recv(peerDescriptor, &byte, 1, 0) == 1, byte != 0x0A {}
+      var response = Data(repeating: 0x62, count: 32_769)
+      response.append(0x0A)
+      response.withUnsafeBytes { bytes in
+        var offset = 0
+        while offset < bytes.count {
+          let written = Darwin.send(
+            peerDescriptor,
+            bytes.baseAddress!.advanced(by: offset),
+            bytes.count - offset,
+            0
+          )
+          guard written > 0 else { return }
+          offset += written
+        }
+      }
+    }
+    let responseStart = ContinuousClock.now
+    let result = BrokerGitCredentialHelper.exchange(
+      action: "get",
+      input: Data("protocol=https\nhost=github.com\npath=octo/repo\n\n".utf8),
+      environment: ["SYMPHONY_GIT_HELPER_FD": String(clientDescriptor)]
+    )
+    Darwin.close(clientDescriptor)
+    _ = await peer.value
+    XCTAssertNotEqual(result.status, 0)
+    XCTAssertTrue(result.output.isEmpty)
+    XCTAssertLessThan(responseStart.duration(to: .now), .seconds(1))
+  }
+
   private func makeServer() throws -> (
     server: PrivateGitCredentialServer,
     credential: OperationCredential,

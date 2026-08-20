@@ -71,11 +71,16 @@ struct GitRepositoryTrustPolicy: Sendable {
   func revalidate(
     _ plan: ValidatedGitOperationPlan,
     in scope: AuthorizedGitHubRepositoryScope,
-    preparedCloneIdentity: FileIdentity?
+    preparedCloneIdentity: FileIdentity?,
+    preparedCloneURL: URL? = nil
   ) throws {
     if case .clone = plan.request, let preparedCloneIdentity {
       try requireRootIdentity(scope)
-      guard try directoryIdentity(plan.targetURL) == preparedCloneIdentity else {
+      guard try directoryIdentity(preparedCloneURL ?? plan.targetURL) == preparedCloneIdentity else {
+        throw GitRepositoryTrustError.filesystemChanged
+      }
+      var desired = stat()
+      guard lstat(plan.targetURL.path, &desired) != 0, errno == ENOENT else {
         throw GitRepositoryTrustError.filesystemChanged
       }
       return

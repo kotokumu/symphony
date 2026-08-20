@@ -29,7 +29,11 @@ final class NamespaceGitHubAccessSessionTests: XCTestCase {
         storedAppID: 10
       )
       XCTFail("Expected conflicting scope")
-    } catch {}
+    } catch let error as GitHubRepositoryAccessError {
+      XCTAssertEqual(error.failure.category, .unauthorizedScope)
+    } catch {
+      XCTFail("Unexpected conflicting-scope error: \(error)")
+    }
   }
 
   func testRejectsAppMismatchTraversalAndUnsafeWorkspaceRootsBeforeMinting() async throws {
@@ -62,12 +66,27 @@ final class NamespaceGitHubAccessSessionTests: XCTestCase {
       ),
     ]
 
-    for authorization in cases {
+    for (index, authorization) in cases.enumerated() {
       let session = NamespaceGitHubAccessSession(api: api)
       do {
         try await session.authorize(authorization, storedAppID: 10)
         XCTFail("Expected rejected scope")
-      } catch {}
+      } catch let error as GitHubRepositoryAccessError {
+        XCTAssertEqual(error.failure.category, .unauthorizedScope)
+        if index == 2 {
+          switch error {
+          case .invalidWorkspaceRoot: break
+          default: XCTFail("Expected invalid workspace root, got \(error)")
+          }
+        } else {
+          switch error {
+          case .unauthorizedScope: break
+          default: XCTFail("Expected unauthorized scope, got \(error)")
+          }
+        }
+      } catch {
+        XCTFail("Unexpected scope-validation error: \(error)")
+      }
     }
     let rejectedMintCount = await api.mintCount
     XCTAssertEqual(rejectedMintCount, 0)
@@ -363,6 +382,89 @@ final class NamespaceGitHubAccessSessionTests: XCTestCase {
     XCTAssertEqual(mintCount, 2)
   }
 
+  func testRealAPIPreflightRefreshesWithoutRedispatchingTheMutation() async throws {
+    let root = try makeDirectory()
+    let transport = AccessSequenceTransport(responses: [
+      .json(status: 201, body: #"{"token":"first","expires_at":"2030-01-01T00:00:00Z"}"#),
+      .json(status: 401, body: "{}"),
+      .json(status: 201, body: #"{"token":"second","expires_at":"2030-01-01T00:00:00Z"}"#),
+      .json(status: 200, body: #"{"number":7}"#),
+      .json(status: 201, body: #"{"id":70,"body":"created"}"#),
+    ])
+    let client = GitHubAppAPIClient(
+      baseURL: URL(string: "https://api.github.test")!,
+      transport: transport
+    )
+    let session = NamespaceGitHubAccessSession(api: client)
+    try await session.authorize(makeAuthorization(root: root), storedAppID: 10)
+
+    let result = try await session.performIssueRequest(
+      .createComment(issueNumber: 7, body: "created"),
+      jwt: "jwt"
+    )
+
+    XCTAssertEqual(result, .comment(GitHubIssueCommentRecord(id: 70, body: "created")))
+    let requests = await transport.requests
+    XCTAssertEqual(
+      requests.map { [$0.httpMethod ?? "", $0.url?.path ?? ""] },
+      [
+        ["POST", "/app/installations/20/access_tokens"],
+        ["GET", "/repos/octo/repo/issues/7"],
+        ["POST", "/app/installations/20/access_tokens"],
+        ["GET", "/repos/octo/repo/issues/7"],
+        ["POST", "/repos/octo/repo/issues/7/comments"],
+      ]
+    )
+    XCTAssertEqual(requests.filter { $0.httpMethod == "POST" && $0.url?.path.hasSuffix("/comments") == true }.count, 1)
+  }
+
+  func testSecondAttemptDispatchedFailuresRemainAmbiguous() async throws {
+    for (category, expected) in [
+      (
+        GitHubCapabilityFailure.Category.authExpired,
+        GitHubCapabilityFailure.Category.ambiguousMutationAuthenticationFailure
+      ),
+      (.networkUnavailable, .ambiguousMutationFailure),
+    ] {
+      let root = try makeDirectory()
+      let api = RecordingRepositoryAPI(
+        expirations: [Date().addingTimeInterval(3_600), Date().addingTimeInterval(3_600)],
+        issueResults: [
+          .failure(.failure(
+            GitHubCapabilityFailure(category: .authExpired, message: "preflight", status: 401),
+            invalidatesLease: true,
+            retryGET: true
+          )),
+          .failure(.failure(
+            GitHubCapabilityFailure(
+              category: category,
+              message: "dispatched",
+              status: category == .authExpired ? 401 : nil,
+              effectMayHaveOccurred: true
+            ),
+            invalidatesLease: category == .authExpired,
+            retryGET: category == .authExpired
+          )),
+        ]
+      )
+      let session = NamespaceGitHubAccessSession(api: api)
+      try await session.authorize(makeAuthorization(root: root), storedAppID: 10)
+
+      do {
+        _ = try await session.performIssueRequest(
+          .createComment(issueNumber: 7, body: "created"),
+          jwt: "jwt"
+        )
+        XCTFail("Expected ambiguous refreshed mutation failure")
+      } catch let error as GitHubRepositoryAPIError {
+        XCTAssertEqual(error.failure.category, expected)
+        XCTAssertTrue(error.failure.effectMayHaveOccurred)
+      }
+      let issueCount = await api.issueCount
+      XCTAssertEqual(issueCount, 2)
+    }
+  }
+
   private func makeAuthorization(root: URL) -> GitHubRepositoryAuthorization {
     GitHubRepositoryAuthorization(
       appID: 10,
@@ -420,6 +522,40 @@ private actor RecordingRepositoryAPI: GitHubRepositoryAPIRequesting {
     issueCount += 1
     if !issueResults.isEmpty { return try issueResults.removeFirst().get() }
     return .issue(GitHubIssueRecord(number: 1))
+  }
+}
+
+private actor AccessSequenceTransport: GitHubHTTPTransporting {
+  struct Response: Sendable {
+    let status: Int
+    let data: Data
+
+    static func json(status: Int, body: String) -> Self {
+      Self(status: status, data: Data(body.utf8))
+    }
+  }
+
+  private var responses: [Response]
+  private(set) var requests: [URLRequest] = []
+
+  init(responses: [Response]) { self.responses = responses }
+
+  func data(
+    for request: URLRequest,
+    maximumBytes: Int,
+    deadline: ContinuousClock.Instant
+  ) throws -> (Data, HTTPURLResponse) {
+    requests.append(request)
+    let response = responses.removeFirst()
+    return (
+      response.data,
+      HTTPURLResponse(
+        url: request.url!,
+        statusCode: response.status,
+        httpVersion: "HTTP/1.1",
+        headerFields: ["Content-Type": "application/json"]
+      )!
+    )
   }
 }
 

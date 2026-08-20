@@ -55,11 +55,15 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
 
   func testRemovesBrokerCreatedPartialCloneAfterFailure() async throws {
     let fixture = try makeFixture()
+    let external = fixture.root.appendingPathComponent("external-sentinel")
+    try Data("preserve-me".utf8).write(to: external)
     let executable = try makeExecutable(
       """
       #!/bin/sh
       for argument in "$@"; do target="$argument"; done
-      mkdir -p "$target"
+      mkdir -p "$target/nested"
+      printf partial > "$target/nested/data"
+      ln -s "\(external.path)" "$target/link"
       echo failed >&2
       exit 2
       """
@@ -82,6 +86,11 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       XCTAssertEqual(error.failure.category, .gitFailed)
     }
     XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.root.appendingPathComponent("partial").path))
+    XCTAssertEqual(try Data(contentsOf: external), Data("preserve-me".utf8))
+    XCTAssertFalse(
+      try FileManager.default.contentsOfDirectory(atPath: fixture.root.path)
+        .contains { $0.hasPrefix(".symphony-") }
+    )
   }
 
   func testBoundsOutputAndReturnsATypedFailure() async throws {
@@ -195,6 +204,118 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     XCTAssertEqual(try Data(contentsOf: target.appendingPathComponent("keep")), Data("sentinel".utf8))
   }
 
+  func testCloneTargetReplacementBetweenCreationAndOpenIsRetainedForSafeRetry() async throws {
+    let fixture = try makeFixture()
+    let replacement = DescriptorEntryReplacement(targetEntry: nil)
+    let executable = try makeExecutable("#!/bin/sh\nexit 0\n")
+    let runner = ScopedGitCommandRunner(
+      gitExecutableURL: executable,
+      brokerExecutableURL: executable,
+      operationTimeout: 2,
+      wrapsGitInBrokerExecutable: false,
+      beforeCloneTargetOpen: { descriptor, name in
+        replacement.replace(parentDescriptor: descriptor, name: name)
+      }
+    )
+    let source = SecureSecretBuffer(copying: Data("token".utf8))
+    defer { source.clear() }
+
+    do {
+      _ = try await runner.run(.clone(targetName: "published"), in: fixture.scope) {
+        OperationCredential(copying: source)
+      }
+      XCTFail("Expected clone staging replacement rejection")
+    } catch let error as GitCommandRunnerError {
+      XCTAssertEqual(error.failure.category, .cleanupRequired)
+    }
+    let replacementURL = try replacement.replacementURL(in: fixture.root)
+    XCTAssertEqual(try Data(contentsOf: replacementURL.appendingPathComponent("keep")), Data("sentinel".utf8))
+    try replacement.restoreOriginal(in: fixture.root)
+    try await runner.stopRetainedOperation()
+    XCTAssertFalse(FileManager.default.fileExists(atPath: replacementURL.path))
+  }
+
+  func testFailedCloneCleanupRejectsExternalHardLinksAndRetriesAfterRemoval() async throws {
+    let fixture = try makeFixture()
+    let external = fixture.root.appendingPathComponent("external-hard-link")
+    try Data("external-sentinel".utf8).write(to: external)
+    let executable = try makeExecutable(
+      """
+      #!/bin/sh
+      for argument in "$@"; do target="$argument"; done
+      ln "\(external.path)" "$target/linked"
+      exit 2
+      """
+    )
+    let runner = ScopedGitCommandRunner(
+      gitExecutableURL: executable,
+      brokerExecutableURL: executable,
+      operationTimeout: 2,
+      wrapsGitInBrokerExecutable: false
+    )
+    let source = SecureSecretBuffer(copying: Data("token".utf8))
+    defer { source.clear() }
+
+    do {
+      _ = try await runner.run(.clone(targetName: "hard-link"), in: fixture.scope) {
+        OperationCredential(copying: source)
+      }
+      XCTFail("Expected retained cleanup for a multiply linked inode")
+    } catch let error as GitCommandRunnerError {
+      XCTAssertEqual(error.failure.category, .cleanupRequired)
+    }
+    XCTAssertEqual(try Data(contentsOf: external), Data("external-sentinel".utf8))
+    let quarantine = try findCloneStagingDirectory(in: fixture.root)
+    let linkedEntry = try XCTUnwrap(
+      FileManager.default.contentsOfDirectory(at: quarantine, includingPropertiesForKeys: nil)
+        .first { $0.lastPathComponent.hasPrefix(".symphony-cleared-") }
+    )
+    try FileManager.default.removeItem(at: linkedEntry)
+    try await runner.stopRetainedOperation()
+    XCTAssertEqual(try Data(contentsOf: external), Data("external-sentinel".utf8))
+    XCTAssertFalse(FileManager.default.fileExists(atPath: quarantine.path))
+  }
+
+  func testNestedCleanupReplacementIsPreservedAndCleanupCoalescesIntoRetry() async throws {
+    let fixture = try makeFixture()
+    let replacement = DescriptorEntryReplacement(targetEntry: "nested")
+    let executable = try makeExecutable(
+      """
+      #!/bin/sh
+      for argument in "$@"; do target="$argument"; done
+      mkdir -p "$target/nested"
+      printf partial > "$target/nested/data"
+      exit 2
+      """
+    )
+    let runner = ScopedGitCommandRunner(
+      gitExecutableURL: executable,
+      brokerExecutableURL: executable,
+      operationTimeout: 2,
+      wrapsGitInBrokerExecutable: false,
+      beforeNestedCloneCleanup: { descriptor, name in
+        replacement.replace(parentDescriptor: descriptor, name: name)
+      }
+    )
+    let source = SecureSecretBuffer(copying: Data("token".utf8))
+    defer { source.clear() }
+
+    do {
+      _ = try await runner.run(.clone(targetName: "nested-race"), in: fixture.scope) {
+        OperationCredential(copying: source)
+      }
+      XCTFail("Expected nested cleanup replacement rejection")
+    } catch let error as GitCommandRunnerError {
+      XCTAssertEqual(error.failure.category, .cleanupRequired)
+    }
+    let quarantine = try findCloneStagingDirectory(in: fixture.root)
+    let replacementURL = try replacement.replacementURL(in: quarantine)
+    XCTAssertEqual(try Data(contentsOf: replacementURL.appendingPathComponent("keep")), Data("sentinel".utf8))
+    try replacement.restoreOriginal(in: quarantine)
+    try await runner.stopRetainedOperation()
+    XCTAssertFalse(FileManager.default.fileExists(atPath: quarantine.path))
+  }
+
   func testStopAtFinalPreparationBarrierPreventsLaunch() async throws {
     let fixture = try makeFixture()
     let marker = fixture.root.appendingPathComponent("launched")
@@ -268,6 +389,64 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     XCTAssertEqual(credentialRequests.value, 0)
   }
 
+  func testGitReadsOnlyTheBrokerEffectiveConfigurationAfterFinalValidation() async throws {
+    let fixture = try makeFixture()
+    let repository = try makeRepository(in: fixture.root)
+    let effectiveMutation = EffectiveConfigurationMutation()
+    let executable = try makeExecutable(
+      """
+      #!/bin/sh
+      for argument in "$@"; do
+        case "$argument" in --git-dir=*) git_dir="${argument#--git-dir=}" ;; esac
+      done
+      printf 'EFFECTIVE=%s\n' "$git_dir"
+      /usr/bin/git --git-dir="$git_dir" config --get-urlmatch \
+        http.curloptResolve https://github.com/octo/repo/info/refs || true
+      /usr/bin/git --git-dir="$git_dir" config --get-urlmatch \
+        http.sslCAInfo https://github.com/octo/repo/info/refs || true
+      exit 0
+      """
+    )
+    let runner = ScopedGitCommandRunner(
+      gitExecutableURL: executable,
+      brokerExecutableURL: executable,
+      operationTimeout: 2,
+      wrapsGitInBrokerExecutable: false,
+      afterEffectiveConfigurationPrepared: { effectiveDirectory in
+        if let effectiveDirectory {
+          effectiveMutation.attempt(
+            effectiveDirectory.appendingPathComponent("config")
+          )
+        }
+        try? Data(
+          """
+          [core]
+            repositoryformatversion = 0
+            bare = false
+          [remote "origin"]
+            url = https://github.com/octo/repo
+            fetch = +refs/heads/*:refs/remotes/origin/*
+          [http "https://github.com/octo/repo/info"]
+            curloptResolve = +github.com:443:127.0.0.1
+            sslCAInfo = /tmp/attacker-ca.pem
+          """.utf8
+        ).write(to: repository.appendingPathComponent(".git/config"), options: .atomic)
+      }
+    )
+    let source = SecureSecretBuffer(copying: Data("token".utf8))
+    defer { source.clear() }
+
+    let result = try await runner.run(.fetch(repositoryName: "existing"), in: fixture.scope) {
+      OperationCredential(copying: source)
+    }
+
+    XCTAssertTrue(result.output.contains("EFFECTIVE="))
+    XCTAssertFalse(result.output.contains("127.0.0.1"))
+    XCTAssertFalse(result.output.contains("attacker-ca.pem"))
+    XCTAssertFalse(result.output.contains(repository.appendingPathComponent(".git").path))
+    XCTAssertTrue(effectiveMutation.wasRejected)
+  }
+
   func testEveryFilesystemAuthorityIsRevalidatedAtTheFinalLaunchBarrier() async throws {
     for mutation in FinalTrustMutation.allCases {
       let fixture = try makeFixture()
@@ -314,7 +493,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
         try FileManager.default.createDirectory(at: metadata, withIntermediateDirectories: false)
         try writeRepositoryConfiguration(to: metadata.appendingPathComponent("config"))
       case .preparedClone:
-        let target = fixture.root.appendingPathComponent("prepared-clone", isDirectory: true)
+        let target = try findCloneStagingDirectory(in: fixture.root)
         try FileManager.default.moveItem(at: target, to: backup)
         try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
       }
@@ -340,7 +519,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
 
       if mutation == .preparedClone {
-        let target = fixture.root.appendingPathComponent("prepared-clone", isDirectory: true)
+        let target = try findCloneStagingDirectory(in: fixture.root)
         try FileManager.default.removeItem(at: target)
         try FileManager.default.moveItem(at: backup, to: target)
         try await runner.stopRetainedOperation()
@@ -351,13 +530,22 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
   func testInheritedSocketCapabilityWorksThroughTheRealBrokerHelperExecutable() async throws {
     let fixture = try makeFixture()
     let broker = try brokerExecutable()
+    let ready = fixture.root.appendingPathComponent("credential-used")
+    let release = fixture.root.appendingPathComponent("credential-release")
+    let homePath = fixture.root.appendingPathComponent("temporary-home-path")
+    let processIDPath = fixture.root.appendingPathComponent("credential-process-id")
     let executable = try makeExecutable(
       """
       #!/bin/sh
       request="$HOME/credential-request"
       printf 'protocol=https\nhost=github.com\npath=octo/repo\n\n' > "$request"
-      exec /usr/bin/git \
-        "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" credential fill < "$request"
+      credential_output=$(/usr/bin/git \
+        "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" credential fill < "$request")
+      printf '%s' "$HOME" > "\(homePath.path)"
+      printf '%s' "$$" > "\(processIDPath.path)"
+      touch "\(ready.path)"
+      while [ ! -e "\(release.path)" ]; do sleep 0.01; done
+      printf '%s\n' "$credential_output"
       """
     )
     let runner = ScopedGitCommandRunner(
@@ -369,9 +557,27 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     let source = SecureSecretBuffer(copying: Data("socket-canary-token".utf8))
     defer { source.clear() }
 
-    let result = try await runner.run(.clone(targetName: "helper"), in: fixture.scope) {
-      OperationCredential(copying: source)
+    let operation = Task {
+      try await runner.run(.clone(targetName: "helper"), in: fixture.scope) {
+        OperationCredential(copying: source)
+      }
     }
+    try await waitForFile(ready)
+    let temporaryHome = URL(
+      fileURLWithPath: String(contentsOf: homePath, encoding: .utf8)
+    )
+    try assertNoCredentialRepresentations("socket-canary-token", under: fixture.root)
+    try assertNoCredentialRepresentations("socket-canary-token", under: temporaryHome)
+    let processID = try XCTUnwrap(
+      Int32(String(contentsOf: processIDPath, encoding: .utf8))
+    )
+    let processListing = try processOutput(
+      executable: URL(fileURLWithPath: "/bin/ps"),
+      arguments: ["eww", "-p", String(processID)]
+    )
+    XCTAssertFalse(processListing.contains("socket-canary-token"))
+    FileManager.default.createFile(atPath: release.path, contents: Data())
+    let result = try await operation.value
 
     XCTAssertTrue(result.output.contains("username=x-access-token"))
     XCTAssertFalse(result.output.contains("socket-canary-token"))
@@ -425,17 +631,22 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     do {
       _ = try await operation.value
       XCTFail("Expected cancelled preparation")
-    } catch {}
+    } catch is CancellationError {
+    } catch {
+      XCTFail("Unexpected preparation cancellation error: \(error)")
+    }
     try await stop.value
     XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
   }
 
   func testStopWaitsForActiveGitParentAndDescendantProcessGroup() async throws {
     let fixture = try makeFixture()
+    let broker = try brokerExecutable()
     let parentPIDFile = fixture.root.appendingPathComponent("git-parent-pid")
     let childPIDFile = fixture.root.appendingPathComponent("git-child-pid")
     let processReadyFile = fixture.root.appendingPathComponent("git-process-ready")
     let processReleaseFile = fixture.root.appendingPathComponent("git-process-release")
+    let groupObservation = ProcessGroupObservation()
     let executable = try makeExecutable(
       """
       #!/bin/sh
@@ -450,10 +661,11 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     )
     let runner = ScopedGitCommandRunner(
       gitExecutableURL: executable,
-      brokerExecutableURL: executable,
+      brokerExecutableURL: broker,
       operationTimeout: 60,
       stopTimeout: 0.5,
-      wrapsGitInBrokerExecutable: false
+      wrapsGitInBrokerExecutable: true,
+      afterProcessGroupEstablished: { groupObservation.record($0) }
     )
     let source = SecureSecretBuffer(copying: Data("token".utf8))
     defer { source.clear() }
@@ -462,18 +674,27 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
         OperationCredential(copying: source)
       }
     }
+    let observedParentPID = try await groupObservation.waitForProcessID()
+    XCTAssertEqual(Darwin.getpgid(observedParentPID), observedParentPID)
     try await waitForFile(processReadyFile)
     FileManager.default.createFile(atPath: processReleaseFile.path, contents: Data())
     try await waitForFile(parentPIDFile)
     try await waitForFile(childPIDFile)
     let parentPID = try XCTUnwrap(Int32(String(contentsOf: parentPIDFile).trimmingCharacters(in: .whitespacesAndNewlines)))
     let childPID = try XCTUnwrap(Int32(String(contentsOf: childPIDFile).trimmingCharacters(in: .whitespacesAndNewlines)))
+    XCTAssertEqual(parentPID, observedParentPID)
+    XCTAssertEqual(Darwin.getpgid(parentPID), parentPID)
+    XCTAssertEqual(Darwin.getpgid(childPID), parentPID)
 
     try await runner.stopRetainedOperation()
     do {
       _ = try await operation.value
       XCTFail("Expected stopped Git operation to fail")
-    } catch {}
+    } catch let error as GitCommandRunnerError {
+      XCTAssertEqual(error.failure.category, .gitFailed)
+    } catch {
+      XCTFail("Unexpected stopped operation error: \(error)")
+    }
 
     XCTAssertFalse(processExists(parentPID))
     XCTAssertFalse(processExists(childPID))
@@ -481,6 +702,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
 
   func testFailedProcessGroupStopRetainsRuntimeUntilProductionRetrySucceeds() async throws {
     let fixture = try makeFixture()
+    let broker = try brokerExecutable()
     let ready = fixture.root.appendingPathComponent("retained-ready")
     let release = fixture.root.appendingPathComponent("retained-release")
     let parentPIDFile = fixture.root.appendingPathComponent("retained-parent")
@@ -500,10 +722,10 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     let controller = FailOnceGitProcessGroupController()
     let runner = ScopedGitCommandRunner(
       gitExecutableURL: executable,
-      brokerExecutableURL: executable,
+      brokerExecutableURL: broker,
       operationTimeout: 60,
       stopTimeout: 0.05,
-      wrapsGitInBrokerExecutable: false,
+      wrapsGitInBrokerExecutable: true,
       processGroupController: controller.controller
     )
     let source = SecureSecretBuffer(copying: Data("retained-token".utf8))
@@ -603,6 +825,14 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     XCTAssertTrue(FileManager.default.fileExists(atPath: url.path))
   }
 
+  private func findCloneStagingDirectory(in root: URL) throws -> URL {
+    let name = try XCTUnwrap(
+      FileManager.default.contentsOfDirectory(atPath: root.path)
+        .first { $0.hasPrefix(".symphony-clone-") || $0.hasPrefix(".symphony-failed-clone-") }
+    )
+    return root.appendingPathComponent(name, isDirectory: true)
+  }
+
   private func brokerExecutable() throws -> URL {
     let starts = [
       Bundle(for: ScopedGitCommandRunnerTests.self).bundleURL,
@@ -617,6 +847,18 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       }
     }
     throw GitCommandRunnerError.launchFailed
+  }
+
+  private func processOutput(executable: URL, arguments: [String]) throws -> String {
+    let process = Process()
+    let output = Pipe()
+    process.executableURL = executable
+    process.arguments = arguments
+    process.standardOutput = output
+    process.standardError = output
+    try process.run()
+    process.waitUntilExit()
+    return String(decoding: output.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
   }
 
   private func processExists(_ pid: Int32) -> Bool {
@@ -638,11 +880,13 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     for case let url as URL in enumerator {
       guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey]),
         values.isRegularFile == true,
-        let contents = try? Data(contentsOf: url),
-        let text = String(data: contents, encoding: .utf8)
+        let contents = try? Data(contentsOf: url)
       else { continue }
       for representation in representations {
-        XCTAssertFalse(text.contains(representation), "Credential representation persisted at \(url.path)")
+        XCTAssertNil(
+          contents.range(of: Data(representation.utf8)),
+          "Credential representation persisted at \(url.path)"
+        )
       }
     }
   }
@@ -660,6 +904,43 @@ private final class CredentialRequestCounter: @unchecked Sendable {
   private var count = 0
   func increment() { lock.withLock { count += 1 } }
   var value: Int { lock.withLock { count } }
+}
+
+private final class ProcessGroupObservation: @unchecked Sendable {
+  private let lock = NSLock()
+  private var processID: Int32?
+
+  func record(_ processID: Int32) {
+    lock.withLock { self.processID = processID }
+  }
+
+  func waitForProcessID() async throws -> Int32 {
+    let deadline = ContinuousClock.now.advanced(by: .seconds(1))
+    while ContinuousClock.now < deadline {
+      if let processID = lock.withLock({ processID }) { return processID }
+      try await Task.sleep(for: .milliseconds(5))
+    }
+    throw GitCommandRunnerError.launchFailed
+  }
+}
+
+private final class EffectiveConfigurationMutation: @unchecked Sendable {
+  private let lock = NSLock()
+  private var rejected = false
+
+  var wasRejected: Bool { lock.withLock { rejected } }
+
+  func attempt(_ configuration: URL) {
+    do {
+      try Data("[http]\nproxy = https://attacker.test\n".utf8).write(
+        to: configuration,
+        options: .atomic
+      )
+      lock.withLock { rejected = false }
+    } catch {
+      lock.withLock { rejected = true }
+    }
+  }
 }
 
 private final class FailOnceGitProcessGroupController: @unchecked Sendable {
@@ -703,6 +984,59 @@ private final class CloneCleanupReplacement: @unchecked Sendable {
       try? FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
       try? Data("sentinel".utf8).write(to: target.appendingPathComponent("keep"))
     }
+  }
+}
+
+private final class DescriptorEntryReplacement: @unchecked Sendable {
+  private let lock = NSLock()
+  private let targetEntry: String?
+  private var replacedName: String?
+
+  init(targetEntry: String?) {
+    self.targetEntry = targetEntry
+  }
+
+  func replace(parentDescriptor: Int32, name: String) {
+    lock.withLock {
+      guard replacedName == nil, targetEntry == nil || targetEntry == name else { return }
+      let originalName = "\(name)-original"
+      guard Darwin.renameat(parentDescriptor, name, parentDescriptor, originalName) == 0,
+        Darwin.mkdirat(parentDescriptor, name, S_IRWXU) == 0
+      else { return }
+      let replacement = Darwin.openat(
+        parentDescriptor,
+        name,
+        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+      )
+      guard replacement >= 0 else { return }
+      defer { Darwin.close(replacement) }
+      let file = Darwin.openat(
+        replacement,
+        "keep",
+        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC,
+        S_IRUSR | S_IWUSR
+      )
+      guard file >= 0 else { return }
+      var sentinel = Data("sentinel".utf8)
+      _ = sentinel.withUnsafeMutableBytes { bytes in
+        Darwin.write(file, bytes.baseAddress, bytes.count)
+      }
+      Darwin.close(file)
+      replacedName = name
+    }
+  }
+
+  func replacementURL(in parent: URL) throws -> URL {
+    let name = try lock.withLock { try XCTUnwrap(replacedName) }
+    return parent.appendingPathComponent(name, isDirectory: true)
+  }
+
+  func restoreOriginal(in parent: URL) throws {
+    let name = try lock.withLock { try XCTUnwrap(replacedName) }
+    let replacement = parent.appendingPathComponent(name, isDirectory: true)
+    let original = parent.appendingPathComponent("\(name)-original", isDirectory: true)
+    try FileManager.default.removeItem(at: replacement)
+    try FileManager.default.moveItem(at: original, to: replacement)
   }
 }
 

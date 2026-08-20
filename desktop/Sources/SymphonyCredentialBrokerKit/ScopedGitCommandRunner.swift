@@ -72,6 +72,10 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
   private let wrapsGitInBrokerExecutable: Bool
   private let beforeLaunch: @Sendable () async -> Void
   private let beforeCloneCleanup: @Sendable () -> Void
+  private let beforeCloneTargetOpen: @Sendable (Int32, String) -> Void
+  private let afterEffectiveConfigurationPrepared: @Sendable (URL?) -> Void
+  private let beforeNestedCloneCleanup: @Sendable (Int32, String) -> Void
+  private let afterProcessGroupEstablished: @Sendable (Int32) -> Void
   private let processGroupController: GitProcessGroupController
   private let lock = NSLock()
   private var active: RetainedRuntime?
@@ -89,6 +93,10 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     wrapsGitInBrokerExecutable: Bool = true,
     beforeLaunch: @escaping @Sendable () async -> Void = {},
     beforeCloneCleanup: @escaping @Sendable () -> Void = {},
+    beforeCloneTargetOpen: @escaping @Sendable (Int32, String) -> Void = { _, _ in },
+    afterEffectiveConfigurationPrepared: @escaping @Sendable (URL?) -> Void = { _ in },
+    beforeNestedCloneCleanup: @escaping @Sendable (Int32, String) -> Void = { _, _ in },
+    afterProcessGroupEstablished: @escaping @Sendable (Int32) -> Void = { _ in },
     processGroupController: GitProcessGroupController = .system
   ) {
     self.policy = policy
@@ -99,6 +107,10 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     self.wrapsGitInBrokerExecutable = wrapsGitInBrokerExecutable
     self.beforeLaunch = beforeLaunch
     self.beforeCloneCleanup = beforeCloneCleanup
+    self.beforeCloneTargetOpen = beforeCloneTargetOpen
+    self.afterEffectiveConfigurationPrepared = afterEffectiveConfigurationPrepared
+    self.beforeNestedCloneCleanup = beforeNestedCloneCleanup
+    self.afterProcessGroupEstablished = afterProcessGroupEstablished
     self.processGroupController = processGroupController
   }
 
@@ -134,14 +146,32 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     let cloneTarget: CloneTargetHandle?
     do {
       cloneTarget = try prepareCloneTarget(plan)
+    } catch let error as CloneTargetPreparationError {
+      switch error {
+      case .replaced(let target):
+        lock.withLock {
+          pendingCloneCleanup = PendingCloneCleanup(
+            plan: plan,
+            target: target,
+            scope: scope,
+            temporaryDirectory: isolated.temporaryDirectory
+          )
+        }
+      }
+      throw GitCommandRunnerError.cleanupRequired
     } catch {
-      try? FileManager.default.removeItem(at: isolated.temporaryDirectory)
+      removeIsolatedDirectory(isolated.temporaryDirectory)
       throw error
     }
     await beforeLaunch()
     do {
       try requireAdmission()
-      try policy.revalidate(plan, in: scope, preparedCloneIdentity: cloneTarget?.identity)
+      try policy.revalidate(
+        plan,
+        in: scope,
+        preparedCloneIdentity: cloneTarget?.identity,
+        preparedCloneURL: cloneTarget.map { plan.targetURL.deletingLastPathComponent().appendingPathComponent($0.currentEntryName) }
+      )
     } catch {
       try cleanupPreparedCloneOrRetain(
         plan,
@@ -149,14 +179,19 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
         scope: scope,
         temporaryDirectory: isolated.temporaryDirectory
       )
-      try? FileManager.default.removeItem(at: isolated.temporaryDirectory)
+      removeIsolatedDirectory(isolated.temporaryDirectory)
       throw error
     }
     var acquiredCredential: OperationCredential?
     do {
       acquiredCredential = try await acquireCredential()
       try requireAdmission()
-      try policy.revalidate(plan, in: scope, preparedCloneIdentity: cloneTarget?.identity)
+      try policy.revalidate(
+        plan,
+        in: scope,
+        preparedCloneIdentity: cloneTarget?.identity,
+        preparedCloneURL: cloneTarget.map { plan.targetURL.deletingLastPathComponent().appendingPathComponent($0.currentEntryName) }
+      )
     } catch {
       acquiredCredential?.clear()
       try cleanupPreparedCloneOrRetain(
@@ -165,10 +200,35 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
         scope: scope,
         temporaryDirectory: isolated.temporaryDirectory
       )
-      try? FileManager.default.removeItem(at: isolated.temporaryDirectory)
+      removeIsolatedDirectory(isolated.temporaryDirectory)
       throw error
     }
     guard let credential = acquiredCredential else { throw GitCommandRunnerError.launchFailed }
+    let effectiveGitDirectory: URL?
+    do {
+      effectiveGitDirectory = try prepareEffectiveGitDirectory(plan, in: isolated.temporaryDirectory)
+      afterEffectiveConfigurationPrepared(effectiveGitDirectory)
+      try requireAdmission()
+      if let cloneTarget {
+        try policy.revalidate(
+          plan,
+          in: scope,
+          preparedCloneIdentity: cloneTarget.identity,
+          preparedCloneURL: plan.targetURL.deletingLastPathComponent()
+            .appendingPathComponent(cloneTarget.currentEntryName)
+        )
+      }
+    } catch {
+      credential.clear()
+      try cleanupPreparedCloneOrRetain(
+        plan,
+        target: cloneTarget,
+        scope: scope,
+        temporaryDirectory: isolated.temporaryDirectory
+      )
+      removeIsolatedDirectory(isolated.temporaryDirectory)
+      throw error
+    }
     let server: PrivateGitCredentialServer
     do {
       server = try PrivateGitCredentialServer(scope: scope, credential: credential)
@@ -180,13 +240,16 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
         scope: scope,
         temporaryDirectory: isolated.temporaryDirectory
       )
-      try? FileManager.default.removeItem(at: isolated.temporaryDirectory)
+      removeIsolatedDirectory(isolated.temporaryDirectory)
       throw error
     }
     let serverTask = Task.detached { server.serve() }
     let process = Process()
     let output = Pipe()
-    let arguments = gitArguments(plan.arguments, repositoryURL: scope.repositoryURL)
+    let arguments = gitArguments(
+      operationArguments(plan, cloneTarget: cloneTarget, effectiveGitDirectory: effectiveGitDirectory),
+      repositoryURL: scope.repositoryURL
+    )
     process.executableURL = wrapsGitInBrokerExecutable ? brokerExecutableURL : gitExecutableURL
     process.arguments = wrapsGitInBrokerExecutable
       ? ["git-runner", gitExecutableURL.path] + arguments
@@ -195,13 +258,26 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     process.standardInput = server.clientHandle
     process.standardOutput = output
     process.standardError = output
+    var launchedProcessID: Int32?
+    var ownsProcessGroup = false
     do {
       try process.run()
+      launchedProcessID = process.processIdentifier
       if !wrapsGitInBrokerExecutable {
-        _ = Darwin.setpgid(process.processIdentifier, process.processIdentifier)
+        ownsProcessGroup = Darwin.setpgid(
+          process.processIdentifier,
+          process.processIdentifier
+        ) == 0 || Darwin.getpgid(process.processIdentifier) == process.processIdentifier
+      } else {
+        guard waitForProcessGroup(process.processIdentifier) else {
+          throw GitCommandRunnerError.launchFailed
+        }
+        ownsProcessGroup = true
       }
+      if ownsProcessGroup { afterProcessGroupEstablished(process.processIdentifier) }
       server.closeClientCopy()
     } catch {
+      if let launchedProcessID { _ = Darwin.kill(launchedProcessID, SIGKILL) }
       server.stop()
       _ = await serverTask.value
       credential.clear()
@@ -211,10 +287,14 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
         scope: scope,
         temporaryDirectory: isolated.temporaryDirectory
       )
-      try? FileManager.default.removeItem(at: isolated.temporaryDirectory)
+      removeIsolatedDirectory(isolated.temporaryDirectory)
       throw GitCommandRunnerError.launchFailed
     }
-    let processReference = GitProcessReference(process, controller: processGroupController)
+    let processReference = GitProcessReference(
+      process,
+      ownsProcessGroup: ownsProcessGroup,
+      controller: processGroupController
+    )
     let ownedRuntime = RetainedRuntime(
       process: processReference,
       server: server,
@@ -271,7 +351,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     let status = processReference.terminationStatus
     let erased = server.authenticationWasRejected
     credential.clear()
-    try? FileManager.default.removeItem(at: isolated.temporaryDirectory)
+    removeIsolatedDirectory(isolated.temporaryDirectory)
     lock.withLock { active = nil }
 
     if collector.exceededLimit || timedOut || Task.isCancelled || erased || status != 0 {
@@ -286,6 +366,18 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     if timedOut || Task.isCancelled { throw GitCommandRunnerError.timedOut }
     if erased { throw GitCommandRunnerError.authenticationRejected }
     guard status == 0 else { throw GitCommandRunnerError.failed(status, sanitized) }
+    if let cloneTarget {
+      do {
+        try publishClone(plan, target: cloneTarget, scope: scope)
+      } catch {
+        do {
+          try cleanupFailedClone(plan, target: cloneTarget, scope: scope)
+        } catch {
+          lock.withLock { retained = ownedRuntime }
+        }
+        throw GitCommandRunnerError.cleanupRequired
+      }
+    }
     return GitRepositoryCapabilityResult(
       exitStatus: status,
       output: sanitized,
@@ -311,7 +403,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     }
     if let pending = lock.withLock({ pendingCloneCleanup }) {
       try cleanupFailedClone(pending.plan, target: pending.target, scope: pending.scope)
-      try? FileManager.default.removeItem(at: pending.temporaryDirectory)
+      removeIsolatedDirectory(pending.temporaryDirectory)
       lock.withLock { pendingCloneCleanup = nil }
     }
     if let retained = lock.withLock({ self.retained }) {
@@ -323,7 +415,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
         target: retained.cloneTarget,
         scope: retained.scope
       )
-      try? FileManager.default.removeItem(at: retained.temporaryDirectory)
+      removeIsolatedDirectory(retained.temporaryDirectory)
     }
     lock.withLock {
       active = nil
@@ -365,6 +457,96 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     ] + operationArguments
   }
 
+  private func operationArguments(
+    _ plan: ValidatedGitOperationPlan,
+    cloneTarget: CloneTargetHandle?,
+    effectiveGitDirectory: URL?
+  ) -> [String] {
+    switch plan.request {
+    case .clone:
+      guard let cloneTarget else { return plan.arguments }
+      let stagingURL = plan.targetURL.deletingLastPathComponent()
+        .appendingPathComponent(cloneTarget.currentEntryName, isDirectory: true)
+      return ["clone", "--", plan.repositoryURL.absoluteString, stagingURL.path]
+    case .fetch:
+      guard let effectiveGitDirectory else { return plan.arguments }
+      return [
+        "--git-dir=\(effectiveGitDirectory.path)",
+        "--work-tree=\(plan.targetURL.path)",
+        "fetch", "--prune", "--", plan.repositoryURL.absoluteString,
+        "+refs/heads/*:refs/remotes/origin/*",
+      ]
+    case .push(_, let branch):
+      guard let effectiveGitDirectory else { return plan.arguments }
+      return [
+        "--git-dir=\(effectiveGitDirectory.path)",
+        "--work-tree=\(plan.targetURL.path)",
+        "push", "--porcelain", "--", plan.repositoryURL.absoluteString,
+        "HEAD:refs/heads/\(branch)",
+      ]
+    }
+  }
+
+  private func prepareEffectiveGitDirectory(
+    _ plan: ValidatedGitOperationPlan,
+    in temporaryDirectory: URL
+  ) throws -> URL? {
+    if case .clone = plan.request { return nil }
+    let source = plan.targetURL.appendingPathComponent(".git", isDirectory: true)
+    let effective = temporaryDirectory.appendingPathComponent("effective.git", isDirectory: true)
+    try FileManager.default.createDirectory(at: effective, withIntermediateDirectories: false)
+    guard chmod(effective.path, S_IRWXU) == 0 else { throw GitCommandRunnerError.launchFailed }
+    let safeConfiguration = Data(
+      """
+      [core]
+        repositoryformatversion = 0
+        bare = false
+      """.utf8
+    )
+    let effectiveConfiguration = effective.appendingPathComponent("config")
+    try safeConfiguration.write(to: effectiveConfiguration, options: .atomic)
+    guard chmod(effectiveConfiguration.path, S_IRUSR) == 0,
+      chflags(effectiveConfiguration.path, UInt32(UF_IMMUTABLE)) == 0
+    else { throw GitCommandRunnerError.launchFailed }
+    for directoryName in ["objects", "refs"] {
+      let sourceURL = source.appendingPathComponent(directoryName, isDirectory: true)
+      let destinationURL = effective.appendingPathComponent(directoryName, isDirectory: true)
+      if FileManager.default.fileExists(atPath: sourceURL.path) {
+        try FileManager.default.createSymbolicLink(at: destinationURL, withDestinationURL: sourceURL)
+      } else {
+        try FileManager.default.createDirectory(at: destinationURL, withIntermediateDirectories: false)
+      }
+    }
+    for fileName in ["HEAD", "packed-refs", "shallow"] {
+      let sourceURL = source.appendingPathComponent(fileName)
+      guard FileManager.default.fileExists(atPath: sourceURL.path) else { continue }
+      var information = stat()
+      guard lstat(sourceURL.path, &information) == 0,
+        information.st_mode & S_IFMT == S_IFREG,
+        information.st_size >= 0,
+        information.st_size <= 8 * 1_024 * 1_024
+      else { throw GitCommandRunnerError.launchFailed }
+      try Data(contentsOf: sourceURL).write(
+        to: effective.appendingPathComponent(fileName),
+        options: .atomic
+      )
+    }
+    if !FileManager.default.fileExists(atPath: effective.appendingPathComponent("HEAD").path) {
+      try Data("ref: refs/heads/main\n".utf8).write(to: effective.appendingPathComponent("HEAD"))
+    }
+    return effective
+  }
+
+  private func waitForProcessGroup(_ processID: Int32) -> Bool {
+    let deadline = ContinuousClock.now.advanced(by: .seconds(1))
+    while ContinuousClock.now < deadline {
+      if Darwin.getpgid(processID) == processID { return true }
+      if Darwin.kill(processID, 0) != 0, errno != EPERM { return false }
+      usleep(1_000)
+    }
+    return Darwin.getpgid(processID) == processID
+  }
+
   private func isolatedEnvironment() throws -> (environment: [String: String], temporaryDirectory: URL) {
     let directory = FileManager.default.temporaryDirectory
       .appendingPathComponent("symphony-git-\(UUID().uuidString)", isDirectory: true)
@@ -385,6 +567,13 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       "NO_PROXY": "*",
       "no_proxy": "*",
     ], directory)
+  }
+
+  private func removeIsolatedDirectory(_ directory: URL) {
+    let configuration = directory.appendingPathComponent("effective.git/config")
+    _ = chflags(configuration.path, 0)
+    _ = chmod(configuration.path, S_IRUSR | S_IWUSR)
+    try? FileManager.default.removeItem(at: directory)
   }
 
   private func stop(_ process: GitProcessReference) async throws {
@@ -427,11 +616,24 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       close(parentDescriptor)
       throw GitCommandRunnerError.cleanupRequired
     }
-    let name = plan.targetURL.lastPathComponent
+    let name = ".symphony-clone-\(UUID().uuidString)"
     guard mkdirat(parentDescriptor, name, S_IRWXU) == 0 else {
       close(parentDescriptor)
       throw GitCommandRunnerError.launchFailed
     }
+    var created = stat()
+    guard fstatat(parentDescriptor, name, &created, AT_SYMLINK_NOFOLLOW) == 0,
+      created.st_mode & S_IFMT == S_IFDIR
+    else {
+      _ = unlinkat(parentDescriptor, name, AT_REMOVEDIR)
+      close(parentDescriptor)
+      throw GitCommandRunnerError.cleanupRequired
+    }
+    let createdIdentity = FileIdentity(
+      device: UInt64(created.st_dev),
+      inode: UInt64(created.st_ino)
+    )
+    beforeCloneTargetOpen(parentDescriptor, name)
     let targetDescriptor = openat(
       parentDescriptor,
       name,
@@ -439,19 +641,57 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     )
     var information = stat()
     guard targetDescriptor >= 0, fstat(targetDescriptor, &information) == 0,
-      information.st_mode & S_IFMT == S_IFDIR
+      information.st_mode & S_IFMT == S_IFDIR,
+      FileIdentity(device: UInt64(information.st_dev), inode: UInt64(information.st_ino))
+        == createdIdentity
     else {
       if targetDescriptor >= 0 { close(targetDescriptor) }
-      _ = unlinkat(parentDescriptor, name, AT_REMOVEDIR)
-      close(parentDescriptor)
-      throw GitCommandRunnerError.cleanupRequired
+      throw CloneTargetPreparationError.replaced(
+        CloneTargetHandle(
+          parentDescriptor: parentDescriptor,
+          targetDescriptor: -1,
+          name: name,
+          identity: createdIdentity
+        )
+      )
     }
     return CloneTargetHandle(
       parentDescriptor: parentDescriptor,
       targetDescriptor: targetDescriptor,
       name: name,
-      identity: FileIdentity(device: UInt64(information.st_dev), inode: UInt64(information.st_ino))
+      identity: createdIdentity
     )
+  }
+
+  private func publishClone(
+    _ plan: ValidatedGitOperationPlan,
+    target: CloneTargetHandle,
+    scope: AuthorizedGitHubRepositoryScope
+  ) throws {
+    guard case .clone = plan.request,
+      plan.targetURL.deletingLastPathComponent().standardizedFileURL == scope.workspacesRoot
+    else { throw GitCommandRunnerError.cleanupRequired }
+    var root = stat()
+    var staged = stat()
+    guard fstat(target.parentDescriptor, &root) == 0,
+      FileIdentity(device: UInt64(root.st_dev), inode: UInt64(root.st_ino)) == plan.rootIdentity,
+      fstatat(
+        target.parentDescriptor,
+        target.currentEntryName,
+        &staged,
+        AT_SYMLINK_NOFOLLOW
+      ) == 0,
+      staged.st_mode & S_IFMT == S_IFDIR,
+      FileIdentity(device: UInt64(staged.st_dev), inode: UInt64(staged.st_ino)) == target.identity,
+      renameatx_np(
+        target.parentDescriptor,
+        target.currentEntryName,
+        target.parentDescriptor,
+        plan.targetURL.lastPathComponent,
+        UInt32(RENAME_EXCL)
+      ) == 0
+    else { throw GitCommandRunnerError.cleanupRequired }
+    target.recordMove(to: plan.targetURL.lastPathComponent)
   }
 
   private func cleanupFailedClone(
@@ -499,7 +739,24 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       throw GitCommandRunnerError.cleanupRequired
     }
     target.recordMove(to: quarantineName)
-    try removeDirectoryContents(target.targetDescriptor)
+    let openedForCleanup: Int32
+    if target.targetDescriptor >= 0 {
+      openedForCleanup = target.targetDescriptor
+    } else {
+      openedForCleanup = openat(
+        target.parentDescriptor,
+        quarantineName,
+        O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+      )
+      guard openedForCleanup >= 0 else { throw GitCommandRunnerError.cleanupRequired }
+    }
+    defer {
+      if target.targetDescriptor < 0 { close(openedForCleanup) }
+    }
+    try removeDirectoryContents(openedForCleanup)
+    guard unlinkat(target.parentDescriptor, quarantineName, AT_REMOVEDIR) == 0 else {
+      throw GitCommandRunnerError.cleanupRequired
+    }
   }
 
   private func cleanupPreparedCloneOrRetain(
@@ -530,6 +787,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       if enumerationDescriptor >= 0 { close(enumerationDescriptor) }
       throw GitCommandRunnerError.cleanupRequired
     }
+    rewinddir(directory)
     var names: [String] = []
     while let entry = readdir(directory) {
       let name = withUnsafePointer(to: &entry.pointee.d_name) {
@@ -545,6 +803,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       guard fstatat(descriptor, name, &information, AT_SYMLINK_NOFOLLOW) == 0 else {
         throw GitCommandRunnerError.cleanupRequired
       }
+      beforeNestedCloneCleanup(descriptor, name)
       let quarantinedName = ".symphony-cleared-\(UUID().uuidString)"
       guard renameatx_np(
         descriptor,
@@ -589,7 +848,11 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
           close(child)
           throw error
         }
+        guard unlinkat(descriptor, quarantinedName, AT_REMOVEDIR) == 0 else {
+          throw GitCommandRunnerError.cleanupRequired
+        }
       } else if information.st_mode & S_IFMT == S_IFREG {
+        guard information.st_nlink == 1 else { throw GitCommandRunnerError.cleanupRequired }
         let file = openat(descriptor, quarantinedName, O_WRONLY | O_NOFOLLOW | O_CLOEXEC)
         guard file >= 0 else { throw GitCommandRunnerError.cleanupRequired }
         var opened = stat()
@@ -601,6 +864,15 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
         guard cleared else {
           throw GitCommandRunnerError.cleanupRequired
         }
+        guard unlinkat(descriptor, quarantinedName, 0) == 0 else {
+          throw GitCommandRunnerError.cleanupRequired
+        }
+      } else if information.st_mode & S_IFMT == S_IFLNK {
+        guard unlinkat(descriptor, quarantinedName, 0) == 0 else {
+          throw GitCommandRunnerError.cleanupRequired
+        }
+      } else {
+        throw GitCommandRunnerError.cleanupRequired
       }
     }
   }
@@ -634,9 +906,13 @@ private final class CloneTargetHandle: @unchecked Sendable {
   }
 
   deinit {
-    close(targetDescriptor)
+    if targetDescriptor >= 0 { close(targetDescriptor) }
     close(parentDescriptor)
   }
+}
+
+private enum CloneTargetPreparationError: Error {
+  case replaced(CloneTargetHandle)
 }
 
 struct GitProcessGroupController: Sendable {
@@ -658,13 +934,21 @@ struct GitProcessGroupController: Sendable {
 
 private final class GitProcessReference: @unchecked Sendable {
   private let process: Process
+  private let ownsProcessGroup: Bool
   private let controller: GitProcessGroupController
-  init(_ process: Process, controller: GitProcessGroupController) {
+  init(
+    _ process: Process,
+    ownsProcessGroup: Bool,
+    controller: GitProcessGroupController
+  ) {
     self.process = process
+    self.ownsProcessGroup = ownsProcessGroup
     self.controller = controller
   }
   var isRunning: Bool { process.isRunning }
-  var groupExists: Bool { controller.exists(process.processIdentifier) }
+  var groupExists: Bool {
+    ownsProcessGroup ? controller.exists(process.processIdentifier) : process.isRunning
+  }
   var terminationStatus: Int32 { process.terminationStatus }
   func terminateGroup(_ signal: Int32) {
     controller.signal(process.processIdentifier, signal)

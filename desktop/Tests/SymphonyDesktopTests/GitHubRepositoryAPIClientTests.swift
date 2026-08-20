@@ -178,6 +178,69 @@ final class GitHubRepositoryAPIClientTests: XCTestCase {
     }
   }
 
+  func testMutationEffectStateDistinguishesPreflightFromEveryDispatchedFailure() async throws {
+    let fixture = try makeScope()
+    let token = SecureSecretBuffer(copying: Data("token".utf8))
+    defer { token.clear() }
+
+    let preflight = GitHubAppAPIClient(
+      baseURL: URL(string: "https://api.github.test")!,
+      transport: RepositoryTransport(responses: [.json(status: 401, body: "{}")])
+    )
+    do {
+      _ = try await preflight.performIssueRequest(
+        .createComment(issueNumber: 7, body: "hello"),
+        scope: fixture.scope,
+        token: token
+      )
+      XCTFail("Expected preflight authentication failure")
+    } catch let error as GitHubRepositoryAPIError {
+      XCTAssertEqual(error.failure.category, .authExpired)
+      XCTAssertFalse(error.failure.effectMayHaveOccurred)
+    }
+
+    for (response, category) in [
+      (RepositoryTransport.Response.json(status: 401, body: "{}"), .authExpired),
+      (RepositoryTransport.Response.json(status: 201, body: "{}"), .invalidServiceResponse),
+    ] as [(RepositoryTransport.Response, GitHubCapabilityFailure.Category)] {
+      let client = GitHubAppAPIClient(
+        baseURL: URL(string: "https://api.github.test")!,
+        transport: RepositoryTransport(responses: [
+          .json(status: 200, body: #"{"number":7}"#),
+          response,
+        ])
+      )
+      do {
+        _ = try await client.performIssueRequest(
+          .createComment(issueNumber: 7, body: "hello"),
+          scope: fixture.scope,
+          token: token
+        )
+        XCTFail("Expected dispatched mutation failure")
+      } catch let error as GitHubRepositoryAPIError {
+        XCTAssertEqual(error.failure.category, category)
+        XCTAssertTrue(error.failure.effectMayHaveOccurred)
+      }
+    }
+
+    let transportFailure = DispatchedFailureTransport()
+    let client = GitHubAppAPIClient(
+      baseURL: URL(string: "https://api.github.test")!,
+      transport: transportFailure
+    )
+    do {
+      _ = try await client.performIssueRequest(
+        .setIssueState(issueNumber: 7, state: .closed),
+        scope: fixture.scope,
+        token: token
+      )
+      XCTFail("Expected dispatched transport failure")
+    } catch let error as GitHubRepositoryAPIError {
+      XCTAssertEqual(error.failure.category, .networkUnavailable)
+      XCTAssertTrue(error.failure.effectMayHaveOccurred)
+    }
+  }
+
   private func jsonObject(_ request: URLRequest) throws -> [String: String] {
     try XCTUnwrap(
       JSONSerialization.jsonObject(with: XCTUnwrap(request.httpBody)) as? [String: String]
@@ -232,6 +295,28 @@ private actor RepositoryTransport: GitHubHTTPTransporting {
         statusCode: response.status,
         httpVersion: "HTTP/1.1",
         headerFields: response.headers
+      )!
+    )
+  }
+}
+
+private actor DispatchedFailureTransport: GitHubHTTPTransporting {
+  private var requestCount = 0
+
+  func data(
+    for request: URLRequest,
+    maximumBytes: Int,
+    deadline: ContinuousClock.Instant
+  ) throws -> (Data, HTTPURLResponse) {
+    requestCount += 1
+    if requestCount == 2 { throw URLError(.networkConnectionLost) }
+    return (
+      Data(#"{"number":7}"#.utf8),
+      HTTPURLResponse(
+        url: request.url!,
+        statusCode: 200,
+        httpVersion: "HTTP/1.1",
+        headerFields: [:]
       )!
     )
   }

@@ -671,6 +671,52 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
     XCTAssertFalse(processExists(gitChild))
   }
 
+  func testRealGitWatchdogKillsTheProcessGroupWhenOnlyItsBrokerSocketCloses() async throws {
+    let directory = try temporaryDirectory()
+    defer { try? FileManager.default.removeItem(at: directory) }
+    let realBroker = try brokerExecutable()
+    let gitParentURL = directory.appendingPathComponent("watchdog-parent")
+    let gitChildURL = directory.appendingPathComponent("watchdog-child")
+    let longRunningGit = try executableScript(
+      in: directory,
+      name: "watchdog-git",
+      contents: """
+        #!/bin/sh
+        echo $$ > "\(gitParentURL.path)"
+        sleep 60 &
+        child=$!
+        echo $child > "\(gitChildURL.path)"
+        wait $child
+        """
+    )
+    var descriptors: [Int32] = [0, 0]
+    XCTAssertEqual(Darwin.socketpair(AF_UNIX, SOCK_STREAM, 0, &descriptors), 0)
+    let brokerSide = FileHandle(fileDescriptor: descriptors[0], closeOnDealloc: true)
+    let ownerSide = FileHandle(fileDescriptor: descriptors[1], closeOnDealloc: true)
+    let process = Process()
+    process.executableURL = realBroker
+    process.arguments = ["git-runner", longRunningGit.path]
+    process.standardInput = brokerSide
+    process.standardOutput = FileHandle.nullDevice
+    process.standardError = FileHandle.nullDevice
+    try process.run()
+    brokerSide.closeFile()
+    await eventually { FileManager.default.fileExists(atPath: gitParentURL.path) }
+    await eventually { FileManager.default.fileExists(atPath: gitChildURL.path) }
+    let gitParent = try XCTUnwrap(
+      Int32(String(contentsOf: gitParentURL).trimmingCharacters(in: .whitespacesAndNewlines))
+    )
+    let gitChild = try XCTUnwrap(
+      Int32(String(contentsOf: gitChildURL).trimmingCharacters(in: .whitespacesAndNewlines))
+    )
+
+    ownerSide.closeFile()
+    await eventually { !self.processExists(gitParent) && !self.processExists(gitChild) }
+
+    XCTAssertFalse(processExists(gitParent))
+    XCTAssertFalse(processExists(gitChild))
+  }
+
   private func temporaryDirectory() throws -> URL {
     let url = FileManager.default.temporaryDirectory
       .appendingPathComponent("CredentialBrokerProcessLauncherTests-\(UUID().uuidString)")

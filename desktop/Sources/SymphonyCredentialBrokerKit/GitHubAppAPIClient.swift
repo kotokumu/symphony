@@ -434,9 +434,9 @@ public struct GitHubAppAPIClient: GitHubAppAPIRequesting, GitHubRepositoryAPIReq
         return .stateChanged(value)
       }
     } catch let error as GitHubRepositoryAPIError {
-      throw error
+      throw request.isMutation ? error.markingEffectMayHaveOccurred() : error
     } catch {
-      throw GitHubRepositoryAPIError.failure(
+      let responseError = GitHubRepositoryAPIError.failure(
         GitHubCapabilityFailure(
           category: .invalidServiceResponse,
           message: "GitHub returned an unreadable issue response."
@@ -444,6 +444,7 @@ public struct GitHubAppAPIClient: GitHubAppAPIRequesting, GitHubRepositoryAPIReq
         invalidatesLease: false,
         retryGET: false
       )
+      throw request.isMutation ? responseError.markingEffectMayHaveOccurred() : responseError
     }
   }
 

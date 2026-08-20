@@ -18,6 +18,9 @@ struct SymphonyCredentialBrokerMain {
       guard gitProcessID > 1, getpgid(gitProcessID) == gitProcessID,
         parentExecutableMatchesBroker(gitProcessID)
       else { Foundation.exit(77) }
+      var ready: UInt8 = 1
+      guard Darwin.write(STDOUT_FILENO, &ready, 1) == 1 else { Foundation.exit(77) }
+      Darwin.close(STDOUT_FILENO)
       monitorBrokerLifetime(descriptor: STDIN_FILENO, gitProcessID: gitProcessID)
     }
     guard arguments.count == 2, let namespaceID = UUID(uuidString: arguments[1]) else {
@@ -80,16 +83,23 @@ struct SymphonyCredentialBrokerMain {
 
     let gitProcessID = getpid()
     let watchdog = Process()
+    let readiness = Pipe()
     watchdog.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
     watchdog.arguments = ["git-watchdog"]
     watchdog.standardInput = FileHandle(fileDescriptor: credentialDescriptor, closeOnDealloc: false)
-    watchdog.standardOutput = FileHandle.nullDevice
+    watchdog.standardOutput = readiness
     watchdog.standardError = FileHandle.nullDevice
     do {
       try watchdog.run()
     } catch {
       return 1
     }
+    readiness.fileHandleForWriting.closeFile()
+    guard waitForWatchdogReadiness(readiness.fileHandleForReading.fileDescriptor) else {
+      watchdog.terminate()
+      return 1
+    }
+    readiness.fileHandleForReading.closeFile()
 
     var pointers: [UnsafeMutablePointer<CChar>?] = ([executable] + arguments).map { strdup($0) }
     guard pointers.allSatisfy({ $0 != nil }) else { return 1 }
@@ -99,6 +109,13 @@ struct SymphonyCredentialBrokerMain {
       _ = Darwin.execv(path, &pointers)
     }
     return 1
+  }
+
+  private static func waitForWatchdogReadiness(_ descriptor: Int32) -> Bool {
+    var polled = pollfd(fd: descriptor, events: Int16(POLLIN | POLLHUP), revents: 0)
+    guard Darwin.poll(&polled, 1, 1_000) > 0 else { return false }
+    var byte: UInt8 = 0
+    return Darwin.read(descriptor, &byte, 1) == 1 && byte == 1
   }
 
   private static func monitorBrokerLifetime(descriptor: Int32, gitProcessID: Int32) -> Never {
