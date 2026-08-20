@@ -16,13 +16,16 @@ final class NamespaceController: ObservableObject {
 
   private let repository: any NamespaceRepository
   private let beforeDelete: (Namespace.ID) async throws -> Void
+  private let afterDelete: (Namespace.ID, Bool) async -> Void
 
   init(
     repository: any NamespaceRepository,
-    beforeDelete: @escaping (Namespace.ID) async throws -> Void = { _ in }
+    beforeDelete: @escaping (Namespace.ID) async throws -> Void = { _ in },
+    afterDelete: @escaping (Namespace.ID, Bool) async -> Void = { _, _ in }
   ) {
     self.repository = repository
     self.beforeDelete = beforeDelete
+    self.afterDelete = afterDelete
   }
 
   func load() async {
@@ -73,9 +76,15 @@ final class NamespaceController: ObservableObject {
     var updatedCatalog = catalog
     let namespace = try updatedCatalog.delete(id)
     try await beforeDelete(id)
-    let outcome = try await repository.delete(namespace, saving: updatedCatalog)
-    catalog = updatedCatalog
-    return outcome
+    do {
+      let outcome = try await repository.delete(namespace, saving: updatedCatalog)
+      catalog = updatedCatalog
+      await afterDelete(id, true)
+      return outcome
+    } catch {
+      await afterDelete(id, false)
+      throw error
+    }
   }
 
   private func beginChange() throws {

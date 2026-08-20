@@ -73,3 +73,17 @@ Deleting a namespace stops its daemon before deleting local namespace data. Clos
 window stops all namespace daemons owned by that application instance. Quitting the application
 waits for its daemons to stop; if safe shutdown fails, the application reports the failure and
 cancels termination.
+
+---
+
+## 6. Codex Authentication
+
+Each namespace has an independent Codex authentication state. A user can start ChatGPT browser
+sign-in for the selected namespace and return to the application when Codex completes the flow.
+The application reports signed-out, authenticating, signed-in, expired, and failed states. Expired
+or failed authentication can be retried.
+
+Signing in or out changes only the selected namespace. Authentication remains associated with the
+namespace's stable identity across application restarts and namespace renames. The same isolated
+authentication boundary is used when that namespace's Symphony daemon starts Codex. Authentication
+operations stop before the namespace's local data is deleted or the application terminates.

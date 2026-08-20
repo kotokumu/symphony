@@ -28,6 +28,7 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
     let ports = PortSequence([42001, 42001, 42002])
     let supervisor = NamespaceDaemonSupervisor(
       executableURL: executable,
+      codexExecutableURL: URL(fileURLWithPath: "/usr/bin/true"),
       readinessTimeout: 1,
       readinessProbe: { _ in true },
       portAllocator: { try ports.next() }
@@ -54,6 +55,7 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
     for directory in [firstDirectory, secondDirectory] {
       XCTAssertTrue(fileExists(directory.appendingPathComponent("Runtime/WORKFLOW.md")))
       XCTAssertTrue(fileExists(directory.appendingPathComponent("Workspaces")))
+      XCTAssertTrue(fileExists(directory.appendingPathComponent("CodexHome")))
       XCTAssertTrue(fileExists(directory.appendingPathComponent("Logs/daemon.stdout.log")))
       XCTAssertTrue(fileExists(directory.appendingPathComponent("Logs/daemon.stderr.log")))
       let workflow = try String(
@@ -62,6 +64,11 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
       )
       XCTAssertTrue(workflow.contains("kind: memory"))
       XCTAssertTrue(workflow.contains(directory.appendingPathComponent("Workspaces").path))
+      XCTAssertTrue(
+        workflow.contains(
+          "CODEX_HOME='\(directory.appendingPathComponent("CodexHome").path)' '/usr/bin/true' app-server"
+        )
+      )
     }
 
     try await supervisor.stop(namespaceID: firstID)
@@ -73,12 +80,58 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
     try await supervisor.stopAll()
   }
 
+  func testDaemonReceivesTheSharedSanitizedEnvironmentWithAnAbsoluteCodexPath() async throws {
+    let executable = temporaryDirectory.appendingPathComponent("check-environment.sh")
+    let script = """
+      #!/bin/sh
+      if [ -n "${OPENAI_API_KEY:-}" ] || [ -n "${CODEX_ACCESS_TOKEN:-}" ] || [ -n "${CODEX_API_KEY:-}" ] || [ -n "${CODEX_HOME:-}" ]; then
+        exit 42
+      fi
+      while :; do sleep 1; done
+      """
+    try script.write(to: executable, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: executable.path)
+    let namespaceID = UUID()
+    let namespaceDirectory = try makeNamespaceDirectory(namespaceID)
+    let supervisor = NamespaceDaemonSupervisor(
+      executableURL: executable,
+      codexExecutableURL: URL(fileURLWithPath: "/usr/bin/true"),
+      readinessTimeout: 1,
+      readinessProbe: { _ in
+        try? await Task.sleep(for: .milliseconds(100))
+        return true
+      },
+      portAllocator: { 42003 },
+      environment: [
+        "PATH": "/usr/bin:/bin",
+        "CODEX_HOME": "/global/codex-home",
+        "OPENAI_API_KEY": "inherited-openai-key",
+        "CODEX_ACCESS_TOKEN": "inherited-access-token",
+        "CODEX_API_KEY": "inherited-codex-key",
+      ]
+    )
+
+    await supervisor.start(
+      namespaceID: namespaceID,
+      namespaceDirectory: namespaceDirectory
+    )
+
+    _ = try runningEndpoint(await supervisor.state(for: namespaceID))
+    let workflow = try String(
+      contentsOf: namespaceDirectory.appendingPathComponent("Runtime/WORKFLOW.md"),
+      encoding: .utf8
+    )
+    XCTAssertTrue(workflow.contains("'/usr/bin/true' app-server"))
+    try await supervisor.stopAll()
+  }
+
   func testRestartDoesNotAcceptTheOldProcessesDelayedTermination() async throws {
     let executable = try makeLongRunningExecutable()
     let ports = PortSequence([42101, 42102])
     let terminations = DeferredTerminationDelivery()
     let supervisor = NamespaceDaemonSupervisor(
       executableURL: executable,
+      codexExecutableURL: URL(fileURLWithPath: "/usr/bin/true"),
       readinessTimeout: 1,
       readinessProbe: { _ in true },
       portAllocator: { try ports.next() },
@@ -119,6 +172,7 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
     let ports = PortSequence([42111, 42112])
     let supervisor = NamespaceDaemonSupervisor(
       executableURL: executable,
+      codexExecutableURL: URL(fileURLWithPath: "/usr/bin/true"),
       readinessTimeout: 1,
       readinessProbe: { endpoint in endpoint.port == 42112 },
       portAllocator: { try ports.next() }
@@ -156,6 +210,7 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
     let ports = PortSequence([42201, 42202])
     let supervisor = NamespaceDaemonSupervisor(
       executableURL: executable,
+      codexExecutableURL: URL(fileURLWithPath: "/usr/bin/true"),
       readinessTimeout: 1,
       readinessProbe: { endpoint in endpoint.port == 42201 },
       portAllocator: { try ports.next() }
@@ -179,6 +234,7 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
     let ports = PortSequence([42211, 42212])
     let supervisor = NamespaceDaemonSupervisor(
       executableURL: executable,
+      codexExecutableURL: URL(fileURLWithPath: "/usr/bin/true"),
       readinessTimeout: 1,
       readinessProbe: { _ in true },
       portAllocator: { try ports.next() }
@@ -216,6 +272,7 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
     let ports = PortSequence([42221, 42222])
     let supervisor = NamespaceDaemonSupervisor(
       executableURL: executable,
+      codexExecutableURL: URL(fileURLWithPath: "/usr/bin/true"),
       readinessTimeout: 1,
       readinessProbe: { _ in FileManager.default.fileExists(atPath: readySignal.path) },
       portAllocator: { try ports.next() },
@@ -259,6 +316,7 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
     )
     let supervisor = NamespaceDaemonSupervisor(
       executableURL: executable,
+      codexExecutableURL: URL(fileURLWithPath: "/usr/bin/true"),
       readinessTimeout: 1,
       readinessProbe: { _ in FileManager.default.fileExists(atPath: readySignal.path) },
       portAllocator: { 42231 },
@@ -296,6 +354,7 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
   func testMissingExecutableReportsAnActionableFailure() async throws {
     let supervisor = NamespaceDaemonSupervisor(
       executableURL: nil,
+      codexExecutableURL: URL(fileURLWithPath: "/usr/bin/true"),
       readinessTimeout: 0.1,
       readinessProbe: { _ in false },
       portAllocator: { 42301 }
@@ -319,6 +378,55 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
     )
   }
 
+  func testMissingCodexExecutableReportsAnActionableFailure() async throws {
+    let supervisor = NamespaceDaemonSupervisor(
+      executableURL: try makeLongRunningExecutable(),
+      codexExecutableURL: nil,
+      readinessTimeout: 0.1,
+      readinessProbe: { _ in false },
+      portAllocator: { 42302 }
+    )
+    let namespaceID = UUID()
+
+    await supervisor.start(
+      namespaceID: namespaceID,
+      namespaceDirectory: try makeNamespaceDirectory(namespaceID)
+    )
+
+    let state = await supervisor.state(for: namespaceID)
+    XCTAssertEqual(
+      state,
+      .failed(message: "The Codex CLI could not be found. Install Codex and try again.")
+    )
+  }
+
+  func testNonExecutableCodexReportsItsPath() async throws {
+    let codexExecutable = temporaryDirectory.appendingPathComponent("codex-not-executable")
+    try Data().write(to: codexExecutable)
+    let supervisor = NamespaceDaemonSupervisor(
+      executableURL: try makeLongRunningExecutable(),
+      codexExecutableURL: codexExecutable,
+      readinessTimeout: 0.1,
+      readinessProbe: { _ in false },
+      portAllocator: { 42303 }
+    )
+    let namespaceID = UUID()
+
+    await supervisor.start(
+      namespaceID: namespaceID,
+      namespaceDirectory: try makeNamespaceDirectory(namespaceID)
+    )
+
+    let state = await supervisor.state(for: namespaceID)
+    XCTAssertEqual(
+      state,
+      .failed(
+        message:
+          "The Codex CLI at \(codexExecutable.path) is not executable. Reinstall Codex and try again."
+      )
+    )
+  }
+
   func testReadinessCleanupFailureRetainsOwnershipAndBlocksReplacement() async throws {
     let pidFile = temporaryDirectory.appendingPathComponent("daemon.pid")
     let executable = try makeExecutable(
@@ -332,6 +440,7 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
     let ports = PortSequence([42311, 42312])
     let supervisor = NamespaceDaemonSupervisor(
       executableURL: executable,
+      codexExecutableURL: URL(fileURLWithPath: "/usr/bin/true"),
       readinessTimeout: 0.01,
       readinessProbe: { _ in false },
       portAllocator: { try ports.next() },

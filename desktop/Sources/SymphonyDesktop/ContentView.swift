@@ -4,6 +4,7 @@ import SymphonyDesktopCore
 struct ContentView: View {
   @ObservedObject var controller: NamespaceController
   @ObservedObject var daemonController: NamespaceDaemonController
+  @ObservedObject var authenticationController: CodexAuthenticationController
 
   @State private var editor: NamespaceEditorContext?
   @State private var namespaceToDelete: DesktopNamespace?
@@ -23,12 +24,20 @@ struct ContentView: View {
     }
     .task {
       await daemonController.startObserving()
+      await authenticationController.startObserving()
       if controller.loadState == .loading {
         await controller.load()
       }
     }
+    .task(id: controller.catalog.selectedID) {
+      guard let namespaceID = controller.catalog.selectedID else {
+        return
+      }
+      await authenticationController.refresh(namespaceID)
+    }
     .onDisappear {
       Task {
+        try? await authenticationController.cancelAll()
         try? await daemonController.stopAll()
       }
     }
@@ -105,6 +114,7 @@ struct ContentView: View {
         NamespaceDetailView(
           namespace: namespace,
           daemonState: daemonController.state(for: namespace.id),
+          authenticationState: authenticationController.state(for: namespace.id),
           start: {
             Task {
               await daemonController.start(namespace)
@@ -122,6 +132,16 @@ struct ContentView: View {
               await reportErrors {
                 try await daemonController.restart(namespace)
               }
+            }
+          },
+          signIn: {
+            Task {
+              await authenticationController.signIn(namespace.id)
+            }
+          },
+          signOut: {
+            Task {
+              await authenticationController.signOut(namespace.id)
             }
           },
           rename: { editor = .rename(namespace) },
@@ -246,9 +266,12 @@ private struct EmptyNamespaceView: View {
 private struct NamespaceDetailView: View {
   let namespace: DesktopNamespace
   let daemonState: NamespaceDaemonState
+  let authenticationState: CodexAuthenticationState
   let start: () -> Void
   let stop: () -> Void
   let restart: () -> Void
+  let signIn: () -> Void
+  let signOut: () -> Void
   let rename: () -> Void
   let delete: () -> Void
 
@@ -266,12 +289,71 @@ private struct NamespaceDetailView: View {
 
       daemonControls
 
+      Divider()
+        .frame(maxWidth: 440)
+
+      authenticationStatus
+
+      authenticationControls
+
       HStack {
         Button("Rename…", action: rename)
         Button("Delete…", role: .destructive, action: delete)
       }
     }
     .padding(48)
+  }
+
+  @ViewBuilder
+  private var authenticationStatus: some View {
+    let presentation = CodexAuthenticationPresentation(state: authenticationState)
+    if presentation.showsProgress {
+      HStack(spacing: 8) {
+        ProgressView()
+          .controlSize(.small)
+        Text(presentation.status)
+      }
+      .foregroundStyle(.secondary)
+    } else if let systemImage = presentation.systemImage {
+      VStack(spacing: 6) {
+        Label(presentation.status, systemImage: systemImage)
+          .foregroundStyle(authenticationStatusColor(presentation.tone))
+        if let detail = presentation.detail {
+          Text(detail)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: 440)
+        }
+      }
+    }
+  }
+
+  @ViewBuilder
+  private var authenticationControls: some View {
+    switch CodexAuthenticationPresentation(state: authenticationState).action {
+    case .none:
+      EmptyView()
+    case .signIn(let title):
+      Button(title, action: signIn)
+        .buttonStyle(.borderedProminent)
+    case .signOut(let title):
+      Button(title, action: signOut)
+    }
+  }
+
+  private func authenticationStatusColor(
+    _ tone: CodexAuthenticationPresentation.Tone
+  ) -> Color {
+    switch tone {
+    case .secondary:
+      .secondary
+    case .success:
+      .green
+    case .warning:
+      .orange
+    case .error:
+      .red
+    }
   }
 
   @ViewBuilder

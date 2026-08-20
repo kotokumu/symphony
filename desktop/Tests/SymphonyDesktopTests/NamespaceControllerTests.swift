@@ -153,6 +153,9 @@ final class NamespaceControllerTests: XCTestCase {
       repository: repository,
       beforeDelete: { id in
         operations.append("stop:\(id.uuidString)")
+      },
+      afterDelete: { id, succeeded in
+        operations.append("finish:\(id.uuidString):\(succeeded)")
       }
     )
     await repository.recordOperations(in: operations)
@@ -161,7 +164,14 @@ final class NamespaceControllerTests: XCTestCase {
     _ = try await controller.deleteNamespace(namespace.id)
 
     let recorded = operations.values
-    XCTAssertEqual(recorded.suffix(2), ["stop:\(namespace.id.uuidString)", "delete"])
+    XCTAssertEqual(
+      recorded.suffix(3),
+      [
+        "stop:\(namespace.id.uuidString)",
+        "delete",
+        "finish:\(namespace.id.uuidString):true",
+      ]
+    )
   }
 
   func testStopFailurePreventsDeletionAndPreservesTheCatalog() async throws {
@@ -194,7 +204,13 @@ final class NamespaceControllerTests: XCTestCase {
     var catalog = NamespaceCatalog()
     let namespace = try catalog.create(named: "Research")
     let repository = TestNamespaceRepository(catalog: catalog)
-    let controller = NamespaceController(repository: repository)
+    let operations = OperationRecorder()
+    let controller = NamespaceController(
+      repository: repository,
+      afterDelete: { id, succeeded in
+        operations.append("finish:\(id.uuidString):\(succeeded)")
+      }
+    )
     await controller.load()
     await repository.failNextDelete()
 
@@ -208,6 +224,7 @@ final class NamespaceControllerTests: XCTestCase {
     let snapshot = await repository.snapshot()
     XCTAssertEqual(controller.catalog, catalog)
     XCTAssertEqual(snapshot.catalog, catalog)
+    XCTAssertEqual(operations.values, ["finish:\(namespace.id.uuidString):false"])
     XCTAssertFalse(controller.isChanging)
   }
 
