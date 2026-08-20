@@ -394,7 +394,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       try await stop(runtime.process)
       runtime.server.stop()
     }
-    let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+    let deadline = ContinuousClock.now.advanced(by: .seconds(5))
     while lock.withLock({ operationInProgress }), ContinuousClock.now < deadline {
       try? await Task.sleep(for: .milliseconds(20))
     }

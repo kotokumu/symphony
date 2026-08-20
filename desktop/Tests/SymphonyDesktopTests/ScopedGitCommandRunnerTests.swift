@@ -148,8 +148,8 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       }
     }
     try await waitForFile(ready)
-    let target = fixture.root.appendingPathComponent("partial", isDirectory: true)
-    let original = fixture.root.appendingPathComponent("original-partial", isDirectory: true)
+    let target = try findCloneStagingDirectory(in: fixture.root)
+    let original = fixture.root.appendingPathComponent("original-\(target.lastPathComponent)", isDirectory: true)
     try FileManager.default.moveItem(at: target, to: original)
     try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
     try Data("sentinel".utf8).write(to: target.appendingPathComponent("keep"))
@@ -178,9 +178,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
 
   func testDoesNotDeleteAReplacementInsertedAfterCleanupIdentityVerification() async throws {
     let fixture = try makeFixture()
-    let target = fixture.root.appendingPathComponent("cleanup-race", isDirectory: true)
-    let original = fixture.root.appendingPathComponent("cleanup-race-original", isDirectory: true)
-    let replacement = CloneCleanupReplacement(target: target, original: original)
+    let replacement = CloneCleanupReplacement(root: fixture.root)
     let executable = try makeExecutable("#!/bin/sh\nexit 2\n")
     let runner = ScopedGitCommandRunner(
       gitExecutableURL: executable,
@@ -201,6 +199,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       XCTAssertEqual(error.failure.category, .cleanupRequired)
     }
 
+    let target = try replacement.replacementURL()
     XCTAssertEqual(try Data(contentsOf: target.appendingPathComponent("keep")), Data("sentinel".utf8))
   }
 
@@ -967,23 +966,32 @@ private final class FailOnceGitProcessGroupController: @unchecked Sendable {
 
 private final class CloneCleanupReplacement: @unchecked Sendable {
   private let lock = NSLock()
-  private let target: URL
-  private let original: URL
+  private let root: URL
+  private var target: URL?
   private var replaced = false
 
-  init(target: URL, original: URL) {
-    self.target = target
-    self.original = original
+  init(root: URL) {
+    self.root = root
   }
 
   func replace() {
     lock.withLock {
       guard !replaced else { return }
-      replaced = true
+      guard let name = try? FileManager.default.contentsOfDirectory(atPath: root.path)
+        .first(where: { $0.hasPrefix(".symphony-clone-") })
+      else { return }
+      let target = root.appendingPathComponent(name, isDirectory: true)
+      let original = root.appendingPathComponent("original-\(name)", isDirectory: true)
       try? FileManager.default.moveItem(at: target, to: original)
       try? FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
       try? Data("sentinel".utf8).write(to: target.appendingPathComponent("keep"))
+      self.target = target
+      replaced = true
     }
+  }
+
+  func replacementURL() throws -> URL {
+    try lock.withLock { try XCTUnwrap(target) }
   }
 }
 
