@@ -5,17 +5,13 @@ import XCTest
 
 final class CredentialLockPresentationTests: XCTestCase {
   func testPresentsEveryLockStateWithTheMatchingRecoveryAction() {
-    XCTAssertEqual(
-      CredentialLockPresentation(state: .locked()),
-      CredentialLockPresentation(
-        status: "Namespace locked",
-        detail: nil,
-        systemImage: "lock.fill",
-        showsProgress: false,
-        tone: .secondary,
-        action: .unlock("Unlock")
-      )
-    )
+    let locked = CredentialLockPresentation(state: .locked())
+    XCTAssertEqual(locked.status, "Namespace locked")
+    XCTAssertNil(locked.detail)
+    XCTAssertEqual(locked.systemImage, "lock.fill")
+    XCTAssertFalse(locked.showsProgress)
+    XCTAssertEqual(locked.tone, .secondary)
+    XCTAssertEqual(locked.action, .unlock("Unlock"))
     XCTAssertEqual(
       CredentialLockPresentation(state: .unlocking).action,
       .none

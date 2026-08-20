@@ -112,6 +112,11 @@ private actor RecordingBrokerSession: CredentialBrokerSessionHandle {
   let launcher: RecordingBrokerLauncher
   private var locked = false
 
+  init(namespaceID: UUID, launcher: RecordingBrokerLauncher) {
+    self.namespaceID = namespaceID
+    self.launcher = launcher
+  }
+
   func lock() async throws {
     guard !locked else { return }
     locked = true

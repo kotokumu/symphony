@@ -144,7 +144,7 @@ private final class RecordingCredentialStorage: NamespaceCredentialStoring, @unc
   }
 
   func removeAll(namespaceID: UUID) throws {
-    lock.withLock {
+    _ = lock.withLock {
       credentials.removeValue(forKey: namespaceID)
     }
   }
