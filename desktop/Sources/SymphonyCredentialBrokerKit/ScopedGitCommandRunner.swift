@@ -1132,10 +1132,10 @@ final class GitHubConnectProxy: @unchecked Sendable {
         if lock.withLock({ stopped }) { return }
         continue
       }
-      lock.withLock { connections.insert(client) }
+      lock.withLock { _ = connections.insert(client) }
       DispatchQueue.global(qos: .userInitiated).async { [self] in
         handle(client)
-        lock.withLock { connections.remove(client) }
+        lock.withLock { _ = connections.remove(client) }
         Darwin.close(client)
       }
     }
@@ -1150,9 +1150,9 @@ final class GitHubConnectProxy: @unchecked Sendable {
       _ = sendAll(Data("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n".utf8), to: client)
       return
     }
-    lock.withLock { connections.insert(upstream) }
+    lock.withLock { _ = connections.insert(upstream) }
     defer {
-      lock.withLock { connections.remove(upstream) }
+      lock.withLock { _ = connections.remove(upstream) }
       Darwin.shutdown(upstream, SHUT_RDWR)
       Darwin.close(upstream)
     }

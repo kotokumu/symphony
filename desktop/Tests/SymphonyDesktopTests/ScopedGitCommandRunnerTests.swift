@@ -1228,8 +1228,8 @@ private final class LoopbackConnectionProbe: @unchecked Sendable {
   private var connected = false
 
   init() throws {
-    descriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
-    guard descriptor >= 0 else { throw GitCommandRunnerError.launchFailed }
+    let listener = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+    guard listener >= 0 else { throw GitCommandRunnerError.launchFailed }
     var address = sockaddr_in()
     address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
     address.sin_family = sa_family_t(AF_INET)
@@ -1237,24 +1237,25 @@ private final class LoopbackConnectionProbe: @unchecked Sendable {
     address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
     let bound = withUnsafePointer(to: &address) { pointer in
       pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+        Darwin.bind(listener, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
       }
     }
-    guard bound == 0, Darwin.listen(descriptor, 1) == 0 else {
-      Darwin.close(descriptor)
+    guard bound == 0, Darwin.listen(listener, 1) == 0 else {
+      Darwin.close(listener)
       throw GitCommandRunnerError.launchFailed
     }
     var actual = sockaddr_in()
     var length = socklen_t(MemoryLayout<sockaddr_in>.size)
     let named = withUnsafeMutablePointer(to: &actual) { pointer in
       pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-        Darwin.getsockname(descriptor, $0, &length)
+        Darwin.getsockname(listener, $0, &length)
       }
     }
     guard named == 0 else {
-      Darwin.close(descriptor)
+      Darwin.close(listener)
       throw GitCommandRunnerError.launchFailed
     }
+    descriptor = listener
     port = UInt16(bigEndian: actual.sin_port)
     DispatchQueue.global(qos: .userInitiated).async { [self] in
       let client = Darwin.accept(descriptor, nil, nil)
