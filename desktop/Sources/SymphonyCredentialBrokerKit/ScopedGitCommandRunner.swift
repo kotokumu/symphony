@@ -72,6 +72,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
   private let wrapsGitInBrokerExecutable: Bool
   private let beforeLaunch: @Sendable () async -> Void
   private let beforeCloneCleanup: @Sendable () -> Void
+  private let processGroupController: GitProcessGroupController
   private let lock = NSLock()
   private var active: RetainedRuntime?
   private var retained: RetainedRuntime?
@@ -87,7 +88,8 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     stopTimeout: TimeInterval = 0.75,
     wrapsGitInBrokerExecutable: Bool = true,
     beforeLaunch: @escaping @Sendable () async -> Void = {},
-    beforeCloneCleanup: @escaping @Sendable () -> Void = {}
+    beforeCloneCleanup: @escaping @Sendable () -> Void = {},
+    processGroupController: GitProcessGroupController = .system
   ) {
     self.policy = policy
     self.gitExecutableURL = gitExecutableURL
@@ -97,6 +99,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     self.wrapsGitInBrokerExecutable = wrapsGitInBrokerExecutable
     self.beforeLaunch = beforeLaunch
     self.beforeCloneCleanup = beforeCloneCleanup
+    self.processGroupController = processGroupController
   }
 
   func run(
@@ -211,7 +214,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       try? FileManager.default.removeItem(at: isolated.temporaryDirectory)
       throw GitCommandRunnerError.launchFailed
     }
-    let processReference = GitProcessReference(process)
+    let processReference = GitProcessReference(process, controller: processGroupController)
     let ownedRuntime = RetainedRuntime(
       process: processReference,
       server: server,
@@ -622,19 +625,35 @@ private final class CloneTargetHandle: @unchecked Sendable {
   }
 }
 
+struct GitProcessGroupController: Sendable {
+  let exists: @Sendable (Int32) -> Bool
+  let signal: @Sendable (Int32, Int32) -> Void
+
+  static let system = GitProcessGroupController(
+    exists: { processID in
+      let result = Darwin.kill(-processID, 0)
+      return result == 0 || errno == EPERM
+    },
+    signal: { processID, signal in
+      if Darwin.kill(-processID, signal) != 0 {
+        _ = Darwin.kill(processID, signal)
+      }
+    }
+  )
+}
+
 private final class GitProcessReference: @unchecked Sendable {
   private let process: Process
-  init(_ process: Process) { self.process = process }
-  var isRunning: Bool { process.isRunning }
-  var groupExists: Bool {
-    let result = Darwin.kill(-process.processIdentifier, 0)
-    return result == 0 || errno == EPERM
+  private let controller: GitProcessGroupController
+  init(_ process: Process, controller: GitProcessGroupController) {
+    self.process = process
+    self.controller = controller
   }
+  var isRunning: Bool { process.isRunning }
+  var groupExists: Bool { controller.exists(process.processIdentifier) }
   var terminationStatus: Int32 { process.terminationStatus }
   func terminateGroup(_ signal: Int32) {
-    if Darwin.kill(-process.processIdentifier, signal) != 0 {
-      _ = Darwin.kill(process.processIdentifier, signal)
-    }
+    controller.signal(process.processIdentifier, signal)
   }
 }
 
@@ -704,7 +723,7 @@ enum GitCommandRunnerError: LocalizedError, Sendable {
   var errorDescription: String? { failure.message }
 }
 
-private struct GitCredentialWireRequest: Codable {
+struct GitCredentialWireRequest: Codable {
   let action: String
   let input: Data
 
@@ -728,7 +747,7 @@ private struct GitCredentialWireRequest: Codable {
   private enum CodingKeys: String, CodingKey, CaseIterable { case action, input }
 }
 
-private struct GitCredentialWireResponse: Codable {
+struct GitCredentialWireResponse: Codable {
   let succeeded: Bool
   let output: Data
 

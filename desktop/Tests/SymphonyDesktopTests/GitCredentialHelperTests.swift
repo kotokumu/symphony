@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 import XCTest
 
@@ -5,6 +6,36 @@ import XCTest
 @testable import SymphonyCredentialBrokerProtocol
 
 final class GitCredentialHelperTests: XCTestCase {
+  func testCredentialWireFramesRejectUnknownMissingAndMalformedFieldsWithoutCredentialOutput() async throws {
+    let fixture = try makeServer()
+    let task = Task.detached { fixture.server.serve() }
+    defer { fixture.server.stop() }
+    let hostileFrames = [
+      #"{"action":"get","input":"cHJvdG9jb2w9aHR0cHMK","secret":"exfiltrate"}"#,
+      #"{"action":"get"}"#,
+      #"{"action":7,"input":false}"#,
+    ]
+
+    for frame in hostileFrames {
+      try writeSocketLine(Data(frame.utf8), to: fixture.server.clientHandle.fileDescriptor)
+      let responseData = try readSocketLine(from: fixture.server.clientHandle.fileDescriptor)
+      let response = try JSONDecoder().decode(GitCredentialWireResponse.self, from: responseData)
+      XCTAssertFalse(response.succeeded)
+      XCTAssertTrue(response.output.isEmpty)
+      XCTAssertFalse(String(decoding: responseData, as: UTF8.self).contains("canary-token"))
+    }
+    for response in [
+      #"{"succeeded":true,"output":"","secret":"exfiltrate"}"#,
+      #"{"succeeded":true}"#,
+      #"{"succeeded":"yes","output":false}"#,
+    ] {
+      XCTAssertThrowsError(
+        try JSONDecoder().decode(GitCredentialWireResponse.self, from: Data(response.utf8))
+      )
+    }
+    fixture.server.stop()
+    _ = await task.value
+  }
   func testReturnsCredentialOnlyForTheAuthorizedGitHubRepository() async throws {
     let fixture = try makeServer()
     let task = Task.detached { fixture.server.serve() }
@@ -112,5 +143,31 @@ final class GitCredentialHelperTests: XCTestCase {
 
   private func helperEnvironment(_ server: PrivateGitCredentialServer) -> [String: String] {
     server.helperEnvironment
+  }
+
+  private func writeSocketLine(_ data: Data, to descriptor: Int32) throws {
+    var framed = data
+    framed.append(0x0A)
+    try framed.withUnsafeBytes { bytes in
+      var offset = 0
+      while offset < bytes.count {
+        let written = Darwin.send(descriptor, bytes.baseAddress!.advanced(by: offset), bytes.count - offset, 0)
+        guard written > 0 else { throw GitCommandRunnerError.authenticationRejected }
+        offset += written
+      }
+    }
+  }
+
+  private func readSocketLine(from descriptor: Int32) throws -> Data {
+    var result = Data()
+    while result.count <= 32_768 {
+      var byte: UInt8 = 0
+      guard Darwin.recv(descriptor, &byte, 1, 0) == 1 else {
+        throw GitCommandRunnerError.authenticationRejected
+      }
+      if byte == 0x0A { return result }
+      result.append(byte)
+    }
+    throw GitCommandRunnerError.outputTooLarge("")
   }
 }

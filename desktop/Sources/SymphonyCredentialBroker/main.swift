@@ -120,7 +120,7 @@ struct SymphonyCredentialBrokerMain {
   }
 
   private static func parentExecutableMatchesBroker(_ processID: Int32) -> Bool {
-    var path = [CChar](repeating: 0, count: Int(PROC_PIDPATHINFO_MAXSIZE))
+    var path = [CChar](repeating: 0, count: Int(MAXPATHLEN))
     guard proc_pidpath(processID, &path, UInt32(path.count)) > 0 else { return false }
     return URL(fileURLWithPath: String(cString: path)).standardizedFileURL
       == URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL

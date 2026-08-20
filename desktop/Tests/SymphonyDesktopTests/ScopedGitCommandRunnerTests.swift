@@ -12,6 +12,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       """
       #!/bin/sh
       printf '%s\n' "$@"
+      printf 'TEMP_HOME=%s\n' "$HOME"
       env
       exit 0
       """
@@ -37,6 +38,13 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     XCTAssertFalse(result.output.contains("GITHUB_TOKEN"))
     XCTAssertFalse(result.output.contains("SYMPHONY_GIT_HELPER_PORT"))
     XCTAssertFalse(result.output.contains("SYMPHONY_GIT_HELPER_NONCE"))
+    let temporaryHome = try XCTUnwrap(
+      result.output.split(separator: "\n")
+        .first { $0.hasPrefix("TEMP_HOME=") }
+        .map { String($0.dropFirst("TEMP_HOME=".count)) }
+    )
+    XCTAssertFalse(FileManager.default.fileExists(atPath: temporaryHome))
+    try assertNoCredentialRepresentations("never-print-this-token", under: fixture.root)
   }
 
   func testRemovesBrokerCreatedPartialCloneAfterFailure() async throws {
@@ -369,11 +377,13 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     let credential = OperationCredential(copying: source)
     source.clear()
     let basic = Data("x-access-token:canary-token".utf8).base64EncodedString()
+    let hex = Data("canary-token".utf8).map { String(format: "%02x", $0) }.joined()
     let output = credential.redact(
-      "canary-token \(Data("canary-token".utf8).base64EncodedString()) Basic \(basic)"
+      "canary-token \(Data("canary-token".utf8).base64EncodedString()) \(hex) Basic \(basic)"
     )
     XCTAssertFalse(output.contains("canary-token"))
     XCTAssertFalse(output.contains(basic))
+    XCTAssertFalse(output.contains(hex))
     XCTAssertTrue(output.contains("[REDACTED]"))
     credential.clear()
   }
@@ -418,10 +428,13 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     let fixture = try makeFixture()
     let parentPIDFile = fixture.root.appendingPathComponent("git-parent-pid")
     let childPIDFile = fixture.root.appendingPathComponent("git-child-pid")
+    let processReadyFile = fixture.root.appendingPathComponent("git-process-ready")
+    let processReleaseFile = fixture.root.appendingPathComponent("git-process-release")
     let executable = try makeExecutable(
       """
       #!/bin/sh
-      sleep 0.1
+      touch "\(processReadyFile.path)"
+      while [ ! -e "\(processReleaseFile.path)" ]; do sleep 0.01; done
       echo $$ > "\(parentPIDFile.path)"
       sleep 60 &
       child=$!
@@ -443,6 +456,8 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
         OperationCredential(copying: source)
       }
     }
+    try await waitForFile(processReadyFile)
+    FileManager.default.createFile(atPath: processReleaseFile.path, contents: Data())
     try await waitForFile(parentPIDFile)
     try await waitForFile(childPIDFile)
     let parentPID = try XCTUnwrap(Int32(String(contentsOf: parentPIDFile).trimmingCharacters(in: .whitespacesAndNewlines)))
@@ -454,6 +469,76 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       XCTFail("Expected stopped Git operation to fail")
     } catch {}
 
+    XCTAssertFalse(processExists(parentPID))
+    XCTAssertFalse(processExists(childPID))
+  }
+
+  func testFailedProcessGroupStopRetainsRuntimeUntilProductionRetrySucceeds() async throws {
+    let fixture = try makeFixture()
+    let ready = fixture.root.appendingPathComponent("retained-ready")
+    let release = fixture.root.appendingPathComponent("retained-release")
+    let parentPIDFile = fixture.root.appendingPathComponent("retained-parent")
+    let childPIDFile = fixture.root.appendingPathComponent("retained-child")
+    let executable = try makeExecutable(
+      """
+      #!/bin/sh
+      touch "\(ready.path)"
+      while [ ! -e "\(release.path)" ]; do sleep 0.01; done
+      echo $$ > "\(parentPIDFile.path)"
+      sleep 60 &
+      child=$!
+      echo $child > "\(childPIDFile.path)"
+      wait $child
+      """
+    )
+    let controller = FailOnceGitProcessGroupController()
+    let runner = ScopedGitCommandRunner(
+      gitExecutableURL: executable,
+      brokerExecutableURL: executable,
+      operationTimeout: 60,
+      stopTimeout: 0.05,
+      wrapsGitInBrokerExecutable: false,
+      processGroupController: controller.controller
+    )
+    let source = SecureSecretBuffer(copying: Data("retained-token".utf8))
+    defer { source.clear() }
+    let operation = Task {
+      try await runner.run(.clone(targetName: "retained"), in: fixture.scope) {
+        OperationCredential(copying: source)
+      }
+    }
+    try await waitForFile(ready)
+    FileManager.default.createFile(atPath: release.path, contents: Data())
+    try await waitForFile(parentPIDFile)
+    try await waitForFile(childPIDFile)
+    let parentPID = try XCTUnwrap(Int32(String(contentsOf: parentPIDFile).trimmingCharacters(in: .whitespacesAndNewlines)))
+    let childPID = try XCTUnwrap(Int32(String(contentsOf: childPIDFile).trimmingCharacters(in: .whitespacesAndNewlines)))
+
+    do {
+      try await runner.stopRetainedOperation()
+      XCTFail("Expected the first group stop to fail")
+    } catch let error as GitCommandRunnerError {
+      XCTAssertEqual(error.failure.category, .cleanupRequired)
+    }
+    do {
+      _ = try await runner.run(.clone(targetName: "replacement"), in: fixture.scope) {
+        OperationCredential(copying: source)
+      }
+      XCTFail("Expected retained ownership to block replacement")
+    } catch let error as GitCommandRunnerError {
+      XCTAssertEqual(error.failure.category, .cleanupRequired)
+    }
+    XCTAssertTrue(processExists(parentPID))
+    XCTAssertTrue(processExists(childPID))
+
+    controller.allowSignals()
+    try await runner.stopRetainedOperation()
+    do {
+      _ = try await operation.value
+      XCTFail("Expected stopped operation failure")
+    } catch let error as GitCommandRunnerError {
+      XCTAssertEqual(error.failure.category, .gitFailed)
+    }
     XCTAssertFalse(processExists(parentPID))
     XCTAssertFalse(processExists(childPID))
   }
@@ -532,6 +617,29 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     let result = Darwin.kill(pid, 0)
     return result == 0 || errno == EPERM
   }
+
+  private func assertNoCredentialRepresentations(_ token: String, under root: URL) throws {
+    let data = Data(token.utf8)
+    let representations = [
+      token,
+      data.base64EncodedString(),
+      data.map { String(format: "%02x", $0) }.joined(),
+      "Bearer \(token)",
+      "Basic \(Data("x-access-token:\(token)".utf8).base64EncodedString())",
+    ]
+    guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil)
+    else { return }
+    for case let url as URL in enumerator {
+      guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey]),
+        values.isRegularFile == true,
+        let contents = try? Data(contentsOf: url),
+        let text = String(data: contents, encoding: .utf8)
+      else { continue }
+      for representation in representations {
+        XCTAssertFalse(text.contains(representation), "Credential representation persisted at \(url.path)")
+      }
+    }
+  }
 }
 
 private enum FinalTrustMutation: CaseIterable, Equatable {
@@ -546,6 +654,28 @@ private final class CredentialRequestCounter: @unchecked Sendable {
   private var count = 0
   func increment() { lock.withLock { count += 1 } }
   var value: Int { lock.withLock { count } }
+}
+
+private final class FailOnceGitProcessGroupController: @unchecked Sendable {
+  private let lock = NSLock()
+  private var signalsAllowed = false
+
+  var controller: GitProcessGroupController {
+    GitProcessGroupController(
+      exists: { processID in
+        let result = Darwin.kill(-processID, 0)
+        return result == 0 || errno == EPERM
+      },
+      signal: { [weak self] processID, signal in
+        guard let self, self.lock.withLock({ self.signalsAllowed }) else { return }
+        if Darwin.kill(-processID, signal) != 0 { _ = Darwin.kill(processID, signal) }
+      }
+    )
+  }
+
+  func allowSignals() {
+    lock.withLock { signalsAllowed = true }
+  }
 }
 
 private final class CloneCleanupReplacement: @unchecked Sendable {
