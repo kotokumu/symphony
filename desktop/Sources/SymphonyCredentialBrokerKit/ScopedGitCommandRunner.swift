@@ -556,13 +556,13 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       return GitExecutionAuthority(
         descriptor: descriptor,
         writeRoot: plan.targetURL.deletingLastPathComponent(),
-        arguments: ["clone", "--", plan.repositoryURL.absoluteString, "."]
+        arguments: ["clone", "--", plan.repositoryURL.absoluteString, "/dev/fd/4"]
       )
     case .fetch:
       return try existingRepositoryAuthority(
         plan,
         arguments: [
-          "fetch", "--prune", "--", plan.repositoryURL.absoluteString,
+          "-C", "/dev/fd/4", "fetch", "--prune", "--", plan.repositoryURL.absoluteString,
           "+refs/heads/*:refs/remotes/origin/*",
         ]
       )
@@ -570,7 +570,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       return try existingRepositoryAuthority(
         plan,
         arguments: [
-          "push", "--porcelain", "--", plan.repositoryURL.absoluteString,
+          "-C", "/dev/fd/4", "push", "--porcelain", "--", plan.repositoryURL.absoluteString,
           "HEAD:refs/heads/\(branch)",
         ]
       )
@@ -643,6 +643,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       (subpath (param "WRITE_ROOT_REAL"))
       (subpath (param "TEMP_ROOT"))
       (subpath (param "TEMP_ROOT_REAL"))
+      (subpath "/dev/fd/4")
       (literal "/dev/null"))
     (allow network* (socket-domain AF_UNIX))
     (allow network-outbound (remote tcp "localhost:\(proxyPort)"))
