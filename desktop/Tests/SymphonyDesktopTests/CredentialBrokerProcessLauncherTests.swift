@@ -466,7 +466,7 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
     let launcher = CredentialBrokerProcessLauncher(
       executableURL: script,
       handshakeTimeout: 60,
-      capabilityTimeout: 0.2,
+      capabilityTimeout: 2,
       stopTimeout: 0.1,
       environment: [
         "PATH": "/usr/bin:/bin",
@@ -517,7 +517,7 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
     let launcher = CredentialBrokerProcessLauncher(
       executableURL: script,
       handshakeTimeout: 60,
-      capabilityTimeout: 0.2,
+      capabilityTimeout: 2,
       stopTimeout: 0.1,
       environment: [
         "PATH": "/usr/bin:/bin",
