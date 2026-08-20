@@ -5,6 +5,8 @@ struct ContentView: View {
   @ObservedObject var controller: NamespaceController
   @ObservedObject var daemonController: NamespaceDaemonController
   @ObservedObject var authenticationController: CodexAuthenticationController
+  @ObservedObject var lockController: NamespaceLockController
+  @ObservedObject var windowSecurityCoordinator: NamespaceWindowSecurityCoordinator
 
   @State private var editor: NamespaceEditorContext?
   @State private var namespaceToDelete: DesktopNamespace?
@@ -36,10 +38,7 @@ struct ContentView: View {
       await authenticationController.refresh(namespaceID)
     }
     .onDisappear {
-      Task {
-        try? await authenticationController.cancelAll()
-        try? await daemonController.stopAll()
-      }
+      windowSecurityCoordinator.secureAfterWindowCloses()
     }
     .sheet(item: $editor) { context in
       NamespaceEditorSheet(context: context) { name in
@@ -79,6 +78,34 @@ struct ContentView: View {
         dismissButton: .default(Text("OK"))
       )
     }
+    .safeAreaInset(edge: .top) {
+      windowSecurityBanner
+    }
+  }
+
+  @ViewBuilder
+  private var windowSecurityBanner: some View {
+    switch windowSecurityCoordinator.state {
+    case .idle:
+      EmptyView()
+    case .securing:
+      HStack {
+        ProgressView()
+        Text("Securing namespace credentials…")
+      }
+      .padding(8)
+    case .failed(let message):
+      HStack {
+        Text("Window security cleanup failed: \(message)")
+          .lineLimit(2)
+        Spacer()
+        Button("Retry") {
+          windowSecurityCoordinator.retry()
+        }
+      }
+      .padding(8)
+      .background(.red.opacity(0.12))
+    }
   }
 
   private var namespaceBrowser: some View {
@@ -115,6 +142,7 @@ struct ContentView: View {
           namespace: namespace,
           daemonState: daemonController.state(for: namespace.id),
           authenticationState: authenticationController.state(for: namespace.id),
+          lockState: lockController.state(for: namespace.id),
           start: {
             Task {
               await daemonController.start(namespace)
@@ -144,6 +172,18 @@ struct ContentView: View {
               await authenticationController.signOut(namespace.id)
             }
           },
+          unlock: {
+            Task {
+              await lockController.unlock(namespace.id)
+            }
+          },
+          lock: {
+            Task {
+              await reportErrors {
+                try await lockController.lock(namespace.id)
+              }
+            }
+          },
           rename: { editor = .rename(namespace) },
           delete: { namespaceToDelete = namespace }
         )
@@ -154,7 +194,7 @@ struct ContentView: View {
       }
     }
     .frame(minWidth: 760, minHeight: 520)
-    .disabled(controller.isChanging)
+    .disabled(controller.isChanging || windowSecurityCoordinator.state == .securing)
   }
 
   private var selectedNamespaceID: Binding<DesktopNamespace.ID?> {
@@ -267,11 +307,14 @@ private struct NamespaceDetailView: View {
   let namespace: DesktopNamespace
   let daemonState: NamespaceDaemonState
   let authenticationState: CodexAuthenticationState
+  let lockState: NamespaceLockState
   let start: () -> Void
   let stop: () -> Void
   let restart: () -> Void
   let signIn: () -> Void
   let signOut: () -> Void
+  let unlock: () -> Void
+  let lock: () -> Void
   let rename: () -> Void
   let delete: () -> Void
 
@@ -292,6 +335,13 @@ private struct NamespaceDetailView: View {
       Divider()
         .frame(maxWidth: 440)
 
+      credentialLockStatus
+
+      credentialLockControls
+
+      Divider()
+        .frame(maxWidth: 440)
+
       authenticationStatus
 
       authenticationControls
@@ -302,6 +352,62 @@ private struct NamespaceDetailView: View {
       }
     }
     .padding(48)
+  }
+
+  @ViewBuilder
+  private var credentialLockStatus: some View {
+    let presentation = CredentialLockPresentation(state: lockState)
+    if presentation.showsProgress {
+      VStack(spacing: 6) {
+        HStack(spacing: 8) {
+          ProgressView()
+            .controlSize(.small)
+          Text(presentation.status)
+        }
+        if let detail = presentation.detail {
+          Text(detail)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: 440)
+        }
+      }
+      .foregroundStyle(.secondary)
+    } else if let systemImage = presentation.systemImage {
+      VStack(spacing: 6) {
+        Label(presentation.status, systemImage: systemImage)
+          .foregroundStyle(credentialLockStatusColor(presentation.tone))
+        if let detail = presentation.detail {
+          Text(detail)
+            .foregroundStyle(.secondary)
+            .multilineTextAlignment(.center)
+            .frame(maxWidth: 440)
+        }
+      }
+    }
+  }
+
+  @ViewBuilder
+  private var credentialLockControls: some View {
+    switch CredentialLockPresentation(state: lockState).action {
+    case .none:
+      EmptyView()
+    case .unlock(let title):
+      Button(title, action: unlock)
+        .buttonStyle(.borderedProminent)
+    case .lock(let title):
+      Button(title, action: lock)
+    }
+  }
+
+  private func credentialLockStatusColor(_ tone: CredentialLockPresentation.Tone) -> Color {
+    switch tone {
+    case .secondary:
+      .secondary
+    case .success:
+      .green
+    case .error:
+      .red
+    }
   }
 
   @ViewBuilder

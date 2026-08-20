@@ -87,3 +87,29 @@ Signing in or out changes only the selected namespace. Authentication remains as
 namespace's stable identity across application restarts and namespace renames. The same isolated
 authentication boundary is used when that namespace's Symphony daemon starts Codex. Authentication
 operations stop before the namespace's local data is deleted or the application terminates.
+
+---
+
+## 7. Protected Credentials and Namespace Locking
+
+Each namespace starts locked when Symphony launches. Unlocking a namespace requires macOS device
+owner authentication, including Touch ID when it is available. Denying or cancelling the request
+leaves the namespace locked and allows the user to retry. Unlocking or locking one namespace does
+not change the lock state of another namespace.
+
+Long-lived namespace credentials are stored through macOS protected credential storage. They are
+not written to Symphony application files, logs, command-line arguments, or environment variables.
+Only a broker session started by the trusted desktop application can unlock stored credential
+material. The broker exposes operations for a credential's purpose and returns only their results,
+not the stored value, to Symphony. Its daemons and Codex cannot start an authorized broker session
+or read stored credentials directly.
+
+A namespace can be locked manually. Its protected credential access is also cleared when its daemon
+stops or fails, before the Mac acknowledges sleep, when the namespace is deleted, when the main
+window closes, and before the application terminates. If protected credential access cannot be
+cleared safely before deletion or application termination, Symphony reports the failure and does
+not continue the destructive lifecycle operation. If system sleep protection cannot be established,
+Symphony reports the failure and does not allow protected credentials to be unlocked. A failed
+window-close cleanup remains visible and can be retried when the window is shown again. Stored
+credential deletion occurs only after the namespace deletion commits. A failed stored-credential
+cleanup is reported and retried without restoring the deleted namespace.

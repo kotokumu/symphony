@@ -1,0 +1,238 @@
+import Foundation
+import CryptoKit
+import LocalAuthentication
+import XCTest
+
+@testable import SymphonyCredentialBrokerKit
+
+final class NamespaceCredentialSessionTests: XCTestCase {
+  func testFirstUnlockAuthorizesStoresAndRetainsCredentialUntilLock() async throws {
+    let namespaceID = UUID()
+    let storage = RecordingCredentialStorage()
+    let authorizer = RecordingUnlockAuthorizer()
+    let session = NamespaceCredentialSession(
+      namespaceID: namespaceID,
+      authorizer: authorizer,
+      storage: storage,
+      credentialGenerator: { SecureSecretBuffer(copying: Data([1, 2, 3, 4])) }
+    )
+
+    try await session.unlock(reason: "Test unlock")
+
+    XCTAssertEqual(storage.storedCredential(for: namespaceID), Data([1, 2, 3, 4]))
+    let retainedByteCount = await session.retainedByteCount
+    let reasons = await authorizer.reasons
+    XCTAssertEqual(retainedByteCount, 4)
+    XCTAssertEqual(reasons, ["Test unlock"])
+
+    await session.lock()
+
+    let lockedByteCount = await session.retainedByteCount
+    XCTAssertEqual(lockedByteCount, 0)
+  }
+
+  func testLaterUnlockLoadsPersistedCredentialWithoutGeneratingReplacement() async throws {
+    let namespaceID = UUID()
+    let storage = RecordingCredentialStorage(
+      credentials: [namespaceID: Data([9, 8, 7])]
+    )
+    let generator = InvocationCounter()
+    let session = NamespaceCredentialSession(
+      namespaceID: namespaceID,
+      authorizer: RecordingUnlockAuthorizer(),
+      storage: storage,
+      credentialGenerator: {
+        generator.increment()
+        return SecureSecretBuffer(copying: Data([1]))
+      }
+    )
+
+    try await session.unlock(reason: "Test unlock")
+
+    let retainedByteCount = await session.retainedByteCount
+    XCTAssertEqual(retainedByteCount, 3)
+    XCTAssertEqual(generator.value, 0)
+  }
+
+  func testAuthorizationDenialDoesNotAccessStorageOrRetainMaterial() async {
+    let namespaceID = UUID()
+    let storage = RecordingCredentialStorage()
+    let session = NamespaceCredentialSession(
+      namespaceID: namespaceID,
+      authorizer: RecordingUnlockAuthorizer(error: TestUnlockError.denied),
+      storage: storage,
+      credentialGenerator: { SecureSecretBuffer(copying: Data([1, 2, 3])) }
+    )
+
+    do {
+      try await session.unlock(reason: "Test unlock")
+      XCTFail("Expected authorization to fail")
+    } catch {
+      XCTAssertEqual(error.localizedDescription, "Test unlock denied.")
+    }
+
+    XCTAssertEqual(storage.loadCount, 0)
+    XCTAssertEqual(storage.storeCount, 0)
+    let retainedByteCount = await session.retainedByteCount
+    XCTAssertEqual(retainedByteCount, 0)
+  }
+
+  func testRemovingNamespaceClearsMemoryAndDeletesStoredCredential() async throws {
+    let namespaceID = UUID()
+    let storage = RecordingCredentialStorage(
+      credentials: [namespaceID: Data([4, 5, 6])]
+    )
+    let session = NamespaceCredentialSession(
+      namespaceID: namespaceID,
+      authorizer: RecordingUnlockAuthorizer(),
+      storage: storage
+    )
+    try await session.unlock(reason: "Test unlock")
+
+    try await session.removeStoredCredential()
+
+    let retainedByteCount = await session.retainedByteCount
+    XCTAssertEqual(retainedByteCount, 0)
+    XCTAssertNil(storage.storedCredential(for: namespaceID))
+  }
+
+  func testSigningChallengeReturnsOnlyDerivedCapabilityResult() async throws {
+    let namespaceID = UUID()
+    let storedCredential = Data([1, 2, 3, 4])
+    let session = NamespaceCredentialSession(
+      namespaceID: namespaceID,
+      authorizer: RecordingUnlockAuthorizer(),
+      storage: RecordingCredentialStorage(credentials: [namespaceID: storedCredential])
+    )
+    try await session.unlock(reason: "Test unlock")
+    let challenge = Data("challenge".utf8)
+
+    let signature = try await session.signChallenge(challenge)
+
+    let expected = Data(
+      HMAC<SHA256>.authenticationCode(
+        for: challenge,
+        using: SymmetricKey(data: storedCredential)
+      )
+    )
+    XCTAssertEqual(signature, expected)
+    XCTAssertNotEqual(signature, storedCredential)
+
+    await session.lock()
+    do {
+      _ = try await session.signChallenge(challenge)
+      XCTFail("Expected locked capability error")
+    } catch {
+      XCTAssertEqual(error.localizedDescription, "Protected namespace credentials are locked.")
+    }
+  }
+
+  func testSecureBufferOverwritesItsAllocationWhenCleared() {
+    let buffer = SecureSecretBuffer(copying: Data([7, 8, 9]))
+
+    buffer.clear()
+
+    XCTAssertEqual(buffer.bytesForTesting, [0, 0, 0])
+  }
+
+  func testStorageFailureOverwritesGeneratedMaterialBeforeReturning() async {
+    let namespaceID = UUID()
+    let generated = SecureSecretBuffer(copying: Data([5, 6, 7]))
+    let session = NamespaceCredentialSession(
+      namespaceID: namespaceID,
+      authorizer: RecordingUnlockAuthorizer(),
+      storage: RecordingCredentialStorage(storeError: TestCredentialStorageError.failed),
+      credentialGenerator: { generated }
+    )
+
+    do {
+      try await session.unlock(reason: "Test unlock")
+      XCTFail("Expected storage failure")
+    } catch {}
+
+    XCTAssertEqual(generated.bytesForTesting, [0, 0, 0])
+  }
+}
+
+private actor RecordingUnlockAuthorizer: NamespaceUnlockAuthorizing {
+  private(set) var reasons: [String] = []
+  private let error: Error?
+
+  init(error: Error? = nil) {
+    self.error = error
+  }
+
+  func authorize(reason: String) async throws -> NamespaceUnlockAuthorization {
+    reasons.append(reason)
+    if let error { throw error }
+    let authorization = NamespaceUnlockAuthorization(context: LAContext())
+    return authorization
+  }
+}
+
+private final class RecordingCredentialStorage: NamespaceCredentialStoring, @unchecked Sendable {
+  private let lock = NSLock()
+  private var credentials: [UUID: Data]
+  private var loadInvocations = 0
+  private var storeInvocations = 0
+  private let storeError: Error?
+
+  init(credentials: [UUID: Data] = [:], storeError: Error? = nil) {
+    self.credentials = credentials
+    self.storeError = storeError
+  }
+
+  func load(
+    namespaceID: UUID,
+    authorization: NamespaceUnlockAuthorization
+  ) throws -> Data? {
+    lock.withLock {
+      loadInvocations += 1
+      return credentials[namespaceID]
+    }
+  }
+
+  func store(
+    _ credential: Data,
+    namespaceID: UUID,
+    authorization: NamespaceUnlockAuthorization
+  ) throws {
+    lock.withLock {
+      storeInvocations += 1
+      if let storeError { return }
+      credentials[namespaceID] = credential
+    }
+    if let storeError { throw storeError }
+  }
+
+  func removeAll(namespaceID: UUID) throws {
+    _ = lock.withLock {
+      credentials.removeValue(forKey: namespaceID)
+    }
+  }
+
+  func storedCredential(for namespaceID: UUID) -> Data? {
+    lock.withLock { credentials[namespaceID] }
+  }
+
+  var loadCount: Int { lock.withLock { loadInvocations } }
+  var storeCount: Int { lock.withLock { storeInvocations } }
+}
+
+private final class InvocationCounter: @unchecked Sendable {
+  private let lock = NSLock()
+  private var count = 0
+
+  func increment() { lock.withLock { count += 1 } }
+  var value: Int { lock.withLock { count } }
+}
+
+private enum TestUnlockError: LocalizedError {
+  case denied
+
+  var errorDescription: String? { "Test unlock denied." }
+}
+
+private enum TestCredentialStorageError: Error {
+  case failed
+}

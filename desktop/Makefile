@@ -15,4 +15,8 @@ test: check-xcode
 	swift test
 
 run: check-xcode
-	swift run SymphonyDesktop
+	@test -n "$(SYMPHONY_CODE_SIGN_IDENTITY)" || { \
+		echo "error: set SYMPHONY_CODE_SIGN_IDENTITY to an Apple Development signing identity" >&2; \
+		exit 1; \
+	}
+	./scripts/run-signed-dev-app.sh "$(SYMPHONY_CODE_SIGN_IDENTITY)"

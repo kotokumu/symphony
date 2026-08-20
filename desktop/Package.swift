@@ -8,22 +8,48 @@ let package = Package(
     .macOS(.v13)
   ],
   products: [
-    .executable(name: "SymphonyDesktop", targets: ["SymphonyDesktop"])
+    .executable(name: "SymphonyDesktop", targets: ["SymphonyDesktop"]),
+    .executable(name: "SymphonyCredentialBroker", targets: ["SymphonyCredentialBroker"]),
+    .executable(
+      name: "SymphonyCredentialStoreSmoke",
+      targets: ["SymphonyCredentialStoreSmoke"]
+    ),
   ],
   targets: [
     .target(name: "SymphonyDesktopCore"),
+    .target(name: "SymphonyCredentialBrokerProtocol"),
+    .target(
+      name: "SymphonyCredentialBrokerKit",
+      dependencies: ["SymphonyCredentialBrokerProtocol"],
+      linkerSettings: [
+        .linkedFramework("CryptoKit"),
+        .linkedFramework("LocalAuthentication"),
+        .linkedFramework("Security"),
+      ]
+    ),
+    .executableTarget(
+      name: "SymphonyCredentialBroker",
+      dependencies: ["SymphonyCredentialBrokerKit", "SymphonyCredentialBrokerProtocol"]
+    ),
+    .executableTarget(
+      name: "SymphonyCredentialStoreSmoke",
+      dependencies: ["SymphonyCredentialBrokerKit"]
+    ),
     .target(
       name: "SymphonyDesktopInfrastructure",
-      dependencies: ["SymphonyDesktopCore"]
+      dependencies: ["SymphonyDesktopCore", "SymphonyCredentialBrokerProtocol"]
     ),
     .executableTarget(
       name: "SymphonyDesktop",
-      dependencies: ["SymphonyDesktopCore", "SymphonyDesktopInfrastructure"]
+      dependencies: ["SymphonyDesktopCore", "SymphonyDesktopInfrastructure"],
+      linkerSettings: [.linkedFramework("IOKit")]
     ),
     .testTarget(
       name: "SymphonyDesktopTests",
       dependencies: [
         "SymphonyDesktop",
+        "SymphonyCredentialBrokerKit",
+        "SymphonyCredentialBrokerProtocol",
         "SymphonyDesktopCore",
         "SymphonyDesktopInfrastructure",
       ]

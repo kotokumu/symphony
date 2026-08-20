@@ -73,6 +73,65 @@ final class NamespaceDaemonControllerTests: XCTestCase {
     XCTAssertEqual(operations, [.stop(namespace.id), .start(namespace.id, directory)])
   }
 
+  func testStoppingDaemonLocksTheMatchingNamespaceAfterProcessExit() async throws {
+    let namespace = try makeNamespace(named: "Research")
+    let supervisor = TestDaemonSupervisor()
+    let operations = DaemonLifecycleRecorder()
+    let controller = NamespaceDaemonController(
+      supervisor: supervisor,
+      directoryURL: { _ in URL(fileURLWithPath: "/namespaces/research") },
+      afterStop: { namespaceID in
+        operations.append(.locked(namespaceID))
+      }
+    )
+
+    try await controller.stop(namespace.id)
+
+    let supervisorOperations = await supervisor.operations
+    XCTAssertEqual(operations.values, [.locked(namespace.id)])
+    XCTAssertEqual(supervisorOperations, [.stop(namespace.id)])
+  }
+
+  func testUnexpectedDaemonFailureLocksOnlyTheAffectedNamespace() async throws {
+    let first = try makeNamespace(named: "Research")
+    let second = try makeNamespace(named: "Operations")
+    let supervisor = TestDaemonSupervisor()
+    let operations = DaemonLifecycleRecorder()
+    let controller = NamespaceDaemonController(
+      supervisor: supervisor,
+      directoryURL: { id in URL(fileURLWithPath: "/namespaces/\(id.uuidString)") },
+      afterStop: { namespaceID in
+        operations.append(.locked(namespaceID))
+      }
+    )
+    await controller.startObserving()
+
+    await supervisor.emit(
+      .init(namespaceID: first.id, state: .failed(message: "Daemon exited."))
+    )
+
+    await eventually {
+      operations.values == [.locked(first.id)]
+    }
+    XCTAssertFalse(operations.values.contains(.locked(second.id)))
+  }
+
+  func testStoppingAllDaemonsLocksAllNamespaceCredentials() async throws {
+    let supervisor = TestDaemonSupervisor()
+    let operations = DaemonLifecycleRecorder()
+    let controller = NamespaceDaemonController(
+      supervisor: supervisor,
+      directoryURL: { id in URL(fileURLWithPath: "/namespaces/\(id.uuidString)") },
+      afterStopAll: {
+        operations.append(.lockedAll)
+      }
+    )
+
+    try await controller.stopAll()
+
+    XCTAssertEqual(operations.values, [.lockedAll])
+  }
+
   func testConcurrentObservationRequestsCreateOneSubscription() async {
     let supervisor = TestDaemonSupervisor(suspendEventSubscription: true)
     let controller = NamespaceDaemonController(
@@ -119,6 +178,24 @@ final class NamespaceDaemonControllerTests: XCTestCase {
       try? await Task.sleep(for: .milliseconds(10))
     }
     XCTFail("Condition was not satisfied", file: file, line: line)
+  }
+}
+
+private final class DaemonLifecycleRecorder: @unchecked Sendable {
+  enum Operation: Equatable {
+    case locked(UUID)
+    case lockedAll
+  }
+
+  private let lock = NSLock()
+  private var storage: [Operation] = []
+
+  func append(_ operation: Operation) {
+    lock.withLock { storage.append(operation) }
+  }
+
+  var values: [Operation] {
+    lock.withLock { storage }
   }
 }
 

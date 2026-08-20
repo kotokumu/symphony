@@ -15,15 +15,21 @@ final class NamespaceDaemonController: ObservableObject {
 
   private let supervisor: any NamespaceDaemonSupervising
   private let directoryURL: @Sendable (Namespace.ID) -> URL
+  private let afterStop: @Sendable (Namespace.ID) async throws -> Void
+  private let afterStopAll: @Sendable () async throws -> Void
   private var eventStreamTask: Task<AsyncStream<NamespaceDaemonEvent>, Never>?
   private var observationTask: Task<Void, Never>?
 
   init(
     supervisor: any NamespaceDaemonSupervising,
-    directoryURL: @escaping @Sendable (Namespace.ID) -> URL
+    directoryURL: @escaping @Sendable (Namespace.ID) -> URL,
+    afterStop: @escaping @Sendable (Namespace.ID) async throws -> Void = { _ in },
+    afterStopAll: @escaping @Sendable () async throws -> Void = {}
   ) {
     self.supervisor = supervisor
     self.directoryURL = directoryURL
+    self.afterStop = afterStop
+    self.afterStopAll = afterStopAll
   }
 
   deinit {
@@ -53,6 +59,9 @@ final class NamespaceDaemonController: ObservableObject {
           return
         }
         self?.states[event.namespaceID] = event.state
+        if case .failed = event.state {
+          try? await self?.afterStop(event.namespaceID)
+        }
       }
     }
   }
@@ -71,6 +80,7 @@ final class NamespaceDaemonController: ObservableObject {
 
   func stop(_ namespaceID: Namespace.ID) async throws {
     try await supervisor.stop(namespaceID: namespaceID)
+    try await afterStop(namespaceID)
   }
 
   func restart(_ namespace: DesktopNamespace) async throws {
@@ -80,5 +90,6 @@ final class NamespaceDaemonController: ObservableObject {
 
   func stopAll() async throws {
     try await supervisor.stopAll()
+    try await afterStopAll()
   }
 }

@@ -11,6 +11,9 @@ struct SymphonyDesktopApp: App {
   @StateObject private var controller: NamespaceController
   @StateObject private var daemonController: NamespaceDaemonController
   @StateObject private var authenticationController: CodexAuthenticationController
+  @StateObject private var lockController: NamespaceLockController
+  @StateObject private var sleepLockCoordinator: NamespaceSleepLockCoordinator
+  @StateObject private var windowSecurityCoordinator: NamespaceWindowSecurityCoordinator
 
   init() {
     let command = SymphonyExecutableLocator().locate()
@@ -24,28 +27,66 @@ struct SymphonyDesktopApp: App {
     let authenticationManager = CodexAuthenticationManager(
       executor: CodexCLICommandExecutor(executableURL: codexExecutableURL)
     )
+    let credentialBroker = NamespaceCredentialBroker(
+      launcher: CredentialBrokerProcessLauncher(
+        executableURL: CredentialBrokerExecutableLocator().locate()
+      )
+    )
+    let namespaceLockController = NamespaceLockController(
+      broker: credentialBroker,
+      sleepProtectionAvailable: false
+    )
+    let namespaceSleepLockCoordinator = NamespaceSleepLockCoordinator {
+      try await namespaceLockController.lockAll()
+    }
+    _lockController = StateObject(wrappedValue: namespaceLockController)
+    _sleepLockCoordinator = StateObject(wrappedValue: namespaceSleepLockCoordinator)
+    let namespaceWindowSecurityCoordinator: NamespaceWindowSecurityCoordinator
     do {
       let repository = try FileNamespaceRepository()
+      let credentialCleanupCoordinator = NamespaceCredentialCleanupCoordinator(
+        store: try PendingCredentialCleanupStore(),
+        purge: { id in
+          try await namespaceLockController.removeNamespace(id)
+        }
+      )
       let codexAuthenticationController = CodexAuthenticationController(
         authenticator: authenticationManager,
         directoryURL: { id in
           repository.directoryURL(for: id)
         }
       )
-      _daemonController = StateObject(
-        wrappedValue: NamespaceDaemonController(
-          supervisor: supervisor,
-          directoryURL: { id in
-            repository.directoryURL(for: id)
-          }
-        )
+      let namespaceDaemonController = NamespaceDaemonController(
+        supervisor: supervisor,
+        directoryURL: { id in
+          repository.directoryURL(for: id)
+        },
+        afterStop: { id in
+          try await namespaceLockController.lock(id)
+        },
+        afterStopAll: {
+          try await namespaceLockController.lockAll()
+        }
       )
+      _daemonController = StateObject(wrappedValue: namespaceDaemonController)
       _controller = StateObject(
         wrappedValue: NamespaceController(
           repository: repository,
+          afterLoad: { catalog in
+            try await credentialCleanupCoordinator.reconcile(
+              existingNamespaceIDs: Set(catalog.namespaces.map(\.id))
+            )
+          },
           beforeDelete: { id in
             try await supervisor.stop(namespaceID: id)
             try await authenticationManager.quiesce(namespaceID: id)
+            do {
+              try await namespaceLockController.lock(id)
+              try await credentialCleanupCoordinator.stageDeletion(id)
+            } catch {
+              await authenticationManager.resume(namespaceID: id)
+              throw error
+            }
           },
           afterDelete: { id, succeeded in
             if succeeded {
@@ -53,11 +94,28 @@ struct SymphonyDesktopApp: App {
             } else {
               await authenticationManager.resume(namespaceID: id)
             }
+          },
+          cleanupAfterDelete: { id, succeeded in
+            await credentialCleanupCoordinator.finishDeletion(id, committed: succeeded)
           }
         )
       )
       _authenticationController = StateObject(
         wrappedValue: codexAuthenticationController
+      )
+      namespaceWindowSecurityCoordinator = NamespaceWindowSecurityCoordinator(
+        lockCredentials: {
+          try await namespaceLockController.lockAll()
+        },
+        cancelAuthentication: {
+          try await codexAuthenticationController.cancelAll()
+        },
+        stopDaemons: {
+          try await namespaceDaemonController.stopAll()
+        }
+      )
+      _windowSecurityCoordinator = StateObject(
+        wrappedValue: namespaceWindowSecurityCoordinator
       )
     } catch {
       let repository = UnavailableNamespaceRepository(message: error.localizedDescription)
@@ -67,28 +125,71 @@ struct SymphonyDesktopApp: App {
           FileManager.default.temporaryDirectory.appendingPathComponent(id.uuidString)
         }
       )
-      _daemonController = StateObject(
-        wrappedValue: NamespaceDaemonController(
-          supervisor: supervisor,
-          directoryURL: { id in
-            FileManager.default.temporaryDirectory.appendingPathComponent(id.uuidString)
-          }
-        )
+      let namespaceDaemonController = NamespaceDaemonController(
+        supervisor: supervisor,
+        directoryURL: { id in
+          FileManager.default.temporaryDirectory.appendingPathComponent(id.uuidString)
+        },
+        afterStop: { id in
+          try await namespaceLockController.lock(id)
+        },
+        afterStopAll: {
+          try await namespaceLockController.lockAll()
+        }
       )
+      _daemonController = StateObject(wrappedValue: namespaceDaemonController)
       _controller = StateObject(wrappedValue: NamespaceController(repository: repository))
       _authenticationController = StateObject(
         wrappedValue: codexAuthenticationController
       )
+      namespaceWindowSecurityCoordinator = NamespaceWindowSecurityCoordinator(
+        lockCredentials: {
+          try await namespaceLockController.lockAll()
+        },
+        cancelAuthentication: {
+          try await codexAuthenticationController.cancelAll()
+        },
+        stopDaemons: {
+          try await namespaceDaemonController.stopAll()
+        }
+      )
+      _windowSecurityCoordinator = StateObject(
+        wrappedValue: namespaceWindowSecurityCoordinator
+      )
     }
 
-    applicationDelegate.configure {
-      try await authenticationManager.shutdownForApplicationTermination()
-      do {
-        try await supervisor.shutdownForApplicationTermination()
-      } catch {
-        await authenticationManager.resumeAfterApplicationTerminationFailure()
-        throw error
+    applicationDelegate.configure(
+      startSleepProtection: {
+        do {
+          try namespaceSleepLockCoordinator.start()
+          namespaceLockController.setSleepProtectionAvailable(true)
+        } catch {
+          namespaceLockController.setSleepProtectionAvailable(false)
+          throw error
+        }
       }
+    ) {
+      try await ApplicationSecurityShutdownCoordinator(
+        windowSecurity: namespaceWindowSecurityCoordinator,
+        lockCredentials: {
+          try await namespaceLockController.shutdownForApplicationTermination()
+        },
+        shutdownAuthentication: {
+          try await authenticationManager.shutdownForApplicationTermination()
+        },
+        shutdownDaemons: {
+          try await supervisor.shutdownForApplicationTermination()
+        },
+        stopSleepProtection: {
+          namespaceSleepLockCoordinator.stop()
+        },
+        resumeAuthentication: {
+          await authenticationManager.resumeAfterApplicationTerminationFailure()
+        },
+        resumeCredentials: {
+          await namespaceLockController.resumeAfterApplicationTerminationFailure()
+        }
+      ).shutdown()
     }
   }
 
@@ -97,7 +198,9 @@ struct SymphonyDesktopApp: App {
       ContentView(
         controller: controller,
         daemonController: daemonController,
-        authenticationController: authenticationController
+        authenticationController: authenticationController,
+        lockController: lockController,
+        windowSecurityCoordinator: windowSecurityCoordinator
       )
     }
     .defaultSize(width: 760, height: 520)
@@ -106,6 +209,7 @@ struct SymphonyDesktopApp: App {
 
 extension NamespaceDaemonSupervisor: NamespaceDaemonSupervising {}
 extension CodexAuthenticationManager: CodexAuthenticating {}
+extension NamespaceCredentialBroker: NamespaceCredentialBrokering {}
 
 private actor UnavailableNamespaceRepository: NamespaceRepository {
   let message: String
