@@ -308,7 +308,7 @@ private final class RecordingCredentialStorage: NamespaceCredentialStoring, @unc
   ) throws {
     lock.withLock {
       storeInvocations += 1
-      if let storeError { return }
+      if storeError != nil { return }
       credentials[namespaceID] = credential
     }
     if let storeError { throw storeError }

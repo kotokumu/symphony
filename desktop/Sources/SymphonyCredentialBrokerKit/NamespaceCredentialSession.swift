@@ -105,7 +105,7 @@ public actor NamespaceCredentialSession {
       throw GitHubAppCredentialError.invalidPrivateKey
     }
 
-    var pemData = try Data(contentsOf: fileURL, options: [.mappedIfSafe])
+    var pemData = try Data(contentsOf: fileURL)
     defer { pemData.resetBytes(in: pemData.startIndex..<pemData.endIndex) }
     var githubCredential = try StoredGitHubAppCredential(appID: appID, pemData: pemData)
     defer { githubCredential.clear() }
