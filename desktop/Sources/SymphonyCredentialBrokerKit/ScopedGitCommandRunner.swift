@@ -640,9 +640,8 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       (subpath (param "TEMP_ROOT"))
       (subpath (param "TEMP_ROOT_REAL"))
       (literal "/dev/null"))
-    (allow network-outbound
-      (remote tcp "localhost:\(proxyPort)")
-      (socket-domain AF_UNIX))
+    (allow network* (socket-domain AF_UNIX))
+    (allow network-outbound (remote tcp "localhost:\(proxyPort)"))
     (allow sysctl-read)
     (allow iokit-open (iokit-registry-entry-class "RootDomainUserClient"))
     (allow ipc-posix-sem)

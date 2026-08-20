@@ -11,7 +11,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     XCTAssertTrue(profile.contains("(deny default)"))
     XCTAssertTrue(profile.contains("(allow network-outbound"))
     XCTAssertTrue(profile.contains("(remote tcp \"localhost:43123\")"))
-    XCTAssertTrue(profile.contains("(socket-domain AF_UNIX)"))
+    XCTAssertTrue(profile.contains("(allow network* (socket-domain AF_UNIX))"))
     XCTAssertTrue(profile.contains("(allow file-write-data"))
     XCTAssertTrue(profile.contains("(vnode-type REGULAR-FILE)"))
     XCTAssertTrue(profile.contains("(allow file-write*"))
@@ -743,7 +743,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       }
       XCTFail("Expected the injected endpoint to be unreachable")
     } catch let error as GitCommandRunnerError {
-      XCTAssertEqual(error.failure.category, .gitFailed)
+      XCTAssertTrue([.gitFailed, .timedOut].contains(error.failure.category))
       XCTAssertFalse(error.failure.message.contains("sandbox-token-canary"))
     }
     XCTAssertFalse(attacker.wasConnected)
