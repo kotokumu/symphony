@@ -418,6 +418,51 @@ final class NamespaceGitHubAccessSessionTests: XCTestCase {
     XCTAssertEqual(requests.filter { $0.httpMethod == "POST" && $0.url?.path.hasSuffix("/comments") == true }.count, 1)
   }
 
+  func testRefreshedMutationPreflight401RejectsAppCredentialWithoutDispatch() async throws {
+    let root = try makeDirectory()
+    let transport = AccessSequenceTransport(responses: [
+      .json(status: 201, body: #"{"token":"first","expires_at":"2030-01-01T00:00:00Z"}"#),
+      .json(status: 401, body: "{}"),
+      .json(status: 201, body: #"{"token":"second","expires_at":"2030-01-01T00:00:00Z"}"#),
+      .json(status: 401, body: "{}"),
+    ])
+    let client = GitHubAppAPIClient(
+      baseURL: URL(string: "https://api.github.test")!,
+      transport: transport
+    )
+    let session = NamespaceGitHubAccessSession(api: client)
+    try await session.authorize(makeAuthorization(root: root), storedAppID: 10)
+
+    do {
+      _ = try await session.performIssueRequest(
+        .createComment(issueNumber: 7, body: "must-not-dispatch"),
+        jwt: "jwt"
+      )
+      XCTFail("Expected refreshed preflight authentication rejection")
+    } catch let error as GitHubRepositoryAPIError {
+      XCTAssertEqual(error.failure.category, .appCredentialRejected)
+      XCTAssertFalse(error.failure.effectMayHaveOccurred)
+    }
+    let requests = await transport.requests
+    XCTAssertEqual(
+      requests.map { [$0.httpMethod ?? "", $0.url?.path ?? ""] },
+      [
+        ["POST", "/app/installations/20/access_tokens"],
+        ["GET", "/repos/octo/repo/issues/7"],
+        ["POST", "/app/installations/20/access_tokens"],
+        ["GET", "/repos/octo/repo/issues/7"],
+      ]
+    )
+    XCTAssertEqual(
+      requests.filter {
+        $0.httpMethod == "POST" && $0.url?.path == "/repos/octo/repo/issues/7/comments"
+      }.count,
+      0
+    )
+    XCTAssertEqual(requests[1].value(forHTTPHeaderField: "Authorization"), "Bearer first")
+    XCTAssertEqual(requests[3].value(forHTTPHeaderField: "Authorization"), "Bearer second")
+  }
+
   func testSecondAttemptDispatchedFailuresRemainAmbiguous() async throws {
     for (category, expected) in [
       (

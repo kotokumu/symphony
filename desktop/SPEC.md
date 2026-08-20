@@ -152,13 +152,14 @@ repository over HTTPS. Fetch and push reject repositories outside the namespace 
 repositories whose origin does not match the selected repository, unsafe Git configuration, and
 unsupported push destinations. Git receives its short-lived credential through an operation-scoped
 credential helper over an inherited socket capability that is unavailable to unrelated processes.
-Repository URLs and configuration remain credential-free. Fetch and push run against a broker-built
-effective Git directory, so the network process never reloads the repository's mutable local
-configuration after validation. Clone writes to a broker-named staging directory and publishes the
-workspace name atomically only after Git succeeds. A failed clone atomically detaches its staging
-directory under a broker-owned descriptor and clears only exclusively linked entries whose recorded
-filesystem identity still matches; otherwise Symphony preserves the replacement and reports that
-cleanup is required before access can resume.
+Repository URLs and configuration remain credential-free. The broker passes Git a verified
+filesystem authority instead of asking it to reopen a workspace path. A macOS process sandbox limits
+filesystem writes to that authority and outbound network access to a broker-owned localhost tunnel
+that accepts only GitHub connections. Clone writes to a broker-named staging directory and publishes
+the workspace name atomically only after Git succeeds. A failed clone atomically detaches its staging
+directory under a broker-owned descriptor. Cleanup unlinks a verified entry before clearing its contents and
+refuses to clear an inode that remains linked elsewhere. Symphony preserves any replacement and
+reports that cleanup is required before access can resume.
 
 Locking protected credentials stops active GitHub and Git access, cancels queued access, clears
 short-lived credentials, and prevents replacement access until owned processes have exited. A stop

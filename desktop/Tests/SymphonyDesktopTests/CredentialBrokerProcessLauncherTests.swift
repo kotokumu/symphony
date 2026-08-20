@@ -552,7 +552,17 @@ final class CredentialBrokerProcessLauncherTests: XCTestCase {
     do {
       _ = try await capability.value
       XCTFail("Expected the interrupted capability to fail")
-    } catch {}
+    } catch is CancellationError {
+    } catch let error as CredentialBrokerProcessError {
+      switch error {
+      case .invalidCapabilityResponse, .capabilityUnavailable:
+        break
+      default:
+        XCTFail("Unexpected interrupted-capability error: \(error)")
+      }
+    } catch {
+      XCTFail("Unexpected interrupted-capability error: \(error)")
+    }
   }
 
   func testCancelledQueuedCapabilityIsNeverSentBeforeLock() async throws {

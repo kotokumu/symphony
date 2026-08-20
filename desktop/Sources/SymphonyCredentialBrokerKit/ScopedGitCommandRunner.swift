@@ -50,10 +50,12 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
   private struct RetainedRuntime {
     let process: GitProcessReference
     let server: PrivateGitCredentialServer
+    let proxy: GitHubConnectProxy?
     let credential: OperationCredential
     let temporaryDirectory: URL
     let plan: ValidatedGitOperationPlan
     let cloneTarget: CloneTargetHandle?
+    let authority: GitExecutionAuthority
     let scope: AuthorizedGitHubRepositoryScope
   }
 
@@ -67,14 +69,18 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
   private let policy: GitRepositoryTrustPolicy
   private let gitExecutableURL: URL
   private let brokerExecutableURL: URL
+  private let sandboxExecutableURL: URL
   private let operationTimeout: TimeInterval
   private let stopTimeout: TimeInterval
   private let wrapsGitInBrokerExecutable: Bool
   private let beforeLaunch: @Sendable () async -> Void
   private let beforeCloneCleanup: @Sendable () -> Void
   private let beforeCloneTargetOpen: @Sendable (Int32, String) -> Void
-  private let afterEffectiveConfigurationPrepared: @Sendable (URL?) -> Void
+  private let afterExecutionAuthorityPrepared: @Sendable (URL) -> Void
   private let beforeNestedCloneCleanup: @Sendable (Int32, String) -> Void
+  private let beforeClonePublish: @Sendable (Int32, String) -> Void
+  private let afterClonePublish: @Sendable (Int32, String) -> Void
+  private let beforeDestructiveCloneCleanup: @Sendable (Int32, String) -> Void
   private let afterProcessGroupEstablished: @Sendable (Int32) -> Void
   private let processGroupController: GitProcessGroupController
   private let lock = NSLock()
@@ -88,28 +94,36 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     policy: GitRepositoryTrustPolicy = GitRepositoryTrustPolicy(),
     gitExecutableURL: URL = URL(fileURLWithPath: "/usr/bin/git"),
     brokerExecutableURL: URL = URL(fileURLWithPath: CommandLine.arguments[0]),
+    sandboxExecutableURL: URL = URL(fileURLWithPath: "/usr/bin/sandbox-exec"),
     operationTimeout: TimeInterval = 300,
-    stopTimeout: TimeInterval = 0.75,
+    stopTimeout: TimeInterval = 0.4,
     wrapsGitInBrokerExecutable: Bool = true,
     beforeLaunch: @escaping @Sendable () async -> Void = {},
     beforeCloneCleanup: @escaping @Sendable () -> Void = {},
     beforeCloneTargetOpen: @escaping @Sendable (Int32, String) -> Void = { _, _ in },
-    afterEffectiveConfigurationPrepared: @escaping @Sendable (URL?) -> Void = { _ in },
+    afterExecutionAuthorityPrepared: @escaping @Sendable (URL) -> Void = { _ in },
     beforeNestedCloneCleanup: @escaping @Sendable (Int32, String) -> Void = { _, _ in },
+    beforeClonePublish: @escaping @Sendable (Int32, String) -> Void = { _, _ in },
+    afterClonePublish: @escaping @Sendable (Int32, String) -> Void = { _, _ in },
+    beforeDestructiveCloneCleanup: @escaping @Sendable (Int32, String) -> Void = { _, _ in },
     afterProcessGroupEstablished: @escaping @Sendable (Int32) -> Void = { _ in },
     processGroupController: GitProcessGroupController = .system
   ) {
     self.policy = policy
     self.gitExecutableURL = gitExecutableURL
     self.brokerExecutableURL = brokerExecutableURL
+    self.sandboxExecutableURL = sandboxExecutableURL
     self.operationTimeout = operationTimeout
     self.stopTimeout = stopTimeout
     self.wrapsGitInBrokerExecutable = wrapsGitInBrokerExecutable
     self.beforeLaunch = beforeLaunch
     self.beforeCloneCleanup = beforeCloneCleanup
     self.beforeCloneTargetOpen = beforeCloneTargetOpen
-    self.afterEffectiveConfigurationPrepared = afterEffectiveConfigurationPrepared
+    self.afterExecutionAuthorityPrepared = afterExecutionAuthorityPrepared
     self.beforeNestedCloneCleanup = beforeNestedCloneCleanup
+    self.beforeClonePublish = beforeClonePublish
+    self.afterClonePublish = afterClonePublish
+    self.beforeDestructiveCloneCleanup = beforeDestructiveCloneCleanup
     self.afterProcessGroupEstablished = afterProcessGroupEstablished
     self.processGroupController = processGroupController
   }
@@ -136,6 +150,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       }
     }
     let plan = try policy.validate(request, in: scope)
+    try requireNoOrphanedCloneResidue(in: scope.workspacesRoot)
     try requireAdmission()
     let isolated: (environment: [String: String], temporaryDirectory: URL)
     do {
@@ -204,10 +219,10 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       throw error
     }
     guard let credential = acquiredCredential else { throw GitCommandRunnerError.launchFailed }
-    let effectiveGitDirectory: URL?
+    let authority: GitExecutionAuthority
     do {
-      effectiveGitDirectory = try prepareEffectiveGitDirectory(plan, in: isolated.temporaryDirectory)
-      afterEffectiveConfigurationPrepared(effectiveGitDirectory)
+      authority = try prepareExecutionAuthority(plan, cloneTarget: cloneTarget)
+      afterExecutionAuthorityPrepared(authority.writeRoot)
       try requireAdmission()
       if let cloneTarget {
         try policy.revalidate(
@@ -244,20 +259,46 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       throw error
     }
     let serverTask = Task.detached { server.serve() }
+    let proxy: GitHubConnectProxy?
+    do {
+      proxy = wrapsGitInBrokerExecutable ? try GitHubConnectProxy() : nil
+    } catch {
+      server.stop()
+      _ = await serverTask.value
+      credential.clear()
+      try cleanupPreparedCloneOrRetain(
+        plan,
+        target: cloneTarget,
+        scope: scope,
+        temporaryDirectory: isolated.temporaryDirectory
+      )
+      removeIsolatedDirectory(isolated.temporaryDirectory)
+      throw GitCommandRunnerError.launchFailed
+    }
     let process = Process()
     let output = Pipe()
     let arguments = gitArguments(
-      operationArguments(plan, cloneTarget: cloneTarget, effectiveGitDirectory: effectiveGitDirectory),
-      repositoryURL: scope.repositoryURL
+      wrapsGitInBrokerExecutable
+        ? authority.arguments
+        : unsandboxedOperationArguments(plan, cloneTarget: cloneTarget),
+      repositoryURL: scope.repositoryURL,
+      proxyPort: proxy?.port
     )
-    process.executableURL = wrapsGitInBrokerExecutable ? brokerExecutableURL : gitExecutableURL
+    process.executableURL = wrapsGitInBrokerExecutable ? sandboxExecutableURL : gitExecutableURL
     process.arguments = wrapsGitInBrokerExecutable
-      ? ["git-runner", gitExecutableURL.path] + arguments
+      ? sandboxArguments(
+        authority: authority,
+        temporaryDirectory: isolated.temporaryDirectory,
+        proxyPort: proxy!.port
+      )
+        + [brokerExecutableURL.path, "git-runner", gitExecutableURL.path] + arguments
       : arguments
     process.environment = isolated.environment
     process.standardInput = server.clientHandle
     process.standardOutput = output
-    process.standardError = output
+    process.standardError = wrapsGitInBrokerExecutable
+      ? FileHandle(fileDescriptor: authority.descriptor, closeOnDealloc: false)
+      : output
     var launchedProcessID: Int32?
     var ownsProcessGroup = false
     do {
@@ -278,6 +319,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       server.closeClientCopy()
     } catch {
       if let launchedProcessID { _ = Darwin.kill(launchedProcessID, SIGKILL) }
+      proxy?.stop()
       server.stop()
       _ = await serverTask.value
       credential.clear()
@@ -298,10 +340,12 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     let ownedRuntime = RetainedRuntime(
       process: processReference,
       server: server,
+      proxy: proxy,
       credential: credential,
       temporaryDirectory: isolated.temporaryDirectory,
       plan: plan,
       cloneTarget: cloneTarget,
+      authority: authority,
       scope: scope
     )
     let stopAfterLaunch = lock.withLock { () -> Bool in
@@ -342,6 +386,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
         throw GitCommandRunnerError.cleanupRequired
       }
     }
+    proxy?.stop()
     server.stop()
     _ = await serverTask.value
     output.fileHandleForReading.closeFile()
@@ -386,34 +431,42 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
   }
 
   func stopRetainedOperation() async throws {
+    let shutdownDeadline = ContinuousClock.now.advanced(by: .milliseconds(1_800))
     let runtime = lock.withLock { () -> RetainedRuntime? in
       stopRequested = true
       return retained ?? active
     }
     if let runtime {
       try await stop(runtime.process)
+      runtime.proxy?.stop()
       runtime.server.stop()
     }
-    let deadline = ContinuousClock.now.advanced(by: .seconds(5))
-    while lock.withLock({ operationInProgress }), ContinuousClock.now < deadline {
+    while lock.withLock({ operationInProgress }), ContinuousClock.now < shutdownDeadline {
       try? await Task.sleep(for: .milliseconds(20))
     }
     guard !lock.withLock({ operationInProgress }) else {
       throw GitCommandRunnerError.cleanupRequired
     }
     if let pending = lock.withLock({ pendingCloneCleanup }) {
-      try cleanupFailedClone(pending.plan, target: pending.target, scope: pending.scope)
+      try cleanupFailedClone(
+        pending.plan,
+        target: pending.target,
+        scope: pending.scope,
+        deadline: shutdownDeadline
+      )
       removeIsolatedDirectory(pending.temporaryDirectory)
       lock.withLock { pendingCloneCleanup = nil }
     }
     if let retained = lock.withLock({ self.retained }) {
       guard !retained.process.groupExists else { throw GitCommandRunnerError.cleanupRequired }
       retained.server.stop()
+      retained.proxy?.stop()
       retained.credential.clear()
       try cleanupFailedClone(
         retained.plan,
         target: retained.cloneTarget,
-        scope: retained.scope
+        scope: retained.scope,
+        deadline: shutdownDeadline
       )
       removeIsolatedDirectory(retained.temporaryDirectory)
     }
@@ -434,20 +487,25 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     return false
   }
 
-  private func gitArguments(_ operationArguments: [String], repositoryURL: URL) -> [String] {
+  private func gitArguments(
+    _ operationArguments: [String],
+    repositoryURL: URL,
+    proxyPort: UInt16?
+  ) -> [String] {
     let helper = shellQuote(brokerExecutableURL.path)
     let repositoryHTTPKey = "http.\(repositoryURL.absoluteString)"
+    let proxy = proxyPort.map { "http://127.0.0.1:\($0)" } ?? ""
     return [
       "-c", "credential.helper=",
       "-c", "credential.helper=!\(helper) git-credential",
       "-c", "credential.useHttpPath=true",
       "-c", "http.followRedirects=false",
-      "-c", "http.proxy=",
+      "-c", "http.proxy=\(proxy)",
       "-c", "http.sslVerify=true",
       "-c", "http.extraHeader=",
       "-c", "http.cookieFile=",
       "-c", "http.saveCookies=false",
-      "-c", "\(repositoryHTTPKey).proxy=",
+      "-c", "\(repositoryHTTPKey).proxy=\(proxy)",
       "-c", "\(repositoryHTTPKey).sslVerify=true",
       "-c", "\(repositoryHTTPKey).extraHeader=",
       "-c", "\(repositoryHTTPKey).cookieFile=",
@@ -457,10 +515,9 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     ] + operationArguments
   }
 
-  private func operationArguments(
+  private func unsandboxedOperationArguments(
     _ plan: ValidatedGitOperationPlan,
-    cloneTarget: CloneTargetHandle?,
-    effectiveGitDirectory: URL?
+    cloneTarget: CloneTargetHandle?
   ) -> [String] {
     switch plan.request {
     case .clone:
@@ -468,73 +525,106 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       let stagingURL = plan.targetURL.deletingLastPathComponent()
         .appendingPathComponent(cloneTarget.currentEntryName, isDirectory: true)
       return ["clone", "--", plan.repositoryURL.absoluteString, stagingURL.path]
-    case .fetch:
-      guard let effectiveGitDirectory else { return plan.arguments }
-      return [
-        "--git-dir=\(effectiveGitDirectory.path)",
-        "--work-tree=\(plan.targetURL.path)",
-        "fetch", "--prune", "--", plan.repositoryURL.absoluteString,
-        "+refs/heads/*:refs/remotes/origin/*",
-      ]
-    case .push(_, let branch):
-      guard let effectiveGitDirectory else { return plan.arguments }
-      return [
-        "--git-dir=\(effectiveGitDirectory.path)",
-        "--work-tree=\(plan.targetURL.path)",
-        "push", "--porcelain", "--", plan.repositoryURL.absoluteString,
-        "HEAD:refs/heads/\(branch)",
-      ]
+    case .fetch, .push:
+      return plan.arguments
     }
   }
 
-  private func prepareEffectiveGitDirectory(
+  private func prepareExecutionAuthority(
     _ plan: ValidatedGitOperationPlan,
-    in temporaryDirectory: URL
-  ) throws -> URL? {
-    if case .clone = plan.request { return nil }
-    let source = plan.targetURL.appendingPathComponent(".git", isDirectory: true)
-    let effective = temporaryDirectory.appendingPathComponent("effective.git", isDirectory: true)
-    try FileManager.default.createDirectory(at: effective, withIntermediateDirectories: false)
-    guard chmod(effective.path, S_IRWXU) == 0 else { throw GitCommandRunnerError.launchFailed }
-    let safeConfiguration = Data(
-      """
-      [core]
-        repositoryformatversion = 0
-        bare = false
-      """.utf8
-    )
-    let effectiveConfiguration = effective.appendingPathComponent("config")
-    try safeConfiguration.write(to: effectiveConfiguration, options: .atomic)
-    guard chmod(effectiveConfiguration.path, S_IRUSR) == 0,
-      chflags(effectiveConfiguration.path, UInt32(UF_IMMUTABLE)) == 0
-    else { throw GitCommandRunnerError.launchFailed }
-    for directoryName in ["objects", "refs"] {
-      let sourceURL = source.appendingPathComponent(directoryName, isDirectory: true)
-      let destinationURL = effective.appendingPathComponent(directoryName, isDirectory: true)
-      if FileManager.default.fileExists(atPath: sourceURL.path) {
-        try FileManager.default.createSymbolicLink(at: destinationURL, withDestinationURL: sourceURL)
-      } else {
-        try FileManager.default.createDirectory(at: destinationURL, withIntermediateDirectories: false)
-      }
-    }
-    for fileName in ["HEAD", "packed-refs", "shallow"] {
-      let sourceURL = source.appendingPathComponent(fileName)
-      guard FileManager.default.fileExists(atPath: sourceURL.path) else { continue }
-      var information = stat()
-      guard lstat(sourceURL.path, &information) == 0,
-        information.st_mode & S_IFMT == S_IFREG,
-        information.st_size >= 0,
-        information.st_size <= 8 * 1_024 * 1_024
-      else { throw GitCommandRunnerError.launchFailed }
-      try Data(contentsOf: sourceURL).write(
-        to: effective.appendingPathComponent(fileName),
-        options: .atomic
+    cloneTarget: CloneTargetHandle?
+  ) throws -> GitExecutionAuthority {
+    switch plan.request {
+    case .clone:
+      guard let cloneTarget else { throw GitCommandRunnerError.launchFailed }
+      let descriptor = dup(cloneTarget.targetDescriptor)
+      guard descriptor >= 0 else { throw GitCommandRunnerError.launchFailed }
+      return GitExecutionAuthority(
+        descriptor: descriptor,
+        writeRoot: plan.targetURL.deletingLastPathComponent()
+          .appendingPathComponent(cloneTarget.currentEntryName, isDirectory: true),
+        arguments: ["clone", "--", plan.repositoryURL.absoluteString, "."]
+      )
+    case .fetch:
+      return try existingRepositoryAuthority(
+        plan,
+        arguments: [
+          "fetch", "--prune", "--", plan.repositoryURL.absoluteString,
+          "+refs/heads/*:refs/remotes/origin/*",
+        ]
+      )
+    case .push(_, let branch):
+      return try existingRepositoryAuthority(
+        plan,
+        arguments: [
+          "push", "--porcelain", "--", plan.repositoryURL.absoluteString,
+          "HEAD:refs/heads/\(branch)",
+        ]
       )
     }
-    if !FileManager.default.fileExists(atPath: effective.appendingPathComponent("HEAD").path) {
-      try Data("ref: refs/heads/main\n".utf8).write(to: effective.appendingPathComponent("HEAD"))
+  }
+
+  private func existingRepositoryAuthority(
+    _ plan: ValidatedGitOperationPlan,
+    arguments: [String]
+  ) throws -> GitExecutionAuthority {
+    guard let targetIdentity = plan.targetIdentity, let metadataIdentity = plan.metadataIdentity else {
+      throw GitCommandRunnerError.launchFailed
     }
-    return effective
+    let descriptor = open(plan.targetURL.path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+    guard descriptor >= 0 else { throw GitCommandRunnerError.launchFailed }
+    var target = stat()
+    guard fstat(descriptor, &target) == 0,
+      FileIdentity(device: UInt64(target.st_dev), inode: UInt64(target.st_ino)) == targetIdentity
+    else {
+      close(descriptor)
+      throw GitRepositoryTrustError.filesystemChanged
+    }
+    let metadataDescriptor = openat(
+      descriptor,
+      ".git",
+      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+    )
+    var metadata = stat()
+    guard metadataDescriptor >= 0, fstat(metadataDescriptor, &metadata) == 0,
+      FileIdentity(device: UInt64(metadata.st_dev), inode: UInt64(metadata.st_ino)) == metadataIdentity
+    else {
+      if metadataDescriptor >= 0 { close(metadataDescriptor) }
+      close(descriptor)
+      throw GitRepositoryTrustError.filesystemChanged
+    }
+    close(metadataDescriptor)
+    return GitExecutionAuthority(
+      descriptor: descriptor,
+      writeRoot: plan.targetURL.appendingPathComponent(".git", isDirectory: true),
+      arguments: arguments
+    )
+  }
+
+  private func sandboxArguments(
+    authority: GitExecutionAuthority,
+    temporaryDirectory: URL,
+    proxyPort: UInt16
+  ) -> [String] {
+    [
+      "-D", "WRITE_ROOT=\(authority.writeRoot.path)",
+      "-D", "TEMP_ROOT=\(temporaryDirectory.path)",
+      "-p", Self.sandboxProfile(proxyPort: proxyPort),
+    ]
+  }
+
+  static func sandboxProfile(proxyPort: UInt16) -> String {
+    """
+    (version 1)
+    (allow default)
+    (deny network-outbound)
+    (allow network-outbound (remote tcp "localhost:\(proxyPort)"))
+    (deny file-write*)
+    (allow file-write*
+      (subpath (param "WRITE_ROOT"))
+      (subpath (param "TEMP_ROOT"))
+      (literal "/dev/null"))
+    """
   }
 
   private func waitForProcessGroup(_ processID: Int32) -> Bool {
@@ -564,15 +654,12 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       "GIT_CONFIG_GLOBAL": "/dev/null",
       "GIT_TERMINAL_PROMPT": "0",
       "GIT_ASKPASS": "/usr/bin/false",
-      "NO_PROXY": "*",
-      "no_proxy": "*",
+      "NO_PROXY": "",
+      "no_proxy": "",
     ], directory)
   }
 
   private func removeIsolatedDirectory(_ directory: URL) {
-    let configuration = directory.appendingPathComponent("effective.git/config")
-    _ = chflags(configuration.path, 0)
-    _ = chmod(configuration.path, S_IRUSR | S_IWUSR)
     try? FileManager.default.removeItem(at: directory)
   }
 
@@ -602,6 +689,16 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     guard !lock.withLock({ stopRequested }) else { throw CancellationError() }
   }
 
+  private func requireNoOrphanedCloneResidue(in root: URL) throws {
+    let names = try FileManager.default.contentsOfDirectory(atPath: root.path)
+    guard names.count <= 100_000,
+      !names.contains(where: {
+        $0.hasPrefix(".symphony-clone-") || $0.hasPrefix(".symphony-failed-clone-")
+          || $0.hasPrefix(".symphony-cleared-")
+      })
+    else { throw GitCommandRunnerError.cleanupRequired }
+  }
+
   private func prepareCloneTarget(_ plan: ValidatedGitOperationPlan) throws -> CloneTargetHandle? {
     guard case .clone = plan.request else { return nil }
     let parentDescriptor = open(
@@ -621,10 +718,16 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       close(parentDescriptor)
       throw GitCommandRunnerError.launchFailed
     }
+    let targetDescriptor = openat(
+      parentDescriptor,
+      name,
+      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+    )
     var created = stat()
-    guard fstatat(parentDescriptor, name, &created, AT_SYMLINK_NOFOLLOW) == 0,
+    guard targetDescriptor >= 0, fstat(targetDescriptor, &created) == 0,
       created.st_mode & S_IFMT == S_IFDIR
     else {
+      if targetDescriptor >= 0 { close(targetDescriptor) }
       _ = unlinkat(parentDescriptor, name, AT_REMOVEDIR)
       close(parentDescriptor)
       throw GitCommandRunnerError.cleanupRequired
@@ -634,22 +737,15 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       inode: UInt64(created.st_ino)
     )
     beforeCloneTargetOpen(parentDescriptor, name)
-    let targetDescriptor = openat(
-      parentDescriptor,
-      name,
-      O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
-    )
-    var information = stat()
-    guard targetDescriptor >= 0, fstat(targetDescriptor, &information) == 0,
-      information.st_mode & S_IFMT == S_IFDIR,
-      FileIdentity(device: UInt64(information.st_dev), inode: UInt64(information.st_ino))
-        == createdIdentity
+    var atPath = stat()
+    guard fstatat(parentDescriptor, name, &atPath, AT_SYMLINK_NOFOLLOW) == 0,
+      atPath.st_mode & S_IFMT == S_IFDIR,
+      FileIdentity(device: UInt64(atPath.st_dev), inode: UInt64(atPath.st_ino)) == createdIdentity
     else {
-      if targetDescriptor >= 0 { close(targetDescriptor) }
       throw CloneTargetPreparationError.replaced(
         CloneTargetHandle(
           parentDescriptor: parentDescriptor,
-          targetDescriptor: -1,
+          targetDescriptor: targetDescriptor,
           name: name,
           identity: createdIdentity
         )
@@ -682,6 +778,16 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
         AT_SYMLINK_NOFOLLOW
       ) == 0,
       staged.st_mode & S_IFMT == S_IFDIR,
+      FileIdentity(device: UInt64(staged.st_dev), inode: UInt64(staged.st_ino)) == target.identity
+    else { throw GitCommandRunnerError.cleanupRequired }
+    beforeClonePublish(target.parentDescriptor, target.currentEntryName)
+    guard fstatat(
+      target.parentDescriptor,
+      target.currentEntryName,
+      &staged,
+      AT_SYMLINK_NOFOLLOW
+    ) == 0,
+      staged.st_mode & S_IFMT == S_IFDIR,
       FileIdentity(device: UInt64(staged.st_dev), inode: UInt64(staged.st_ino)) == target.identity,
       renameatx_np(
         target.parentDescriptor,
@@ -692,14 +798,27 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       ) == 0
     else { throw GitCommandRunnerError.cleanupRequired }
     target.recordMove(to: plan.targetURL.lastPathComponent)
+    afterClonePublish(target.parentDescriptor, target.currentEntryName)
+    guard fstatat(
+      target.parentDescriptor,
+      target.currentEntryName,
+      &staged,
+      AT_SYMLINK_NOFOLLOW
+    ) == 0,
+      staged.st_mode & S_IFMT == S_IFDIR,
+      FileIdentity(device: UInt64(staged.st_dev), inode: UInt64(staged.st_ino)) == target.identity
+    else { throw GitCommandRunnerError.cleanupRequired }
   }
 
   private func cleanupFailedClone(
     _ plan: ValidatedGitOperationPlan,
     target: CloneTargetHandle?,
-    scope: AuthorizedGitHubRepositoryScope
+    scope: AuthorizedGitHubRepositoryScope,
+    deadline suppliedDeadline: ContinuousClock.Instant? = nil
   ) throws {
     guard case .clone = plan.request, let target else { return }
+    let deadline = suppliedDeadline ?? ContinuousClock.now.advanced(by: .seconds(1))
+    try requireCleanupDeadline(deadline)
     let entryName = target.currentEntryName
     var root = stat()
     var targetAtPath = stat()
@@ -711,6 +830,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       plan.targetURL.deletingLastPathComponent().standardizedFileURL == scope.workspacesRoot
     else { throw GitCommandRunnerError.cleanupRequired }
     beforeCloneCleanup()
+    try requireCleanupDeadline(deadline)
     let quarantineName = ".symphony-failed-clone-\(UUID().uuidString)"
     guard renameatx_np(
       target.parentDescriptor,
@@ -753,8 +873,20 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     defer {
       if target.targetDescriptor < 0 { close(openedForCleanup) }
     }
-    try removeDirectoryContents(openedForCleanup)
-    guard unlinkat(target.parentDescriptor, quarantineName, AT_REMOVEDIR) == 0 else {
+    try removeDirectoryContents(openedForCleanup, deadline: deadline)
+    try requireCleanupDeadline(deadline)
+    beforeDestructiveCloneCleanup(target.parentDescriptor, quarantineName)
+    var current = stat()
+    guard fstatat(
+      target.parentDescriptor,
+      quarantineName,
+      &current,
+      AT_SYMLINK_NOFOLLOW
+    ) == 0,
+      current.st_mode & S_IFMT == S_IFDIR,
+      FileIdentity(device: UInt64(current.st_dev), inode: UInt64(current.st_ino)) == target.identity,
+      unlinkat(target.parentDescriptor, quarantineName, AT_REMOVEDIR) == 0
+    else {
       throw GitCommandRunnerError.cleanupRequired
     }
   }
@@ -781,7 +913,11 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     }
   }
 
-  private func removeDirectoryContents(_ descriptor: Int32) throws {
+  private func removeDirectoryContents(
+    _ descriptor: Int32,
+    deadline: ContinuousClock.Instant
+  ) throws {
+    try requireCleanupDeadline(deadline)
     let enumerationDescriptor = dup(descriptor)
     guard enumerationDescriptor >= 0, let directory = fdopendir(enumerationDescriptor) else {
       if enumerationDescriptor >= 0 { close(enumerationDescriptor) }
@@ -799,6 +935,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     }
     closedir(directory)
     for name in names {
+      try requireCleanupDeadline(deadline)
       var information = stat()
       guard fstatat(descriptor, name, &information, AT_SYMLINK_NOFOLLOW) == 0 else {
         throw GitCommandRunnerError.cleanupRequired
@@ -842,38 +979,283 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
           throw GitCommandRunnerError.cleanupRequired
         }
         do {
-          try removeDirectoryContents(child)
+          try removeDirectoryContents(child, deadline: deadline)
           close(child)
         } catch {
           close(child)
           throw error
         }
-        guard unlinkat(descriptor, quarantinedName, AT_REMOVEDIR) == 0 else {
+        beforeDestructiveCloneCleanup(descriptor, quarantinedName)
+        var current = stat()
+        guard fstatat(descriptor, quarantinedName, &current, AT_SYMLINK_NOFOLLOW) == 0,
+          current.st_mode & S_IFMT == S_IFDIR,
+          FileIdentity(device: UInt64(current.st_dev), inode: UInt64(current.st_ino))
+            == FileIdentity(device: UInt64(information.st_dev), inode: UInt64(information.st_ino)),
+          unlinkat(descriptor, quarantinedName, AT_REMOVEDIR) == 0
+        else {
           throw GitCommandRunnerError.cleanupRequired
         }
       } else if information.st_mode & S_IFMT == S_IFREG {
-        guard information.st_nlink == 1 else { throw GitCommandRunnerError.cleanupRequired }
         let file = openat(descriptor, quarantinedName, O_WRONLY | O_NOFOLLOW | O_CLOEXEC)
         guard file >= 0 else { throw GitCommandRunnerError.cleanupRequired }
         var opened = stat()
         let matched = fstat(file, &opened) == 0
           && FileIdentity(device: UInt64(opened.st_dev), inode: UInt64(opened.st_ino))
             == FileIdentity(device: UInt64(information.st_dev), inode: UInt64(information.st_ino))
-        let cleared = matched && ftruncate(file, 0) == 0
+        beforeDestructiveCloneCleanup(descriptor, quarantinedName)
+        var current = stat()
+        let stillCurrent = fstatat(
+          descriptor,
+          quarantinedName,
+          &current,
+          AT_SYMLINK_NOFOLLOW
+        ) == 0
+          && current.st_mode & S_IFMT == S_IFREG
+          && FileIdentity(device: UInt64(current.st_dev), inode: UInt64(current.st_ino))
+            == FileIdentity(device: UInt64(opened.st_dev), inode: UInt64(opened.st_ino))
+        let unlinked = matched && stillCurrent && unlinkat(descriptor, quarantinedName, 0) == 0
+        var detached = stat()
+        let cleared = unlinked && fstat(file, &detached) == 0 && detached.st_nlink == 0
+          && ftruncate(file, 0) == 0
         close(file)
-        guard cleared else {
-          throw GitCommandRunnerError.cleanupRequired
-        }
-        guard unlinkat(descriptor, quarantinedName, 0) == 0 else {
-          throw GitCommandRunnerError.cleanupRequired
-        }
+        guard cleared else { throw GitCommandRunnerError.cleanupRequired }
       } else if information.st_mode & S_IFMT == S_IFLNK {
-        guard unlinkat(descriptor, quarantinedName, 0) == 0 else {
+        beforeDestructiveCloneCleanup(descriptor, quarantinedName)
+        var current = stat()
+        guard fstatat(descriptor, quarantinedName, &current, AT_SYMLINK_NOFOLLOW) == 0,
+          current.st_mode & S_IFMT == S_IFLNK,
+          FileIdentity(device: UInt64(current.st_dev), inode: UInt64(current.st_ino))
+            == FileIdentity(device: UInt64(information.st_dev), inode: UInt64(information.st_ino)),
+          unlinkat(descriptor, quarantinedName, 0) == 0
+        else {
           throw GitCommandRunnerError.cleanupRequired
         }
       } else {
         throw GitCommandRunnerError.cleanupRequired
       }
+    }
+  }
+
+  private func requireCleanupDeadline(_ deadline: ContinuousClock.Instant) throws {
+    guard ContinuousClock.now < deadline else { throw GitCommandRunnerError.cleanupRequired }
+  }
+}
+
+private final class GitExecutionAuthority: @unchecked Sendable {
+  let descriptor: Int32
+  let writeRoot: URL
+  let arguments: [String]
+
+  init(descriptor: Int32, writeRoot: URL, arguments: [String]) {
+    self.descriptor = descriptor
+    self.writeRoot = writeRoot
+    self.arguments = arguments
+  }
+
+  deinit { Darwin.close(descriptor) }
+}
+
+final class GitHubConnectProxy: @unchecked Sendable {
+  let port: UInt16
+  private let listener: Int32
+  private let lock = NSLock()
+  private var stopped = false
+  private var connections: Set<Int32> = []
+
+  init() throws {
+    let descriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+    guard descriptor >= 0 else { throw GitCommandRunnerError.launchFailed }
+    var noSignal: Int32 = 1
+    guard setsockopt(
+      descriptor,
+      SOL_SOCKET,
+      SO_NOSIGPIPE,
+      &noSignal,
+      socklen_t(MemoryLayout<Int32>.size)
+    ) == 0 else {
+      Darwin.close(descriptor)
+      throw GitCommandRunnerError.launchFailed
+    }
+    var address = sockaddr_in()
+    address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    address.sin_family = sa_family_t(AF_INET)
+    address.sin_port = in_port_t(0)
+    address.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
+    let bound = withUnsafePointer(to: &address) { pointer in
+      pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        Darwin.bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+      }
+    }
+    guard bound == 0, Darwin.listen(descriptor, 4) == 0 else {
+      Darwin.close(descriptor)
+      throw GitCommandRunnerError.launchFailed
+    }
+    var actual = sockaddr_in()
+    var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+    let named = withUnsafeMutablePointer(to: &actual) { pointer in
+      pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+        Darwin.getsockname(descriptor, $0, &length)
+      }
+    }
+    guard named == 0 else {
+      Darwin.close(descriptor)
+      throw GitCommandRunnerError.launchFailed
+    }
+    listener = descriptor
+    port = UInt16(bigEndian: actual.sin_port)
+    DispatchQueue.global(qos: .userInitiated).async { [self] in acceptLoop() }
+  }
+
+  deinit { stop() }
+
+  func stop() {
+    let openConnections = lock.withLock { () -> [Int32] in
+      guard !stopped else { return [] }
+      stopped = true
+      Darwin.shutdown(listener, SHUT_RDWR)
+      Darwin.close(listener)
+      return Array(connections)
+    }
+    for descriptor in openConnections { Darwin.shutdown(descriptor, SHUT_RDWR) }
+  }
+
+  private func acceptLoop() {
+    while !lock.withLock({ stopped }) {
+      var address = sockaddr_storage()
+      var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
+      let client = withUnsafeMutablePointer(to: &address) { pointer in
+        pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+          Darwin.accept(listener, $0, &length)
+        }
+      }
+      if client < 0 {
+        if lock.withLock({ stopped }) { return }
+        continue
+      }
+      lock.withLock { connections.insert(client) }
+      DispatchQueue.global(qos: .userInitiated).async { [self] in
+        handle(client)
+        lock.withLock { connections.remove(client) }
+        Darwin.close(client)
+      }
+    }
+  }
+
+  private func handle(_ client: Int32) {
+    guard let header = readConnectHeader(from: client),
+      let firstLine = String(data: header, encoding: .utf8)?.components(separatedBy: "\r\n").first,
+      firstLine == "CONNECT github.com:443 HTTP/1.1" || firstLine == "CONNECT github.com:443 HTTP/1.0",
+      let upstream = connectToGitHub()
+    else {
+      _ = sendAll(Data("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n".utf8), to: client)
+      return
+    }
+    lock.withLock { connections.insert(upstream) }
+    defer {
+      lock.withLock { connections.remove(upstream) }
+      Darwin.shutdown(upstream, SHUT_RDWR)
+      Darwin.close(upstream)
+    }
+    guard sendAll(Data("HTTP/1.1 200 Connection Established\r\n\r\n".utf8), to: client) else {
+      return
+    }
+    relay(client, upstream)
+  }
+
+  private func readConnectHeader(from descriptor: Int32) -> Data? {
+    let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+    var data = Data()
+    while data.count < 8_192, ContinuousClock.now < deadline {
+      var polled = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
+      let remaining = ContinuousClock.now.duration(to: deadline)
+      let milliseconds = max(1, min(250, Int(remaining.components.seconds * 1_000)))
+      guard Darwin.poll(&polled, 1, Int32(milliseconds)) >= 0 else { return nil }
+      if polled.revents & Int16(POLLIN) == 0 { continue }
+      var buffer = [UInt8](repeating: 0, count: 1_024)
+      let count = Darwin.recv(descriptor, &buffer, buffer.count, 0)
+      guard count > 0 else { return nil }
+      data.append(contentsOf: buffer.prefix(count))
+      if data.range(of: Data("\r\n\r\n".utf8)) != nil { return data }
+    }
+    return nil
+  }
+
+  private func connectToGitHub() -> Int32? {
+    var hints = addrinfo(
+      ai_flags: 0,
+      ai_family: AF_UNSPEC,
+      ai_socktype: SOCK_STREAM,
+      ai_protocol: IPPROTO_TCP,
+      ai_addrlen: 0,
+      ai_canonname: nil,
+      ai_addr: nil,
+      ai_next: nil
+    )
+    var result: UnsafeMutablePointer<addrinfo>?
+    guard getaddrinfo("github.com", "443", &hints, &result) == 0, let first = result else {
+      return nil
+    }
+    defer { freeaddrinfo(first) }
+    var current: UnsafeMutablePointer<addrinfo>? = first
+    while let candidate = current {
+      let descriptor = Darwin.socket(
+        candidate.pointee.ai_family,
+        candidate.pointee.ai_socktype,
+        candidate.pointee.ai_protocol
+      )
+      if descriptor >= 0 {
+        var noSignal: Int32 = 1
+        _ = setsockopt(
+          descriptor,
+          SOL_SOCKET,
+          SO_NOSIGPIPE,
+          &noSignal,
+          socklen_t(MemoryLayout<Int32>.size)
+        )
+        if Darwin.connect(
+          descriptor,
+          candidate.pointee.ai_addr,
+          candidate.pointee.ai_addrlen
+        ) == 0 { return descriptor }
+        Darwin.close(descriptor)
+      }
+      current = candidate.pointee.ai_next
+    }
+    return nil
+  }
+
+  private func relay(_ first: Int32, _ second: Int32) {
+    var descriptors = [
+      pollfd(fd: first, events: Int16(POLLIN), revents: 0),
+      pollfd(fd: second, events: Int16(POLLIN), revents: 0),
+    ]
+    while !lock.withLock({ stopped }) {
+      let count = Darwin.poll(&descriptors, 2, 250)
+      if count < 0 { return }
+      if count == 0 { continue }
+      for index in descriptors.indices where descriptors[index].revents & Int16(POLLIN) != 0 {
+        var buffer = [UInt8](repeating: 0, count: 16_384)
+        let readCount = Darwin.recv(descriptors[index].fd, &buffer, buffer.count, 0)
+        guard readCount > 0 else { return }
+        let destination = descriptors[index == 0 ? 1 : 0].fd
+        guard sendAll(Data(buffer.prefix(readCount)), to: destination) else { return }
+      }
+      if descriptors.contains(where: {
+        $0.revents & Int16(POLLERR | POLLHUP | POLLNVAL) != 0
+      }) { return }
+    }
+  }
+
+  private func sendAll(_ data: Data, to descriptor: Int32) -> Bool {
+    data.withUnsafeBytes { bytes in
+      guard let base = bytes.baseAddress else { return true }
+      var sent = 0
+      while sent < bytes.count {
+        let count = Darwin.send(descriptor, base.advanced(by: sent), bytes.count - sent, 0)
+        if count <= 0 { return false }
+        sent += count
+      }
+      return true
     }
   }
 }
