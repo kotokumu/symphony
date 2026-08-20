@@ -633,15 +633,24 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
         (require-not (remote tcp "localhost:\(proxyPort)"))
         (require-not (socket-domain AF_UNIX))))
     (deny file-write-create file-write-unlink file-write-mode file-write-owner
-      file-write-flags file-write-xattr file-write-setugid file-write-times)
-    (deny file-write-data (vnode-type REGULAR-FILE))
-    (allow file-write*
-      (require-any
-        (subpath (param "WRITE_ROOT"))
-        (subpath (param "WRITE_ROOT_REAL"))
-        (subpath (param "TEMP_ROOT"))
-        (subpath (param "TEMP_ROOT_REAL"))
-        (literal "/dev/null")))
+      file-write-flags file-write-xattr file-write-setugid file-write-times
+      (require-not
+        (require-any
+          (subpath (param "WRITE_ROOT"))
+          (subpath (param "WRITE_ROOT_REAL"))
+          (subpath (param "TEMP_ROOT"))
+          (subpath (param "TEMP_ROOT_REAL"))
+          (literal "/dev/null"))))
+    (deny file-write-data
+      (require-all
+        (vnode-type REGULAR-FILE)
+        (require-not
+          (require-any
+            (subpath (param "WRITE_ROOT"))
+            (subpath (param "WRITE_ROOT_REAL"))
+            (subpath (param "TEMP_ROOT"))
+            (subpath (param "TEMP_ROOT_REAL"))
+            (literal "/dev/null")))))
     """
   }
 
@@ -1520,10 +1529,17 @@ final class PrivateGitCredentialServer: @unchecked Sendable {
   func serve() {
     while !stateLock.withLock({ stopped }) {
       do {
-        let data = try SocketLine.read(descriptor, maximumBytes: 32_768, timeoutMilliseconds: 5_000)
+        let data = try SocketLine.read(
+          descriptor,
+          maximumBytes: 32_768,
+          timeoutMilliseconds: 5_000,
+          isCancelled: { self.stateLock.withLock { self.stopped } }
+        )
         let request = try JSONDecoder().decode(GitCredentialWireRequest.self, from: data)
         let response = try conversation(action: request.action, input: request.input)
         try SocketLine.write(JSONEncoder().encode(response), to: descriptor)
+      } catch GitCommandRunnerError.timedOut {
+        continue
       } catch {
         if stateLock.withLock({ stopped }) { break }
         let response = GitCredentialWireResponse(succeeded: false, output: Data())
@@ -1638,13 +1654,31 @@ public enum BrokerGitCredentialHelper {
 }
 
 private enum SocketLine {
-  static func read(_ descriptor: Int32, maximumBytes: Int, timeoutMilliseconds: Int32) throws -> Data {
+  static func read(
+    _ descriptor: Int32,
+    maximumBytes: Int,
+    timeoutMilliseconds: Int32,
+    isCancelled: () -> Bool = { false }
+  ) throws -> Data {
+    let deadline = ContinuousClock.now.advanced(
+      by: .milliseconds(Int64(timeoutMilliseconds))
+    )
     var data = Data()
-    while data.count <= maximumBytes {
+    while data.count <= maximumBytes, ContinuousClock.now < deadline {
+      guard !isCancelled() else { throw GitCommandRunnerError.authenticationRejected }
       var pollDescriptor = pollfd(fd: descriptor, events: Int16(POLLIN), revents: 0)
-      guard Darwin.poll(&pollDescriptor, 1, timeoutMilliseconds) > 0 else {
-        throw GitCommandRunnerError.timedOut
-      }
+      let remaining = ContinuousClock.now.duration(to: deadline)
+      let components = remaining.components
+      let remainingMilliseconds = max(
+        1,
+        min(
+          Int64(Int32.max),
+          components.seconds * 1_000 + Int64(components.attoseconds / 1_000_000_000_000_000)
+        )
+      )
+      let result = Darwin.poll(&pollDescriptor, 1, Int32(min(50, remainingMilliseconds)))
+      guard result >= 0 else { throw GitCommandRunnerError.authenticationRejected }
+      if result == 0 { continue }
       var byte: UInt8 = 0
       guard Darwin.recv(descriptor, &byte, 1, 0) == 1 else {
         throw GitCommandRunnerError.authenticationRejected
@@ -1652,6 +1686,7 @@ private enum SocketLine {
       if byte == 0x0A { return data }
       data.append(byte)
     }
+    guard data.count > maximumBytes else { throw GitCommandRunnerError.timedOut }
     throw GitCommandRunnerError.outputTooLarge("")
   }
 

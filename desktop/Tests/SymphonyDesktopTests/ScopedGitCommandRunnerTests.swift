@@ -13,7 +13,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     XCTAssertTrue(profile.contains("(socket-domain AF_UNIX)"))
     XCTAssertTrue(profile.contains("(deny file-write-data"))
     XCTAssertTrue(profile.contains("(vnode-type REGULAR-FILE)"))
-    XCTAssertTrue(profile.contains("(allow file-write*"))
+    XCTAssertTrue(profile.contains("(require-not"))
     XCTAssertTrue(profile.contains("(subpath (param \"WRITE_ROOT\"))"))
     XCTAssertFalse(profile.contains("github.com"))
   }
