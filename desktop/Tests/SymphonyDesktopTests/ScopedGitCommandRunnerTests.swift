@@ -828,25 +828,24 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
   func testInheritedSocketCapabilityWorksThroughTheRealBrokerHelperExecutable() async throws {
     let fixture = try makeFixture()
     let broker = try brokerExecutable()
+    let groupObservation = ProcessGroupObservation()
     let executable = try makeExecutable(
       """
       #!/bin/sh
-      request="$HOME/credential-request"
-      printf 'protocol=https\nhost=github.com\npath=octo/repo\n\n' > "$request"
-      credential_output=$(/usr/bin/git \
-        "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" credential fill < "$request")
-      printf '%s' "$HOME" > temporary-home-path
-      printf '%s' "$$" > credential-process-id
-      touch credential-used
-      while [ ! -e credential-release ]; do sleep 0.01; done
-      printf '%s\n' "$credential_output"
+      set -e
+      credential_output=$(printf 'protocol=https\nhost=github.com\npath=octo/repo\n\n' | \
+        /usr/bin/git "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" credential fill)
+      touch sandbox-write-probe
+      sleep 0.5
+      printf 'TEMP_HOME=%s\n%s\n' "$HOME" "$credential_output"
       """
     )
     let runner = ScopedGitCommandRunner(
       gitExecutableURL: executable,
       brokerExecutableURL: broker,
       operationTimeout: 2,
-      wrapsGitInBrokerExecutable: true
+      wrapsGitInBrokerExecutable: true,
+      afterProcessGroupEstablished: { groupObservation.record($0) }
     )
     let source = SecureSecretBuffer(copying: Data("socket-canary-token".utf8))
     defer { source.clear() }
@@ -856,31 +855,30 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
         OperationCredential(copying: source)
       }
     }
-    let staging = try await waitForCloneStagingDirectory(in: fixture.root)
-    let ready = staging.appendingPathComponent("credential-used")
-    let release = staging.appendingPathComponent("credential-release")
-    let homePath = staging.appendingPathComponent("temporary-home-path")
-    let processIDPath = staging.appendingPathComponent("credential-process-id")
-    try await waitForFile(ready)
-    let temporaryHome = URL(
-      fileURLWithPath: try String(contentsOf: homePath, encoding: .utf8)
-    )
+    let processID = try await groupObservation.waitForProcessID()
+    try await Task.sleep(for: .milliseconds(150))
     try assertNoCredentialRepresentations("socket-canary-token", under: fixture.root)
-    try assertNoCredentialRepresentations("socket-canary-token", under: temporaryHome)
-    let processID = try XCTUnwrap(
-      Int32(String(contentsOf: processIDPath, encoding: .utf8))
-    )
     let processListing = try processOutput(
       executable: URL(fileURLWithPath: "/bin/ps"),
       arguments: ["eww", "-p", String(processID)]
     )
     XCTAssertFalse(processListing.contains("socket-canary-token"))
-    FileManager.default.createFile(atPath: release.path, contents: Data())
     let result = try await operation.value
+    let temporaryHome = try XCTUnwrap(
+      result.output.split(separator: "\n")
+        .first(where: { $0.hasPrefix("TEMP_HOME=") })
+        .map { URL(fileURLWithPath: String($0.dropFirst("TEMP_HOME=".count))) }
+    )
 
     XCTAssertTrue(result.output.contains("username=x-access-token"))
     XCTAssertFalse(result.output.contains("socket-canary-token"))
     XCTAssertTrue(result.output.contains("[REDACTED]"))
+    XCTAssertTrue(
+      FileManager.default.fileExists(
+        atPath: fixture.root.appendingPathComponent("helper/sandbox-write-probe").path
+      )
+    )
+    try assertNoCredentialRepresentations("socket-canary-token", under: temporaryHome)
   }
 
   func testRedactsEveryCredentialRepresentation() {
@@ -945,13 +943,8 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     let executable = try makeExecutable(
       """
       #!/bin/sh
-      touch git-process-ready
-      while [ ! -e git-process-release ]; do sleep 0.01; done
-      echo $$ > git-parent-pid
       sleep 60 &
-      child=$!
-      echo $child > git-child-pid
-      wait $child
+      wait $!
       """
     )
     let runner = ScopedGitCommandRunner(
@@ -971,20 +964,8 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     }
     let observedParentPID = try await groupObservation.waitForProcessID()
     XCTAssertEqual(Darwin.getpgid(observedParentPID), observedParentPID)
-    let staging = try await waitForCloneStagingDirectory(in: fixture.root)
-    let parentPIDFile = staging.appendingPathComponent("git-parent-pid")
-    let childPIDFile = staging.appendingPathComponent("git-child-pid")
-    let processReadyFile = staging.appendingPathComponent("git-process-ready")
-    let processReleaseFile = staging.appendingPathComponent("git-process-release")
-    try await waitForFile(processReadyFile)
-    FileManager.default.createFile(atPath: processReleaseFile.path, contents: Data())
-    try await waitForFile(parentPIDFile)
-    try await waitForFile(childPIDFile)
-    let parentPID = try XCTUnwrap(Int32(String(contentsOf: parentPIDFile).trimmingCharacters(in: .whitespacesAndNewlines)))
-    let childPID = try XCTUnwrap(Int32(String(contentsOf: childPIDFile).trimmingCharacters(in: .whitespacesAndNewlines)))
-    XCTAssertEqual(parentPID, observedParentPID)
-    XCTAssertEqual(Darwin.getpgid(parentPID), parentPID)
-    XCTAssertEqual(Darwin.getpgid(childPID), parentPID)
+    let childPIDs = try await waitForChildProcesses(of: observedParentPID, minimumCount: 2)
+    XCTAssertTrue(childPIDs.allSatisfy { Darwin.getpgid($0) == observedParentPID })
 
     try await runner.stopRetainedOperation()
     do {
@@ -996,8 +977,8 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       XCTFail("Unexpected stopped operation error: \(error)")
     }
 
-    XCTAssertFalse(processExists(parentPID))
-    XCTAssertFalse(processExists(childPID))
+    XCTAssertFalse(processExists(observedParentPID))
+    XCTAssertTrue(childPIDs.allSatisfy { !processExists($0) })
   }
 
   func testFailedProcessGroupStopRetainsRuntimeUntilProductionRetrySucceeds() async throws {
@@ -1006,22 +987,19 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     let executable = try makeExecutable(
       """
       #!/bin/sh
-      touch retained-ready
-      while [ ! -e retained-release ]; do sleep 0.01; done
-      echo $$ > retained-parent
       sleep 60 &
-      child=$!
-      echo $child > retained-child
-      wait $child
+      wait $!
       """
     )
     let controller = FailOnceGitProcessGroupController()
+    let groupObservation = ProcessGroupObservation()
     let runner = ScopedGitCommandRunner(
       gitExecutableURL: executable,
       brokerExecutableURL: broker,
       operationTimeout: 60,
       stopTimeout: 0.05,
       wrapsGitInBrokerExecutable: true,
+      afterProcessGroupEstablished: { groupObservation.record($0) },
       processGroupController: controller.controller
     )
     let source = SecureSecretBuffer(copying: Data("retained-token".utf8))
@@ -1031,17 +1009,8 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
         OperationCredential(copying: source)
       }
     }
-    let staging = try await waitForCloneStagingDirectory(in: fixture.root)
-    let ready = staging.appendingPathComponent("retained-ready")
-    let release = staging.appendingPathComponent("retained-release")
-    let parentPIDFile = staging.appendingPathComponent("retained-parent")
-    let childPIDFile = staging.appendingPathComponent("retained-child")
-    try await waitForFile(ready)
-    FileManager.default.createFile(atPath: release.path, contents: Data())
-    try await waitForFile(parentPIDFile)
-    try await waitForFile(childPIDFile)
-    let parentPID = try XCTUnwrap(Int32(String(contentsOf: parentPIDFile).trimmingCharacters(in: .whitespacesAndNewlines)))
-    let childPID = try XCTUnwrap(Int32(String(contentsOf: childPIDFile).trimmingCharacters(in: .whitespacesAndNewlines)))
+    let parentPID = try await groupObservation.waitForProcessID()
+    let childPIDs = try await waitForChildProcesses(of: parentPID, minimumCount: 2)
 
     do {
       try await runner.stopRetainedOperation()
@@ -1058,7 +1027,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       XCTAssertEqual(error.failure.category, .cleanupRequired)
     }
     XCTAssertTrue(processExists(parentPID))
-    XCTAssertTrue(processExists(childPID))
+    XCTAssertTrue(childPIDs.allSatisfy { processExists($0) })
 
     controller.allowSignals()
     try await runner.stopRetainedOperation()
@@ -1069,7 +1038,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       XCTAssertEqual(error.failure.category, .gitFailed)
     }
     XCTAssertFalse(processExists(parentPID))
-    XCTAssertFalse(processExists(childPID))
+    XCTAssertTrue(childPIDs.allSatisfy { !processExists($0) })
   }
 
   private func makeFixture() throws -> (root: URL, scope: AuthorizedGitHubRepositoryScope) {
@@ -1194,6 +1163,25 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
   private func processExists(_ pid: Int32) -> Bool {
     let result = Darwin.kill(pid, 0)
     return result == 0 || errno == EPERM
+  }
+
+  private func waitForChildProcesses(
+    of parent: Int32,
+    minimumCount: Int
+  ) async throws -> [Int32] {
+    let deadline = ContinuousClock.now.advanced(by: .seconds(2))
+    while ContinuousClock.now < deadline {
+      let output = try processOutput(
+        executable: URL(fileURLWithPath: "/usr/bin/pgrep"),
+        arguments: ["-P", String(parent)]
+      )
+      let identifiers = output.split(whereSeparator: \.isNewline).compactMap {
+        Int32(String($0).trimmingCharacters(in: .whitespacesAndNewlines))
+      }
+      if identifiers.count >= minimumCount { return identifiers }
+      try await Task.sleep(for: .milliseconds(10))
+    }
+    throw GitCommandRunnerError.launchFailed
   }
 
   private func assertNoCredentialRepresentations(_ token: String, under root: URL) throws {
