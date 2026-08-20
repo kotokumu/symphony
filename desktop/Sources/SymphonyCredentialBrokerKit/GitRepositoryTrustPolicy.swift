@@ -9,6 +9,7 @@ struct ValidatedGitOperationPlan: Equatable, Sendable {
   let targetURL: URL
   let rootIdentity: FileIdentity
   let targetIdentity: FileIdentity?
+  let metadataIdentity: FileIdentity?
   let configurationFingerprint: Data?
   let arguments: [String]
 }
@@ -33,6 +34,7 @@ struct GitRepositoryTrustPolicy: Sendable {
         targetURL: target,
         rootIdentity: scope.workspacesRootIdentity,
         targetIdentity: nil,
+        metadataIdentity: nil,
         configurationFingerprint: nil,
         arguments: ["clone", "--", scope.repositoryURL.absoluteString, target.path]
       )
@@ -58,6 +60,7 @@ struct GitRepositoryTrustPolicy: Sendable {
     let replacement = try validate(plan.request, in: scope)
     guard replacement.rootIdentity == plan.rootIdentity,
       replacement.targetIdentity == plan.targetIdentity,
+      replacement.metadataIdentity == plan.metadataIdentity,
       replacement.configurationFingerprint == plan.configurationFingerprint,
       replacement.arguments == plan.arguments
     else {
@@ -108,7 +111,7 @@ struct GitRepositoryTrustPolicy: Sendable {
     let target = scope.workspacesRoot.appendingPathComponent(repositoryName, isDirectory: true)
     let targetIdentity = try directoryIdentity(target)
     let metadata = target.appendingPathComponent(".git", isDirectory: true)
-    _ = try directoryIdentity(metadata)
+    let metadataIdentity = try directoryIdentity(metadata)
     let config = metadata.appendingPathComponent("config")
     try requireRegularFile(config)
     try requireConfinedMetadata(metadata)
@@ -134,6 +137,7 @@ struct GitRepositoryTrustPolicy: Sendable {
       targetURL: target,
       rootIdentity: scope.workspacesRootIdentity,
       targetIdentity: targetIdentity,
+      metadataIdentity: metadataIdentity,
       configurationFingerprint: fingerprint,
       arguments: arguments
     )

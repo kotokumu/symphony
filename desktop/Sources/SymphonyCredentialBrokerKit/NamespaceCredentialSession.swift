@@ -7,6 +7,11 @@ import SymphonyCredentialBrokerProtocol
 public actor NamespaceCredentialSession {
   public typealias CredentialGenerator = @Sendable () throws -> SecureSecretBuffer
 
+  private struct TrackedDiscoveryOperation: Sendable {
+    let cancel: @Sendable () -> Void
+    let wait: @Sendable () async -> Void
+  }
+
   private let namespaceID: UUID
   private let authorizer: any NamespaceUnlockAuthorizing
   private let storage: any NamespaceCredentialStoring
@@ -15,6 +20,9 @@ public actor NamespaceCredentialSession {
   private let githubAccess: NamespaceGitHubAccessSession
   private var authorization: NamespaceUnlockAuthorization?
   private var credential: SecureSecretBuffer?
+  private var discoveryGeneration = UUID()
+  private var discoveryOperations: [UUID: TrackedDiscoveryOperation] = [:]
+  private var discoveryAdmissionClosed = true
 
   public init(
     namespaceID: UUID,
@@ -83,6 +91,8 @@ public actor NamespaceCredentialSession {
         }
       }
       self.authorization = authorization
+      discoveryGeneration = UUID()
+      discoveryAdmissionClosed = false
     } catch {
       authorization.invalidate()
       throw error
@@ -90,6 +100,7 @@ public actor NamespaceCredentialSession {
   }
 
   public func lock() async throws {
+    await quiesceDiscovery()
     try await githubAccess.quiesceAndClear()
     credential?.clear()
     credential = nil
@@ -120,6 +131,7 @@ public actor NamespaceCredentialSession {
     guard let authorization, credential != nil else {
       throw NamespaceCredentialSessionError.locked
     }
+    await quiesceDiscovery()
     try await githubAccess.quiesceAndClear()
     var pemData = try Self.readPrivateKey(at: privateKeyFilePath)
     defer { pemData.resetBytes(in: pemData.startIndex..<pemData.endIndex) }
@@ -141,27 +153,39 @@ public actor NamespaceCredentialSession {
     }
     credential?.clear()
     credential = replacement
+    discoveryGeneration = UUID()
+    discoveryAdmissionClosed = false
   }
 
   public func listGitHubInstallations() async throws -> [GitHubInstallationDescriptor] {
     let jwt = try githubJWT()
-    return try await githubAPI.listInstallations(jwt: jwt)
+    let api = githubAPI
+    return try await trackedDiscovery {
+      try await api.listInstallations(jwt: jwt)
+    }
   }
 
   public func listGitHubRepositories(
     installationID: Int64
   ) async throws -> [GitHubRepositoryDescriptor] {
     let jwt = try githubJWT()
-    return try await githubAPI.listRepositories(installationID: installationID, jwt: jwt)
+    let api = githubAPI
+    return try await trackedDiscovery {
+      try await api.listRepositories(installationID: installationID, jwt: jwt)
+    }
   }
 
   public func authorizeGitHubRepository(
     _ authorization: GitHubRepositoryAuthorization
   ) async throws {
-    let repositories = try await githubAPI.listRepositories(
-      installationID: authorization.installationID,
-      jwt: githubJWT()
-    )
+    let jwt = try githubJWT()
+    let api = githubAPI
+    let repositories = try await trackedDiscovery {
+      try await api.listRepositories(
+        installationID: authorization.installationID,
+        jwt: jwt
+      )
+    }
     guard repositories.contains(where: {
       $0.id == authorization.repositoryID
         && $0.fullName.caseInsensitiveCompare(authorization.repositoryFullName) == .orderedSame
@@ -228,6 +252,41 @@ public actor NamespaceCredentialSession {
       defer { githubCredential.clear() }
       return githubCredential.appID
     }
+  }
+
+  private func trackedDiscovery<Value: Sendable>(
+    _ operation: @escaping @Sendable () async throws -> Value
+  ) async throws -> Value {
+    guard credential != nil, !discoveryAdmissionClosed else {
+      throw NamespaceCredentialSessionError.locked
+    }
+    let generation = discoveryGeneration
+    let id = UUID()
+    let task = Task { try await operation() }
+    discoveryOperations[id] = TrackedDiscoveryOperation(
+      cancel: { task.cancel() },
+      wait: { _ = try? await task.value }
+    )
+    do {
+      let value = try await task.value
+      discoveryOperations.removeValue(forKey: id)
+      guard generation == discoveryGeneration, credential != nil, !discoveryAdmissionClosed else {
+        throw NamespaceCredentialSessionError.locked
+      }
+      return value
+    } catch {
+      discoveryOperations.removeValue(forKey: id)
+      throw error
+    }
+  }
+
+  private func quiesceDiscovery() async {
+    discoveryAdmissionClosed = true
+    discoveryGeneration = UUID()
+    let operations = Array(discoveryOperations.values)
+    operations.forEach { $0.cancel() }
+    for operation in operations { await operation.wait() }
+    discoveryOperations.removeAll()
   }
 
   private static func readPrivateKey(at path: String) throws -> Data {

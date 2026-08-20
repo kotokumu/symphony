@@ -93,7 +93,9 @@ actor NamespaceGitHubAccessSession {
       return response.redacting(token)
     } catch let error as GitHubRepositoryAPIError {
       if error.invalidatesLease { clearLease() }
-      if error.shouldRetryGET, request.isReadOperation {
+      if error.shouldRetryGET,
+        request.isReadOperation || !error.failure.effectMayHaveOccurred
+      {
         let replacement = try await refreshToken(
           scope: scope,
           jwt: try await jwtProvider(),
@@ -350,7 +352,7 @@ public enum GitHubRepositoryAPIError: Error, Sendable {
   func forRequest(_ request: GitHubIssueCapabilityRequest) -> GitHubRepositoryAPIError {
     switch self {
     case .failure(let failure, let invalidates, let retry):
-      guard !request.isReadOperation else { return self }
+      guard !request.isReadOperation, failure.effectMayHaveOccurred else { return self }
       let ambiguousCategories: Set<GitHubCapabilityFailure.Category> = [
         .authExpired, .networkUnavailable, .timedOut, .serviceUnavailable,
         .invalidServiceResponse,
@@ -374,6 +376,39 @@ public enum GitHubRepositoryAPIError: Error, Sendable {
   public var failure: GitHubCapabilityFailure {
     switch self {
     case .failure(let failure, _, _): failure
+    }
+  }
+
+  static var unsupportedPullRequest: GitHubRepositoryAPIError {
+    .failure(
+      GitHubCapabilityFailure(
+        category: .invalidRequest,
+        message: "The selected number is not a GitHub issue."
+      ),
+      invalidatesLease: false,
+      retryGET: false
+    )
+  }
+
+  func markingEffectMayHaveOccurred() -> GitHubRepositoryAPIError {
+    switch self {
+    case .failure(let failure, let invalidatesLease, let retryGET):
+      let ambiguousCategories: Set<GitHubCapabilityFailure.Category> = [
+        .authExpired, .networkUnavailable, .timedOut, .serviceUnavailable,
+        .invalidServiceResponse,
+      ]
+      guard ambiguousCategories.contains(failure.category) else { return self }
+      return .failure(
+        GitHubCapabilityFailure(
+          category: failure.category,
+          message: failure.message,
+          status: failure.status,
+          retryAt: failure.retryAt,
+          effectMayHaveOccurred: true
+        ),
+        invalidatesLease: invalidatesLease,
+        retryGET: retryGET
+      )
     }
   }
 }

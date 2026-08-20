@@ -386,13 +386,20 @@ public struct GitHubAppAPIClient: GitHubAppAPIRequesting, GitHubRepositoryAPIReq
     )
     urlRequest.httpMethod = rendered.method
     urlRequest.httpBody = rendered.body
-    let (data, response) = try await sendRepositoryRequest(
-      urlRequest,
-      deadline: deadline,
-      isMint: false
-    )
+    let data: Data
+    let response: HTTPURLResponse
+    do {
+      (data, response) = try await sendRepositoryRequest(
+        urlRequest,
+        deadline: deadline,
+        isMint: false
+      )
+    } catch let error as GitHubRepositoryAPIError {
+      throw request.isMutation ? error.markingEffectMayHaveOccurred() : error
+    }
     guard (200..<300).contains(response.statusCode) else {
-      throw repositoryError(response: response, isMint: false)
+      let error = repositoryError(response: response, isMint: false)
+      throw request.isMutation ? error.markingEffectMayHaveOccurred() : error
     }
     do {
       let decoder = JSONDecoder()
@@ -405,7 +412,9 @@ public struct GitHubAppAPIClient: GitHubAppAPIRequesting, GitHubRepositoryAPIReq
         return .issueList(values)
       case .getIssue:
         let response = try decoder.decode(GitHubIssueAPIResponse.self, from: data)
-        guard !response.isPullRequest else { throw GitHubAppAPIError.invalidResponse }
+        guard !response.isPullRequest else {
+          throw GitHubRepositoryAPIError.unsupportedPullRequest
+        }
         let value = response.record
         guard value.number > 0 else { throw GitHubAppAPIError.invalidResponse }
         return .issue(value)
@@ -424,6 +433,8 @@ public struct GitHubAppAPIClient: GitHubAppAPIRequesting, GitHubRepositoryAPIReq
         guard value.number > 0 else { throw GitHubAppAPIError.invalidResponse }
         return .stateChanged(value)
       }
+    } catch let error as GitHubRepositoryAPIError {
+      throw error
     } catch {
       throw GitHubRepositoryAPIError.failure(
         GitHubCapabilityFailure(
@@ -867,6 +878,13 @@ private extension GitHubIssueCapabilityRequest {
       return issueNumber
     case .listIssues, .getIssue:
       return nil
+    }
+  }
+
+  var isMutation: Bool {
+    switch self {
+    case .createComment, .setIssueState: true
+    case .listIssues, .getIssue, .listComments: false
     }
   }
 }

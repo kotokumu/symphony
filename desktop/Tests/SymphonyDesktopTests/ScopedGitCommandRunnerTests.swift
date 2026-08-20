@@ -149,6 +149,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       XCTAssertEqual(error.failure.category, .cleanupRequired)
     }
     try FileManager.default.removeItem(at: target)
+    try FileManager.default.moveItem(at: original, to: target)
     try await runner.stopRetainedOperation()
   }
 
@@ -216,7 +217,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     let fixture = try makeFixture()
     let repository = try makeRepository(in: fixture.root)
     let marker = fixture.root.appendingPathComponent("fetch-launched")
-    let executable = try makeExecutable("#!/bin/sh\ntouch \"(marker.path)\"\n")
+    let executable = try makeExecutable("#!/bin/sh\ntouch \"\(marker.path)\"\n")
     let gate = GitLaunchGate()
     let runner = ScopedGitCommandRunner(
       gitExecutableURL: executable,
@@ -226,9 +227,11 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       beforeLaunch: { await gate.pause() }
     )
     let source = SecureSecretBuffer(copying: Data("token".utf8))
+    let credentialRequests = CredentialRequestCounter()
     defer { source.clear() }
     let operation = Task {
       try await runner.run(.fetch(repositoryName: repository.lastPathComponent), in: fixture.scope) {
+        credentialRequests.increment()
         OperationCredential(copying: source)
       }
     }
@@ -248,6 +251,87 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       }
     }
     XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+    XCTAssertEqual(credentialRequests.value, 0)
+  }
+
+  func testEveryFilesystemAuthorityIsRevalidatedAtTheFinalLaunchBarrier() async throws {
+    for mutation in FinalTrustMutation.allCases {
+      let fixture = try makeFixture()
+      let repository = try makeRepository(in: fixture.root)
+      let marker = FileManager.default.temporaryDirectory
+        .appendingPathComponent("git-final-marker-\(UUID().uuidString)")
+      addTeardownBlock { try? FileManager.default.removeItem(at: marker) }
+      let executable = try makeExecutable("#!/bin/sh\ntouch \"\(marker.path)\"\n")
+      let gate = GitLaunchGate()
+      let requests = CredentialRequestCounter()
+      let runner = ScopedGitCommandRunner(
+        gitExecutableURL: executable,
+        brokerExecutableURL: executable,
+        operationTimeout: 2,
+        wrapsGitInBrokerExecutable: false,
+        beforeLaunch: { await gate.pause() }
+      )
+      let source = SecureSecretBuffer(copying: Data("token".utf8))
+      defer { source.clear() }
+      let request: GitRepositoryCapabilityRequest = mutation == .preparedClone
+        ? .clone(targetName: "prepared-clone")
+        : .fetch(repositoryName: repository.lastPathComponent)
+      let operation = Task {
+        try await runner.run(request, in: fixture.scope) {
+          requests.increment()
+          return OperationCredential(copying: source)
+        }
+      }
+      await gate.waitUntilPaused()
+
+      let backup = fixture.root.deletingLastPathComponent()
+        .appendingPathComponent("git-final-backup-\(UUID().uuidString)", isDirectory: true)
+      addTeardownBlock { try? FileManager.default.removeItem(at: backup) }
+      switch mutation {
+      case .workspaceRoot:
+        try FileManager.default.moveItem(at: fixture.root, to: backup)
+        try FileManager.default.createDirectory(at: fixture.root, withIntermediateDirectories: false)
+      case .repositoryDirectory:
+        try FileManager.default.moveItem(at: repository, to: backup)
+        _ = try makeRepository(in: fixture.root)
+      case .metadataDirectory:
+        let metadata = repository.appendingPathComponent(".git", isDirectory: true)
+        try FileManager.default.moveItem(at: metadata, to: backup)
+        try FileManager.default.createDirectory(at: metadata, withIntermediateDirectories: false)
+        try writeRepositoryConfiguration(to: metadata.appendingPathComponent("config"))
+      case .preparedClone:
+        let target = fixture.root.appendingPathComponent("prepared-clone", isDirectory: true)
+        try FileManager.default.moveItem(at: target, to: backup)
+        try FileManager.default.createDirectory(at: target, withIntermediateDirectories: false)
+      }
+      await gate.resume()
+
+      do {
+        _ = try await operation.value
+        XCTFail("Expected \(mutation) replacement rejection")
+      } catch let error as GitRepositoryTrustError {
+        guard mutation != .preparedClone else {
+          XCTFail("Expected retained clone cleanup, got \(error)")
+          continue
+        }
+        switch error {
+        case .filesystemChanged: break
+        default: XCTFail("Unexpected trust error for \(mutation): \(error)")
+        }
+      } catch let error as GitCommandRunnerError {
+        XCTAssertEqual(mutation, .preparedClone)
+        XCTAssertEqual(error.failure.category, .cleanupRequired)
+      }
+      XCTAssertEqual(requests.value, 0)
+      XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+
+      if mutation == .preparedClone {
+        let target = fixture.root.appendingPathComponent("prepared-clone", isDirectory: true)
+        try FileManager.default.removeItem(at: target)
+        try FileManager.default.moveItem(at: backup, to: target)
+        try await runner.stopRetainedOperation()
+      }
+    }
   }
 
   func testInheritedSocketCapabilityWorksThroughTheRealBrokerHelperExecutable() async throws {
@@ -256,8 +340,10 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     let executable = try makeExecutable(
       """
       #!/bin/sh
-      printf 'protocol=https\nhost=github.com\npath=octo/repo\n\n' | /usr/bin/git \
-        "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" credential fill
+      request="$HOME/credential-request"
+      printf 'protocol=https\nhost=github.com\npath=octo/repo\n\n' > "$request"
+      exec /usr/bin/git \
+        "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" credential fill < "$request"
       """
     )
     let runner = ScopedGitCommandRunner(
@@ -392,6 +478,11 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     let repository = root.appendingPathComponent("existing", isDirectory: true)
     let metadata = repository.appendingPathComponent(".git", isDirectory: true)
     try FileManager.default.createDirectory(at: metadata, withIntermediateDirectories: true)
+    try writeRepositoryConfiguration(to: metadata.appendingPathComponent("config"))
+    return repository
+  }
+
+  private func writeRepositoryConfiguration(to url: URL) throws {
     try Data(
       """
       [core]
@@ -401,8 +492,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
         url = https://github.com/octo/repo
         fetch = +refs/heads/*:refs/remotes/origin/*
       """.utf8
-    ).write(to: metadata.appendingPathComponent("config"))
-    return repository
+    ).write(to: url)
   }
 
   private func makeExecutable(_ source: String) throws -> URL {
@@ -442,6 +532,20 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     let result = Darwin.kill(pid, 0)
     return result == 0 || errno == EPERM
   }
+}
+
+private enum FinalTrustMutation: CaseIterable, Equatable {
+  case workspaceRoot
+  case repositoryDirectory
+  case metadataDirectory
+  case preparedClone
+}
+
+private final class CredentialRequestCounter: @unchecked Sendable {
+  private let lock = NSLock()
+  private var count = 0
+  func increment() { lock.withLock { count += 1 } }
+  var value: Int { lock.withLock { count } }
 }
 
 private final class CloneCleanupReplacement: @unchecked Sendable {

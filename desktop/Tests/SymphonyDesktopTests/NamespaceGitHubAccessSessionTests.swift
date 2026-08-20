@@ -132,7 +132,11 @@ final class NamespaceGitHubAccessSessionTests: XCTestCase {
     let api = RecordingRepositoryAPI(
       expirations: [now.addingTimeInterval(3_600)],
       issueResults: [.failure(.failure(
-        GitHubCapabilityFailure(category: .networkUnavailable, message: "lost"),
+        GitHubCapabilityFailure(
+          category: .networkUnavailable,
+          message: "lost",
+          effectMayHaveOccurred: true
+        ),
         invalidatesLease: false,
         retryGET: false
       ))]
@@ -304,7 +308,12 @@ final class NamespaceGitHubAccessSessionTests: XCTestCase {
     let mutationAPI = RecordingRepositoryAPI(
       expirations: [now.addingTimeInterval(3_600)],
       issueResults: [.failure(.failure(
-        GitHubCapabilityFailure(category: .authExpired, message: "expired", status: 401),
+        GitHubCapabilityFailure(
+          category: .authExpired,
+          message: "expired",
+          status: 401,
+          effectMayHaveOccurred: true
+        ),
         invalidatesLease: true,
         retryGET: true
       ))]

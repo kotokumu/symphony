@@ -99,9 +99,13 @@ final class GitHubRepositoryAPIClientTests: XCTestCase {
   func testRendersEveryTypedIssueOperationWithoutScopeOverrides() async throws {
     let transport = RepositoryTransport(responses: [
       .json(status: 200, body: #"{"number":7}"#),
+      .json(status: 200, body: #"{"number":7}"#),
       .json(status: 200, body: "[]"),
+      .json(status: 200, body: #"{"number":7}"#),
       .json(status: 201, body: #"{"id":70}"#),
+      .json(status: 200, body: #"{"number":7}"#),
       .json(status: 200, body: #"{"number":7,"state":"open"}"#),
+      .json(status: 200, body: #"{"number":7}"#),
       .json(status: 200, body: #"{"number":7,"state":"closed"}"#),
     ])
     let client = GitHubAppAPIClient(
@@ -122,21 +126,28 @@ final class GitHubRepositoryAPIClientTests: XCTestCase {
       _ = try await client.performIssueRequest(operation, scope: fixture.scope, token: token)
     }
     let requests = await transport.requests
-    XCTAssertEqual(requests.map(\.httpMethod), ["GET", "GET", "POST", "PATCH", "PATCH"])
+    XCTAssertEqual(
+      requests.map(\.httpMethod),
+      ["GET", "GET", "GET", "GET", "POST", "GET", "PATCH", "GET", "PATCH"]
+    )
     XCTAssertEqual(requests.map { $0.url?.path }, [
       "/repos/octo/repo/issues/7",
+      "/repos/octo/repo/issues/7",
       "/repos/octo/repo/issues/7/comments",
+      "/repos/octo/repo/issues/7",
       "/repos/octo/repo/issues/7/comments",
+      "/repos/octo/repo/issues/7",
+      "/repos/octo/repo/issues/7",
       "/repos/octo/repo/issues/7",
       "/repos/octo/repo/issues/7",
     ])
     XCTAssertEqual(
-      URLComponents(url: requests[1].url!, resolvingAgainstBaseURL: false)?.query,
+      URLComponents(url: requests[2].url!, resolvingAgainstBaseURL: false)?.query,
       "per_page=50&page=2"
     )
-    XCTAssertEqual(try jsonObject(requests[2]), ["body": "hello"])
-    XCTAssertEqual(try jsonObject(requests[3]), ["state": "open"])
-    XCTAssertEqual(try jsonObject(requests[4]), ["state": "closed"])
+    XCTAssertEqual(try jsonObject(requests[4]), ["body": "hello"])
+    XCTAssertEqual(try jsonObject(requests[6]), ["state": "open"])
+    XCTAssertEqual(try jsonObject(requests[8]), ["state": "closed"])
     XCTAssertTrue(requests.allSatisfy {
       $0.url?.absoluteString.contains("installation") == false
         && $0.url?.absoluteString.contains("repository_id") == false

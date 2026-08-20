@@ -13,9 +13,11 @@ struct SymphonyCredentialBrokerMain {
     if arguments.count >= 2, arguments[0] == "git-runner" {
       Foundation.exit(runGitProcess(executable: arguments[1], arguments: Array(arguments.dropFirst(2))))
     }
-    if arguments.count == 2, arguments[0] == "git-watchdog",
-      let gitProcessID = Int32(arguments[1])
-    {
+    if arguments == ["git-watchdog"] {
+      let gitProcessID = getppid()
+      guard gitProcessID > 1, getpgid(gitProcessID) == gitProcessID,
+        parentExecutableMatchesBroker(gitProcessID)
+      else { Foundation.exit(77) }
       monitorBrokerLifetime(descriptor: STDIN_FILENO, gitProcessID: gitProcessID)
     }
     guard arguments.count == 2, let namespaceID = UUID(uuidString: arguments[1]) else {
@@ -79,7 +81,7 @@ struct SymphonyCredentialBrokerMain {
     let gitProcessID = getpid()
     let watchdog = Process()
     watchdog.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
-    watchdog.arguments = ["git-watchdog", String(gitProcessID)]
+    watchdog.arguments = ["git-watchdog"]
     watchdog.standardInput = FileHandle(fileDescriptor: credentialDescriptor, closeOnDealloc: false)
     watchdog.standardOutput = FileHandle.nullDevice
     watchdog.standardError = FileHandle.nullDevice
@@ -115,6 +117,13 @@ struct SymphonyCredentialBrokerMain {
         Darwin._exit(0)
       }
     }
+  }
+
+  private static func parentExecutableMatchesBroker(_ processID: Int32) -> Bool {
+    var path = [CChar](repeating: 0, count: Int(PROC_PIDPATHINFO_MAXSIZE))
+    guard proc_pidpath(processID, &path, UInt32(path.count)) > 0 else { return false }
+    return URL(fileURLWithPath: String(cString: path)).standardizedFileURL
+      == URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL
   }
 
   private static func serve(_ session: NamespaceCredentialSession) async throws {

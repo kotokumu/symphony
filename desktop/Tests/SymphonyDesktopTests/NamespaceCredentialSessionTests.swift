@@ -205,7 +205,15 @@ final class NamespaceCredentialSessionTests: XCTestCase {
         installationID: 20,
         repositoryID: 30,
         repositoryFullName: "octo/other",
-        repositoryURL: URL(string: "https://github.com/octo/other")!,
+        repositoryURL: URL(string: "https://github.com/octo/research")!,
+        workspacesRoot: workspacesRoot
+      ),
+      GitHubRepositoryAuthorization(
+        appID: 10,
+        installationID: 20,
+        repositoryID: 30,
+        repositoryFullName: "octo/research",
+        repositoryURL: URL(string: "https://github.com/octo/research.git")!,
         workspacesRoot: workspacesRoot
       ),
       GitHubRepositoryAuthorization(
@@ -244,7 +252,7 @@ final class NamespaceCredentialSessionTests: XCTestCase {
     XCTAssertEqual(stored.appID, 10)
     stored.clear()
     let jwtValues = await githubAPI.jwtValues
-    XCTAssertEqual(jwtValues.count, 7)
+    XCTAssertEqual(jwtValues.count, 8)
     XCTAssertTrue(jwtValues.allSatisfy { $0.split(separator: ".").count == 3 })
     let privateKeyText = try String(contentsOf: privateKeyURL, encoding: .utf8)
     XCTAssertTrue(jwtValues.allSatisfy { !$0.contains(privateKeyText) })
@@ -453,6 +461,37 @@ final class NamespaceCredentialSessionTests: XCTestCase {
     XCTAssertNotNil(storage.storedCredential(for: secondID))
   }
 
+  func testLockCancelsAndWaitsForInFlightGitHubDiscovery() async throws {
+    let namespaceID = UUID()
+    let api = CancellableGitHubDiscoveryAPI()
+    let session = NamespaceCredentialSession(
+      namespaceID: namespaceID,
+      authorizer: RecordingUnlockAuthorizer(),
+      storage: RecordingCredentialStorage(),
+      credentialGenerator: NamespaceCredentialSession.randomCredential,
+      githubAPI: api,
+      githubRepositoryAPI: UnavailableRepositoryAPI(),
+      now: Date.init
+    )
+    let privateKeyURL = try makePrivateKeyPEM()
+    defer { try? FileManager.default.removeItem(at: privateKeyURL) }
+    try await session.unlock(reason: "Discovery lock test")
+    try await session.configureGitHubApp(appID: 10, privateKeyFilePath: privateKeyURL.path)
+    let discovery = Task { try await session.listGitHubInstallations() }
+    await api.waitUntilStarted()
+
+    try await session.lock()
+
+    do {
+      _ = try await discovery.value
+      XCTFail("Expected discovery cancellation")
+    } catch is CancellationError {}
+    let cancellationObserved = await api.cancellationObserved
+    let retainedBytes = await session.retainedByteCount
+    XCTAssertTrue(cancellationObserved)
+    XCTAssertEqual(retainedBytes, 0)
+  }
+
   private func decodeBase64URL(_ value: Substring) throws -> Data {
     var base64 = String(value)
       .replacingOccurrences(of: "-", with: "+")
@@ -528,6 +567,38 @@ private actor RecordingGitHubAppAPI: GitHubAppAPIRequesting {
         isPrivate: true
       )
     ]
+  }
+}
+
+private actor CancellableGitHubDiscoveryAPI: GitHubAppAPIRequesting {
+  private var started = false
+  private var waiters: [CheckedContinuation<Void, Never>] = []
+  private(set) var cancellationObserved = false
+
+  func listInstallations(jwt: String) async throws -> [GitHubInstallationDescriptor] {
+    started = true
+    waiters.forEach { $0.resume() }
+    waiters.removeAll()
+    do {
+      try await Task.sleep(for: .seconds(60))
+      return []
+    } catch {
+      cancellationObserved = true
+      throw error
+    }
+  }
+
+  func listRepositories(
+    installationID: Int64,
+    jwt: String
+  ) async throws -> [GitHubRepositoryDescriptor] {
+    _ = try await listInstallations(jwt: jwt)
+    return []
+  }
+
+  func waitUntilStarted() async {
+    if started { return }
+    await withCheckedContinuation { waiters.append($0) }
   }
 }
 

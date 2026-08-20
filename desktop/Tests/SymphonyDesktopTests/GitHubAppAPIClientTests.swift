@@ -210,7 +210,7 @@ final class GitHubAppAPIClientTests: XCTestCase {
       _ = try await client.performIssueRequest(.getIssue(issueNumber: 7), scope: scope, token: token)
       XCTFail("Expected pull request rejection")
     } catch let error as GitHubRepositoryAPIError {
-      XCTAssertEqual(error.failure.category, .invalidServiceResponse)
+      XCTAssertEqual(error.failure.category, .invalidRequest)
     }
   }
 

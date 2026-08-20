@@ -152,10 +152,10 @@ repository over HTTPS. Fetch and push reject repositories outside the namespace 
 repositories whose origin does not match the selected repository, unsafe Git configuration, and
 unsupported push destinations. Git receives its short-lived credential through an operation-scoped
 credential helper over an inherited socket capability that is unavailable to unrelated processes.
-Repository URLs and configuration remain credential-free. A failed clone removes the partial
-workspace through its broker-owned directory descriptor only while its recorded filesystem identity
-still matches; otherwise Symphony preserves the replacement and reports that cleanup is required
-before access can resume.
+Repository URLs and configuration remain credential-free. A failed clone atomically detaches the
+partial workspace under a broker-owned directory descriptor and clears its contents only while its
+recorded filesystem identity still matches; otherwise Symphony preserves the replacement and
+reports that cleanup is required before access can resume.
 
 Locking protected credentials stops active GitHub and Git access, cancels queued access, clears
 short-lived credentials, and prevents replacement access until owned processes have exited. A stop
