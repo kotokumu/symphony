@@ -277,6 +277,7 @@ final class GitHubAppAPIClientTests: XCTestCase {
     StreamingGitHubURLProtocol.responseData = Data(repeating: 0x61, count: 17)
     StreamingGitHubURLProtocol.contentLength = nil
     StreamingGitHubURLProtocol.withholdCompletion = false
+    StreamingGitHubURLProtocol.withholdResponse = false
     StreamingGitHubURLProtocol.wasStopped = false
     let transport = URLSessionGitHubHTTPTransport(
       session: URLSession(configuration: configuration)
@@ -301,6 +302,7 @@ final class GitHubAppAPIClientTests: XCTestCase {
     StreamingGitHubURLProtocol.responseData = Data()
     StreamingGitHubURLProtocol.contentLength = 17
     StreamingGitHubURLProtocol.withholdCompletion = false
+    StreamingGitHubURLProtocol.withholdResponse = false
     StreamingGitHubURLProtocol.wasStopped = false
     let transport = URLSessionGitHubHTTPTransport(
       session: URLSession(configuration: configuration)
@@ -325,8 +327,42 @@ final class GitHubAppAPIClientTests: XCTestCase {
     StreamingGitHubURLProtocol.responseData = Data([0x61])
     StreamingGitHubURLProtocol.contentLength = nil
     StreamingGitHubURLProtocol.withholdCompletion = true
+    StreamingGitHubURLProtocol.withholdResponse = false
     StreamingGitHubURLProtocol.wasStopped = false
     defer { StreamingGitHubURLProtocol.withholdCompletion = false }
+    let transport = URLSessionGitHubHTTPTransport(
+      session: URLSession(configuration: configuration)
+    )
+    let request = URLRequest(url: URL(string: "https://api.github.test/data")!)
+    let started = ContinuousClock.now
+
+    do {
+      _ = try await transport.data(
+        for: request,
+        maximumBytes: 16,
+        deadline: started.advanced(by: .milliseconds(50))
+      )
+      XCTFail("Expected deadline failure")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("deadline"), error.localizedDescription)
+    }
+
+    XCTAssertLessThan(started.duration(to: .now), .seconds(1))
+    XCTAssertTrue(StreamingGitHubURLProtocol.wasStopped)
+  }
+
+  func testURLSessionTransportCancelsRequestWithoutResponseAtMonotonicDeadline() async throws {
+    let configuration = URLSessionGitHubHTTPTransport.makeEphemeralConfiguration()
+    configuration.protocolClasses = [StreamingGitHubURLProtocol.self]
+    StreamingGitHubURLProtocol.responseData = Data()
+    StreamingGitHubURLProtocol.contentLength = nil
+    StreamingGitHubURLProtocol.withholdCompletion = true
+    StreamingGitHubURLProtocol.withholdResponse = true
+    StreamingGitHubURLProtocol.wasStopped = false
+    defer {
+      StreamingGitHubURLProtocol.withholdCompletion = false
+      StreamingGitHubURLProtocol.withholdResponse = false
+    }
     let transport = URLSessionGitHubHTTPTransport(
       session: URLSession(configuration: configuration)
     )
@@ -367,12 +403,14 @@ private final class StreamingGitHubURLProtocol: URLProtocol, @unchecked Sendable
   nonisolated(unsafe) static var responseData = Data()
   nonisolated(unsafe) static var contentLength: Int?
   nonisolated(unsafe) static var withholdCompletion = false
+  nonisolated(unsafe) static var withholdResponse = false
   nonisolated(unsafe) static var wasStopped = false
 
   override class func canInit(with request: URLRequest) -> Bool { true }
   override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
   override func startLoading() {
+    if Self.withholdResponse { return }
     var headers: [String: String] = ["Content-Type": "application/json"]
     if let contentLength = Self.contentLength {
       headers["Content-Length"] = String(contentLength)

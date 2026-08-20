@@ -13,10 +13,16 @@ public actor NamespaceCredentialBroker {
     let task: Task<Void, Error>
   }
 
+  private struct PendingRemoval {
+    let generation: UUID
+    let task: Task<Void, Error>
+  }
+
   private let launcher: any CredentialBrokerSessionLaunching
   private var sessions: [Namespace.ID: any NamespaceCredentialBrokerSessionHandle] = [:]
   private var pendingUnlocks: [Namespace.ID: PendingUnlock] = [:]
   private var pendingLocks: [Namespace.ID: PendingLock] = [:]
+  private var pendingRemovals: [Namespace.ID: PendingRemoval] = [:]
   private var startSuspensionCount = 0
   private var applicationTerminationRequested = false
 
@@ -31,6 +37,7 @@ public actor NamespaceCredentialBroker {
     guard
       pendingUnlocks[namespaceID] == nil,
       pendingLocks[namespaceID] == nil,
+      pendingRemovals[namespaceID] == nil,
       startSuspensionCount == 0,
       !applicationTerminationRequested
     else {
@@ -48,6 +55,7 @@ public actor NamespaceCredentialBroker {
       guard
         pendingUnlocks[namespaceID]?.generation == generation,
         pendingLocks[namespaceID] == nil,
+        pendingRemovals[namespaceID] == nil,
         startSuspensionCount == 0,
         !applicationTerminationRequested
       else {
@@ -172,8 +180,27 @@ public actor NamespaceCredentialBroker {
   }
 
   public func removeNamespace(_ namespaceID: Namespace.ID) async throws {
-    try await lock(namespaceID: namespaceID)
-    try await launcher.purge(namespaceID: namespaceID)
+    if let pending = pendingRemovals[namespaceID] {
+      try await pending.task.value
+      return
+    }
+    let generation = UUID()
+    let task = Task { [weak self] in
+      guard let self else { return }
+      try await self.performRemoval(namespaceID: namespaceID)
+    }
+    pendingRemovals[namespaceID] = PendingRemoval(generation: generation, task: task)
+    do {
+      try await task.value
+    } catch {
+      if pendingRemovals[namespaceID]?.generation == generation {
+        pendingRemovals.removeValue(forKey: namespaceID)
+      }
+      throw error
+    }
+    if pendingRemovals[namespaceID]?.generation == generation {
+      pendingRemovals.removeValue(forKey: namespaceID)
+    }
   }
 
   public func removeGitHubAppCredential(namespaceID: Namespace.ID) async throws {
@@ -184,14 +211,24 @@ public actor NamespaceCredentialBroker {
     sessions[namespaceID] != nil
   }
 
+  private func performRemoval(namespaceID: Namespace.ID) async throws {
+    try await lock(namespaceID: namespaceID)
+    try await launcher.purge(namespaceID: namespaceID)
+  }
+
   private func lockAllOwnedSessions() async throws {
     var failures: [Namespace.ID: String] = [:]
     let namespaceIDs = Set(sessions.keys)
       .union(pendingUnlocks.keys)
       .union(pendingLocks.keys)
+      .union(pendingRemovals.keys)
     for namespaceID in namespaceIDs {
       do {
-        try await lock(namespaceID: namespaceID)
+        if let pendingRemoval = pendingRemovals[namespaceID] {
+          try await pendingRemoval.task.value
+        } else {
+          try await lock(namespaceID: namespaceID)
+        }
       } catch {
         failures[namespaceID] = error.localizedDescription
       }
@@ -207,6 +244,7 @@ public actor NamespaceCredentialBroker {
     guard
       let session = sessions[namespaceID],
       pendingLocks[namespaceID] == nil,
+      pendingRemovals[namespaceID] == nil,
       startSuspensionCount == 0,
       !applicationTerminationRequested
     else {

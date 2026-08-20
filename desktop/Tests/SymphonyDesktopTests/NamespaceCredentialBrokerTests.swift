@@ -218,21 +218,96 @@ final class NamespaceCredentialBrokerTests: XCTestCase {
     let launcher = GatedCapabilityBrokerLauncher()
     let broker = NamespaceCredentialBroker(launcher: launcher)
     try await broker.unlock(namespaceID: namespaceID)
-    let lockAll = Task { try await broker.lockAll() }
-    await launcher.waitUntilLockStarted()
-
     let removal = Task {
       try await broker.removeGitHubAppCredential(namespaceID: namespaceID)
     }
-    await Task.yield()
-    let purgeBeforeLock = await launcher.purgeCount
-    XCTAssertEqual(purgeBeforeLock, 0)
+    await launcher.waitUntilLockStarted()
 
+    let lockAll = Task { try await broker.lockAll() }
     await launcher.completeLock()
-    try await lockAll.value
     try await removal.value
-    let purgeAfterLock = await launcher.purgeCount
-    XCTAssertEqual(purgeAfterLock, 1)
+    try await lockAll.value
+    let events = await launcher.events
+    XCTAssertEqual(events, ["lock-started", "lock-finished", "purge-started", "purge-finished"])
+  }
+
+  func testSharedLockFailureRetainsOwnershipAndAllowsRemovalRetry() async throws {
+    let namespaceID = UUID()
+    let launcher = GatedCapabilityBrokerLauncher()
+    let broker = NamespaceCredentialBroker(launcher: launcher)
+    try await broker.unlock(namespaceID: namespaceID)
+    let removal = Task {
+      try await broker.removeGitHubAppCredential(namespaceID: namespaceID)
+    }
+    await launcher.waitUntilLockStarted()
+
+    let lockAll = Task { try await broker.lockAll() }
+    await launcher.failLock()
+
+    do {
+      try await removal.value
+      XCTFail("Expected removal to receive the shared lock failure")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("gated lock failed"))
+    }
+    do {
+      try await lockAll.value
+      XCTFail("Expected lockAll to receive the shared lock failure")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("1 namespace"))
+    }
+    let remainedUnlocked = await broker.isUnlocked(namespaceID)
+    let failedEvents = await launcher.events
+    XCTAssertTrue(remainedUnlocked)
+    XCTAssertEqual(failedEvents, ["lock-started", "lock-failed"])
+
+    await launcher.allowLocks()
+    let retry = Task {
+      try await broker.removeGitHubAppCredential(namespaceID: namespaceID)
+    }
+    await launcher.waitUntilLockStarted()
+    await launcher.completeLock()
+    try await retry.value
+    let retryEvents = await launcher.events
+    XCTAssertEqual(
+      retryEvents,
+      [
+        "lock-started", "lock-failed", "lock-started", "lock-finished",
+        "purge-started", "purge-finished",
+      ]
+    )
+  }
+
+  func testRemovalKeepsAdmissionClosedAndCoalescesWhilePurgeIsRunning() async throws {
+    let namespaceID = UUID()
+    let launcher = GatedCapabilityBrokerLauncher(gatesFirstPurge: true)
+    let broker = NamespaceCredentialBroker(launcher: launcher)
+    try await broker.unlock(namespaceID: namespaceID)
+    let firstRemoval = Task {
+      try await broker.removeGitHubAppCredential(namespaceID: namespaceID)
+    }
+    await launcher.waitUntilLockStarted()
+    await launcher.completeLock()
+    await launcher.waitUntilPurgeStarted()
+
+    do {
+      try await broker.unlock(namespaceID: namespaceID)
+      XCTFail("Expected unlock to remain closed during purge")
+    } catch {
+      XCTAssertTrue(error.localizedDescription.contains("security operation"))
+    }
+    let secondRemoval = Task {
+      try await broker.removeGitHubAppCredential(namespaceID: namespaceID)
+    }
+
+    await launcher.completePurge()
+    try await firstRemoval.value
+    try await secondRemoval.value
+    let events = await launcher.events
+    let unlockCount = await launcher.unlockCount
+    XCTAssertEqual(events.filter { $0 == "purge-started" }.count, 1)
+    XCTAssertEqual(events.filter { $0 == "purge-finished" }.count, 1)
+    XCTAssertEqual(unlockCount, 1)
   }
 }
 
@@ -407,24 +482,54 @@ private enum TestPendingBrokerError: LocalizedError {
 }
 
 private actor GatedCapabilityBrokerLauncher: CredentialBrokerSessionLaunching {
+  private let gatesFirstPurge: Bool
   private var lockStarted = false
+  private var locksShouldFail = false
   private var lockStartWaiters: [CheckedContinuation<Void, Never>] = []
-  private var lockContinuation: CheckedContinuation<Void, Never>?
+  private var lockContinuation: CheckedContinuation<Void, any Error>?
+  private var purgeStarted = false
+  private var purgeStartWaiters: [CheckedContinuation<Void, Never>] = []
+  private var purgeContinuation: CheckedContinuation<Void, Never>?
+  private var purgeCount = 0
   private(set) var capabilityCount = 0
-  private(set) var purgeCount = 0
+  private(set) var events: [String] = []
+  private(set) var unlockCount = 0
+
+  init(gatesFirstPurge: Bool = false) {
+    self.gatesFirstPurge = gatesFirstPurge
+  }
 
   func unlock(namespaceID: UUID) -> any NamespaceCredentialBrokerSessionHandle {
+    unlockCount += 1
     GatedCapabilityBrokerSession(namespaceID: namespaceID, launcher: self)
   }
 
   func stop(namespaceID: UUID) {}
-  func purge(namespaceID: UUID) { purgeCount += 1 }
+  func purge(namespaceID: UUID) async {
+    purgeCount += 1
+    events.append("purge-started")
+    purgeStarted = true
+    purgeStartWaiters.forEach { $0.resume() }
+    purgeStartWaiters.removeAll()
+    if gatesFirstPurge, purgeCount == 1 {
+      await withCheckedContinuation { continuation in
+        purgeContinuation = continuation
+      }
+    }
+    events.append("purge-finished")
+  }
 
-  func beginLock() async {
+  func beginLock() async throws {
     lockStarted = true
+    events.append("lock-started")
     lockStartWaiters.forEach { $0.resume() }
     lockStartWaiters.removeAll()
-    await withCheckedContinuation { continuation in
+    if locksShouldFail {
+      lockStarted = false
+      events.append("lock-failed")
+      throw TestGatedLockError.failed
+    }
+    try await withCheckedThrowingContinuation { continuation in
       lockContinuation = continuation
     }
   }
@@ -441,9 +546,41 @@ private actor GatedCapabilityBrokerLauncher: CredentialBrokerSessionLaunching {
   }
 
   func completeLock() {
-    lockContinuation?.resume()
+    lockStarted = false
+    events.append("lock-finished")
+    lockContinuation?.resume(returning: ())
     lockContinuation = nil
   }
+
+  func failLock() {
+    locksShouldFail = true
+    lockStarted = false
+    events.append("lock-failed")
+    lockContinuation?.resume(throwing: TestGatedLockError.failed)
+    lockContinuation = nil
+  }
+
+  func allowLocks() {
+    locksShouldFail = false
+  }
+
+  func waitUntilPurgeStarted() async {
+    if purgeStarted { return }
+    await withCheckedContinuation { continuation in
+      purgeStartWaiters.append(continuation)
+    }
+  }
+
+  func completePurge() {
+    purgeContinuation?.resume()
+    purgeContinuation = nil
+  }
+}
+
+private enum TestGatedLockError: LocalizedError {
+  case failed
+
+  var errorDescription: String? { "The gated lock failed." }
 }
 
 private struct GatedCapabilityBrokerSession: NamespaceCredentialBrokerSessionHandle {
@@ -451,7 +588,7 @@ private struct GatedCapabilityBrokerSession: NamespaceCredentialBrokerSessionHan
   let launcher: GatedCapabilityBrokerLauncher
 
   func lock() async throws {
-    await launcher.beginLock()
+    try await launcher.beginLock()
   }
 
   func signChallenge(_ challenge: Data) async throws -> Data {
