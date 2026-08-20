@@ -52,8 +52,12 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     XCTAssertFalse(profile.contains("github.com"))
   }
 
-  func testConnectProxyRejectsEveryNonGitHubAuthority() throws {
-    let proxy = try GitHubConnectProxy()
+  func testGitHubProxyRejectsRequestsWithoutItsOperationLocalCredential() throws {
+    let fixture = try makeFixture()
+    let source = SecureSecretBuffer(copying: Data("github-token".utf8))
+    defer { source.clear() }
+    let credential = OperationCredential(copying: source)
+    let proxy = try GitHubConnectProxy(scope: fixture.scope, credential: credential)
     defer { proxy.stop() }
     let descriptor = Darwin.socket(AF_INET, SOCK_STREAM, 0)
     XCTAssertGreaterThanOrEqual(descriptor, 0)
@@ -69,7 +73,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       }
     }
     XCTAssertEqual(connected, 0)
-    let request = Data("CONNECT attacker.example:443 HTTP/1.1\r\n\r\n".utf8)
+    let request = Data("GET /octo/repo.git/info/refs HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".utf8)
     let sent = request.withUnsafeBytes {
       Darwin.send(descriptor, $0.baseAddress, $0.count, 0)
     }
