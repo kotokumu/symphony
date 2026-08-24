@@ -44,6 +44,7 @@ public actor NamespaceDaemonSupervisor {
   private var applicationTerminationRequested = false
   private var states: [Namespace.ID: NamespaceDaemonState] = [:]
   private var trackerConfigurations: [Namespace.ID: NamespaceDaemonTrackerConfiguration] = [:]
+  private var recoveryIssueRuns: [Namespace.ID: [NamespaceIssueRun]] = [:]
   private var eventContinuations: [UUID: AsyncStream<NamespaceDaemonEvent>.Continuation] = [:]
 
   public init(
@@ -252,10 +253,13 @@ public actor NamespaceDaemonSupervisor {
     decoder.keyDecodingStrategy = .convertFromSnakeCase
     let payload = try decoder.decode(NamespaceIssueStatePayload.self, from: data)
     if payload.trackerError?.code == "tracker_auth_expired" {
+      recoveryIssueRuns[namespaceID] = payload.runs
       try await refreshGitHubRuntime(namespaceID: namespaceID, runtime: runtime)
       throw NamespaceDaemonError.githubCredentialsUnavailable
     }
-    return payload.runs
+    let recovered = recoveryIssueRuns.removeValue(forKey: namespaceID) ?? []
+    let visibleIdentifiers = Set(payload.runs.map(\.issueIdentifier))
+    return payload.runs + recovered.filter { !visibleIdentifiers.contains($0.issueIdentifier) }
   }
 
   public func issueAction(

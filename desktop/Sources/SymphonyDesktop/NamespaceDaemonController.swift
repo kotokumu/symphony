@@ -72,12 +72,12 @@ final class NamespaceDaemonController: ObservableObject {
         }
         self?.states[event.namespaceID] = event.state
         if case .stopped = event.state {
-          self?.issueRuns.removeValue(forKey: event.namespaceID)
+          self?.markIssueRuns(event.namespaceID, status: "stopped")
           self?.issueRunErrors.removeValue(forKey: event.namespaceID)
         }
-        if case .failed = event.state {
-          self?.issueRuns.removeValue(forKey: event.namespaceID)
-          self?.issueRunErrors.removeValue(forKey: event.namespaceID)
+        if case .failed(let message) = event.state {
+          self?.markIssueRuns(event.namespaceID, status: "failed", error: message)
+          self?.issueRunErrors[event.namespaceID] = message
           try? await self?.afterStop(event.namespaceID)
         }
       }
@@ -111,6 +111,19 @@ final class NamespaceDaemonController: ObservableObject {
         await self?.refreshIssueRuns()
         try? await Task.sleep(for: .seconds(2))
       }
+    }
+  }
+
+  private func markIssueRuns(_ namespaceID: Namespace.ID, status: String, error: String? = nil) {
+    guard let runs = issueRuns[namespaceID], !runs.isEmpty else { return }
+    issueRuns[namespaceID] = runs.map {
+      NamespaceIssueRun(
+        issueIdentifier: $0.issueIdentifier,
+        issueURL: $0.issueURL,
+        status: status,
+        error: error ?? $0.error,
+        workspacePath: $0.workspacePath
+      )
     }
   }
 

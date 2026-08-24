@@ -214,7 +214,6 @@ defmodule SymphonyElixir.Orchestrator do
       Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
       state
-      |> complete_issue(issue_id, running_entry)
       |> schedule_issue_retry(issue_id, 1, %{
         identifier: running_entry.identifier,
         issue_url: running_entry.issue.url,
@@ -426,7 +425,9 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, true)
+        state
+        |> complete_running_issue(issue)
+        |> terminate_running_issue(issue.id, true)
 
       !issue_routable?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
@@ -461,7 +462,10 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Blocked issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing block")
         cleanup_issue_workspace(issue, Map.get(state.blocked, issue.id, %{}))
-        release_issue_claim(state, issue.id)
+
+        state
+        |> complete_blocked_issue(issue)
+        |> release_issue_claim(issue.id)
 
       !issue_routable?(issue) ->
         Logger.info("Blocked issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; releasing block")
@@ -1043,6 +1047,20 @@ defmodule SymphonyElixir.Orchestrator do
     }
   end
 
+  defp complete_running_issue(%State{} = state, %Issue{} = issue) do
+    case Map.get(state.running, issue.id) do
+      metadata when is_map(metadata) -> complete_issue(state, issue.id, Map.put(metadata, :issue, issue))
+      _ -> state
+    end
+  end
+
+  defp complete_blocked_issue(%State{} = state, %Issue{} = issue) do
+    case Map.get(state.blocked, issue.id) do
+      metadata when is_map(metadata) -> complete_issue(state, issue.id, Map.put(metadata, :issue, issue))
+      _ -> state
+    end
+  end
+
   defp clear_tracker_error(%State{} = state), do: %{state | tracker_error: nil}
 
   defp mark_tracker_error(%State{} = state, reason) do
@@ -1144,7 +1162,13 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
         cleanup_issue_workspace(issue, metadata)
-        {:noreply, release_issue_claim(state, issue_id)}
+
+        completed_state =
+          state
+          |> complete_issue(issue_id, Map.merge(metadata, %{issue: issue, identifier: issue.identifier}))
+          |> release_issue_claim(issue_id)
+
+        {:noreply, completed_state}
 
       retry_candidate_issue?(issue, terminal_states) ->
         handle_active_retry(state, issue, attempt, metadata)
