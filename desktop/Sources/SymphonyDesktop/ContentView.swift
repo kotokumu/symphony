@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import SymphonyDesktopCore
+import SymphonyDesktopInfrastructure
 
 struct ContentView: View {
   @ObservedObject var controller: NamespaceController
@@ -175,6 +176,7 @@ struct ContentView: View {
         NamespaceDetailView(
           namespace: namespace,
           daemonState: daemonController.state(for: namespace.id),
+          issueRuns: daemonController.issueRuns[namespace.id] ?? [],
           authenticationState: authenticationController.state(for: namespace.id),
           lockState: lockController.state(for: namespace.id),
           githubConnectionState: githubConnectionController.state(for: namespace.id),
@@ -194,6 +196,27 @@ struct ContentView: View {
             Task {
               await reportErrors {
                 try await daemonController.restart(namespace)
+              }
+            }
+          },
+          startIssue: { identifier in
+            Task {
+              await reportErrors {
+                try await daemonController.startIssue(identifier, in: namespace.id)
+              }
+            }
+          },
+          stopIssue: { identifier in
+            Task {
+              await reportErrors {
+                try await daemonController.stopIssue(identifier, in: namespace.id)
+              }
+            }
+          },
+          retryIssue: { identifier in
+            Task {
+              await reportErrors {
+                try await daemonController.retryIssue(identifier, in: namespace.id)
               }
             }
           },
@@ -365,12 +388,16 @@ private struct EmptyNamespaceView: View {
 private struct NamespaceDetailView: View {
   let namespace: DesktopNamespace
   let daemonState: NamespaceDaemonState
+  let issueRuns: [NamespaceIssueRun]
   let authenticationState: CodexAuthenticationState
   let lockState: NamespaceLockState
   let githubConnectionState: GitHubConnectionOperationState
   let start: () -> Void
   let stop: () -> Void
   let restart: () -> Void
+  let startIssue: (String) -> Void
+  let stopIssue: (String) -> Void
+  let retryIssue: (String) -> Void
   let signIn: () -> Void
   let signOut: () -> Void
   let unlock: () -> Void
@@ -380,6 +407,8 @@ private struct NamespaceDetailView: View {
   let disconnectGitHub: () -> Void
   let rename: () -> Void
   let delete: () -> Void
+
+  @State private var issueIdentifier = ""
 
   var body: some View {
     ScrollView {
@@ -395,6 +424,8 @@ private struct NamespaceDetailView: View {
         daemonStatus
 
         daemonControls
+
+        issueOrchestration
 
         Divider()
           .frame(maxWidth: 440)
@@ -583,6 +614,57 @@ private struct NamespaceDetailView: View {
     case .error:
       .red
     }
+  }
+
+  private var issueOrchestration: some View {
+    VStack(alignment: .leading, spacing: 10) {
+      Text("GitHub issue runs")
+        .font(.headline)
+      HStack {
+        TextField("Issue identifier", text: $issueIdentifier)
+          .textFieldStyle(.roundedBorder)
+        Button("Start") {
+          let identifier = issueIdentifier.trimmingCharacters(in: .whitespacesAndNewlines)
+          guard !identifier.isEmpty else { return }
+          startIssue(identifier)
+          issueIdentifier = ""
+        }
+        .disabled(!isDaemonRunning || issueIdentifier.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+      }
+
+      if issueRuns.isEmpty {
+        Text("No active, retrying, or blocked issues.")
+          .foregroundStyle(.secondary)
+      } else {
+        ForEach(issueRuns) { run in
+          HStack(alignment: .firstTextBaseline) {
+            VStack(alignment: .leading, spacing: 2) {
+              Text(run.issueIdentifier).font(.body.monospaced())
+              Text(run.status.capitalized)
+                .font(.caption)
+                .foregroundStyle(run.status == "blocked" ? .orange : .secondary)
+              if let error = run.error {
+                Text(error).font(.caption).foregroundStyle(.red).lineLimit(2)
+              }
+            }
+            Spacer()
+            if run.status == "running" {
+              Button("Stop") { stopIssue(run.issueIdentifier) }
+            } else if run.status == "blocked" || run.status == "retrying" {
+              Button("Retry") { retryIssue(run.issueIdentifier) }
+            }
+          }
+          .padding(8)
+          .background(.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8))
+        }
+      }
+    }
+    .frame(maxWidth: 440)
+  }
+
+  private var isDaemonRunning: Bool {
+    if case .running = daemonState { return true }
+    return false
   }
 
   @ViewBuilder

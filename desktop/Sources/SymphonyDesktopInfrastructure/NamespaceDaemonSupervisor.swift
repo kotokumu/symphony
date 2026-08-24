@@ -200,6 +200,44 @@ public actor NamespaceDaemonSupervisor {
     states[namespaceID] ?? .stopped
   }
 
+  public func issueRuns(namespaceID: Namespace.ID) async throws -> [NamespaceIssueRun] {
+    guard let runtime = runtimes[namespaceID] else { throw NamespaceDaemonError.endpointUnavailable }
+    var request = URLRequest(url: runtime.endpoint.appendingPathComponent("api/v1/state"))
+    request.httpMethod = "GET"
+    let (data, response) = try await URLSession.shared.data(for: request)
+    guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+      throw NamespaceDaemonError.endpointUnavailable
+    }
+    let decoder = JSONDecoder()
+    decoder.keyDecodingStrategy = .convertFromSnakeCase
+    return try decoder.decode(NamespaceIssueStatePayload.self, from: data).runs
+  }
+
+  public func issueAction(
+    namespaceID: Namespace.ID,
+    issueIdentifier: String,
+    action: NamespaceIssueAction
+  ) async throws -> NamespaceIssueActionResult {
+    guard let runtime = runtimes[namespaceID] else { throw NamespaceDaemonError.endpointUnavailable }
+    var request = URLRequest(
+      url: runtime.endpoint
+        .appendingPathComponent("api/v1")
+        .appendingPathComponent(issueIdentifier)
+        .appendingPathComponent(action.rawValue)
+    )
+    request.httpMethod = "POST"
+    let (data, response) = try await URLSession.shared.data(for: request)
+    guard let http = response as? HTTPURLResponse else {
+      throw NamespaceDaemonError.endpointUnavailable
+    }
+    guard http.statusCode == 202 else {
+      throw NamespaceIssueActionError(statusCode: http.statusCode, body: data)
+    }
+    let decoder = JSONDecoder()
+    decoder.keyDecodingStrategy = .convertFromSnakeCase
+    return try decoder.decode(NamespaceIssueActionResult.self, from: data)
+  }
+
   private func isActive(_ namespaceID: Namespace.ID) -> Bool {
     switch states[namespaceID] ?? .stopped {
     case .starting, .running:
@@ -568,6 +606,94 @@ public actor NamespaceDaemonSupervisor {
       throw NamespaceDaemonError.endpointUnavailable
     }
     return UInt16(bigEndian: boundAddress.sin_port)
+  }
+}
+
+public enum NamespaceIssueAction: String, Codable, Sendable {
+  case start
+  case stop
+  case retry
+}
+
+public struct NamespaceIssueRun: Codable, Equatable, Identifiable, Sendable {
+  public let id: String
+  public let issueIdentifier: String
+  public let issueURL: URL?
+  public let status: String
+  public let error: String?
+  public let workspacePath: String?
+
+  public init(
+    issueIdentifier: String,
+    issueURL: URL? = nil,
+    status: String,
+    error: String? = nil,
+    workspacePath: String? = nil
+  ) {
+    id = issueIdentifier
+    self.issueIdentifier = issueIdentifier
+    self.issueURL = issueURL
+    self.status = status
+    self.error = error
+    self.workspacePath = workspacePath
+  }
+}
+
+public struct NamespaceIssueActionResult: Codable, Equatable, Sendable {
+  public let issueIdentifier: String
+  public let status: String
+}
+
+public struct NamespaceIssueActionError: LocalizedError, Sendable {
+  public let statusCode: Int
+  public let body: Data
+
+  public var errorDescription: String? {
+    "The issue action was rejected by the namespace daemon (HTTP \(statusCode))."
+  }
+}
+
+private struct NamespaceIssueStatePayload: Decodable {
+  let running: [Entry]
+  let retrying: [Entry]
+  let blocked: [Entry]
+
+  var runs: [NamespaceIssueRun] {
+    [
+      (running, "running"),
+      (retrying, "retrying"),
+      (blocked, "blocked"),
+    ].flatMap { entries, status in
+      entries.map {
+        NamespaceIssueRun(
+          issueIdentifier: $0.issueIdentifier,
+          issueURL: $0.issueURL,
+          status: status,
+          error: $0.error,
+          workspacePath: $0.workspacePath
+        )
+      }
+    }
+  }
+
+  private struct Entry: Decodable {
+    let issueIdentifier: String
+    let issueURL: URL?
+    let error: String?
+    let workspacePath: String?
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case running
+    case retrying
+    case blocked
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    running = try container.decodeIfPresent([Entry].self, forKey: .running) ?? []
+    retrying = try container.decodeIfPresent([Entry].self, forKey: .retrying) ?? []
+    blocked = try container.decodeIfPresent([Entry].self, forKey: .blocked) ?? []
   }
 }
 

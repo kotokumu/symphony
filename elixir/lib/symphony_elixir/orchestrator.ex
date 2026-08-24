@@ -1388,6 +1388,17 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @spec request_issue_action(GenServer.server(), atom(), String.t()) ::
+          {:ok, map()} | {:error, atom()} | :unavailable
+  def request_issue_action(server, action, identifier)
+      when action in [:start, :stop, :retry] and is_binary(identifier) do
+    if Process.whereis(server) do
+      GenServer.call(server, {:issue_action, action, identifier})
+    else
+      :unavailable
+    end
+  end
+
   @spec snapshot() :: map() | :timeout | :unavailable
   def snapshot, do: snapshot(__MODULE__, 15_000)
 
@@ -1497,6 +1508,109 @@ defmodule SymphonyElixir.Orchestrator do
        requested_at: DateTime.utc_now(),
        operations: ["poll", "reconcile"]
      }, state}
+  end
+
+  def handle_call({:issue_action, action, identifier}, _from, state) do
+    {reply, state} = handle_issue_action(state, action, identifier)
+    notify_dashboard()
+    {:reply, reply, state}
+  end
+
+  defp handle_issue_action(%State{} = state, :start, identifier) do
+    cond do
+      issue_identifier_present?(state, identifier) ->
+        {{:error, :already_started}, state}
+
+      true ->
+        case Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states) do
+          {:ok, issues} ->
+            case Enum.find(issues, &(&1.identifier == identifier)) do
+              %Issue{} = issue ->
+                next_state = dispatch_issue(state, issue)
+                if MapSet.member?(next_state.claimed, issue.id) do
+                  {{:ok, %{issue_identifier: identifier, status: "running"}}, next_state}
+                else
+                  {{:error, :not_dispatchable}, next_state}
+                end
+
+              nil ->
+                {{:error, :not_found}, state}
+            end
+
+          {:error, _reason} ->
+            {{:error, :tracker_unavailable}, state}
+        end
+    end
+  end
+
+  defp handle_issue_action(%State{} = state, :stop, identifier) do
+    case find_running_by_identifier(state.running, identifier) do
+      {issue_id, _entry} ->
+        {{:ok, %{issue_identifier: identifier, status: "stopped"}}, terminate_running_issue(state, issue_id, false)}
+
+      nil ->
+        {{:error, :not_running}, state}
+    end
+  end
+
+  defp handle_issue_action(%State{} = state, :retry, identifier) do
+    case find_retry_by_identifier(state.retry_attempts, identifier) do
+      {issue_id, retry} ->
+        retry_issue_action(state, issue_id, retry, identifier)
+
+      nil ->
+        case find_blocked_by_identifier(state.blocked, identifier) do
+          {issue_id, blocked} ->
+            retry_issue_action(state, issue_id, blocked, identifier)
+
+          nil ->
+            {{:error, :not_found}, state}
+        end
+    end
+  end
+
+  defp retry_issue_action(state, issue_id, metadata, identifier) do
+    state = %{
+      state
+      | retry_attempts: Map.delete(state.retry_attempts, issue_id),
+        blocked: Map.delete(state.blocked, issue_id),
+        claimed: MapSet.delete(state.claimed, issue_id)
+    }
+
+    case Tracker.fetch_issues_by_ids([issue_id]) do
+      {:ok, [%Issue{} = issue | _]} ->
+        next_state = dispatch_issue(state, issue, Map.get(metadata, :attempt), Map.get(metadata, :worker_host))
+
+        if MapSet.member?(next_state.claimed, issue_id) do
+          {{:ok, %{issue_identifier: identifier, status: "running"}}, next_state}
+        else
+          {{:error, :not_dispatchable}, next_state}
+        end
+
+      {:ok, []} ->
+        {{:error, :not_found}, state}
+
+      {:error, _reason} ->
+        {{:error, :tracker_unavailable}, state}
+    end
+  end
+
+  defp issue_identifier_present?(state, identifier) do
+    find_running_by_identifier(state.running, identifier) != nil or
+      find_retry_by_identifier(state.retry_attempts, identifier) != nil or
+      find_blocked_by_identifier(state.blocked, identifier) != nil
+  end
+
+  defp find_running_by_identifier(running, identifier) do
+    Enum.find(running, fn {_id, entry} -> entry.identifier == identifier end)
+  end
+
+  defp find_retry_by_identifier(retries, identifier) do
+    Enum.find(retries, fn {_id, entry} -> Map.get(entry, :identifier) == identifier end)
+  end
+
+  defp find_blocked_by_identifier(blocked, identifier) do
+    Enum.find(blocked, fn {_id, entry} -> Map.get(entry, :identifier) == identifier end)
   end
 
   defp blocked_issue_state(%{issue: %Issue{state: state}}), do: state

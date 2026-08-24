@@ -6,6 +6,7 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   use Phoenix.Controller, formats: [:json]
 
   alias Plug.Conn
+  alias SymphonyElixir.Orchestrator
   alias SymphonyElixirWeb.{Endpoint, Presenter}
 
   @spec state(Conn.t(), map()) :: Conn.t()
@@ -37,6 +38,28 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
     end
   end
 
+  @spec issue_action(Conn.t(), map()) :: Conn.t()
+  def issue_action(conn, %{"issue_identifier" => issue_identifier, "action" => action}) do
+    case parse_action(action) do
+      {:ok, action} ->
+        case Orchestrator.request_issue_action(orchestrator(), action, issue_identifier) do
+          {:ok, payload} ->
+            conn
+            |> put_status(202)
+            |> json(payload)
+
+          {:error, :not_found} -> error_response(conn, 404, "issue_not_found", "Issue not found")
+          {:error, :not_running} -> error_response(conn, 409, "issue_not_running", "Issue is not running")
+          {:error, :already_started} -> error_response(conn, 409, "issue_already_started", "Issue is already active")
+          {:error, :not_dispatchable} -> error_response(conn, 409, "issue_not_dispatchable", "Issue cannot be dispatched")
+          {:error, :tracker_unavailable} -> error_response(conn, 503, "tracker_unavailable", "Issue tracker is unavailable")
+          :unavailable -> error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
+        end
+
+      :error -> error_response(conn, 400, "invalid_action", "Unsupported issue action")
+    end
+  end
+
   @spec method_not_allowed(Conn.t(), map()) :: Conn.t()
   def method_not_allowed(conn, _params) do
     error_response(conn, 405, "method_not_allowed", "Method not allowed")
@@ -60,4 +83,9 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   defp snapshot_timeout_ms do
     Endpoint.config(:snapshot_timeout_ms) || 15_000
   end
+
+  defp parse_action("start"), do: {:ok, :start}
+  defp parse_action("stop"), do: {:ok, :stop}
+  defp parse_action("retry"), do: {:ok, :retry}
+  defp parse_action(_action), do: :error
 end

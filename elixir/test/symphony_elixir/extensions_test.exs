@@ -57,6 +57,10 @@ defmodule SymphonyElixir.ExtensionsTest do
     def handle_call(:request_refresh, _from, state) do
       {:reply, Keyword.get(state, :refresh, :unavailable), state}
     end
+
+    def handle_call({:issue_action, _action, identifier}, _from, state) do
+      {:reply, {:ok, %{issue_identifier: identifier, status: "running"}}, state}
+    end
   end
 
   setup do
@@ -376,6 +380,24 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert %{"queued" => true, "coalesced" => false, "operations" => ["poll", "reconcile"]} =
              json_response(conn, 202)
+  end
+
+  test "issue actions are routed to the namespace orchestrator" do
+    orchestrator = Module.concat(__MODULE__, :IssueActionOrchestrator)
+    start_test_endpoint(orchestrator: orchestrator, snapshot_timeout_ms: 50)
+    start_supervised!({StaticOrchestrator, name: orchestrator, snapshot: static_snapshot()})
+
+    assert json_response(post(build_conn(), "/api/v1/MT-HTTP/start", %{}), 202) == %{
+             "issue_identifier" => "MT-HTTP",
+             "status" => "running"
+           }
+
+    assert json_response(post(build_conn(), "/api/v1/MT-HTTP/stop", %{}), 202)["status"] ==
+             "running"
+
+    assert json_response(post(build_conn(), "/api/v1/MT-HTTP/unknown", %{}), 400) == %{
+             "error" => %{"code" => "invalid_action", "message" => "Unsupported issue action"}
+           }
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
