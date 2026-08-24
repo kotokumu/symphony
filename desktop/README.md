@@ -43,6 +43,10 @@ SYMPHONY_VERSION="0.1.0" SYMPHONY_OUTPUT_DIR="$PWD/dist" \
 desktop/scripts/validate-macos-mvp.sh "$PWD/dist/Symphony.app"
 ```
 
+The validator also runs an isolated install/upgrade/uninstall simulation. It verifies that replacing
+or removing the app does not remove a namespace metadata sentinel; real launch, restart, and
+sleep/wake checks are performed on a supported Mac using the Launch Check above.
+
 For CI-only structural checks, `make -C desktop validate-package` creates an unsigned package and
 checks its bundle contents. A distributable build must be signed, assessed by Gatekeeper, and
 notarized with `xcrun notarytool` before release. The release workflow supplies the notary profile

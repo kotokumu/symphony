@@ -28,3 +28,4 @@ if find "$application" -type f \( -name '*.env' -o -name '*.pem' -o -name '*.key
 fi
 
 echo "MVP package validation passed"
+"$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/validate-macos-lifecycle.sh" "$application"
