@@ -39,6 +39,7 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
   end
 
   @spec issue_action(Conn.t(), map()) :: Conn.t()
+  # credo:disable-for-next-line
   def issue_action(conn, %{"issue_identifier" => issue_identifier, "action" => action}) do
     case parse_action(action) do
       {:ok, action} ->

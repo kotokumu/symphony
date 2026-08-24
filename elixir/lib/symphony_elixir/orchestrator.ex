@@ -1523,30 +1523,10 @@ defmodule SymphonyElixir.Orchestrator do
   end
 
   defp handle_issue_action(%State{} = state, :start, identifier) do
-    cond do
-      issue_identifier_present?(state, identifier) ->
-        {{:error, :already_started}, state}
-
-      true ->
-        case Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states) do
-          {:ok, issues} ->
-            case Enum.find(issues, &(&1.identifier == identifier)) do
-              %Issue{} = issue ->
-                next_state = dispatch_issue(state, issue)
-
-                if MapSet.member?(next_state.claimed, issue.id) do
-                  {{:ok, %{issue_identifier: identifier, status: "running"}}, next_state}
-                else
-                  {{:error, :not_dispatchable}, next_state}
-                end
-
-              nil ->
-                {{:error, :not_found}, state}
-            end
-
-          {:error, reason} ->
-            {{:error, tracker_action_error(reason)}, state}
-        end
+    if issue_identifier_present?(state, identifier) do
+      {{:error, :already_started}, state}
+    else
+      start_issue_action(state, identifier)
     end
   end
 
@@ -1575,6 +1555,28 @@ defmodule SymphonyElixir.Orchestrator do
         end
     end
   end
+
+  defp start_issue_action(state, identifier) do
+    case Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states) do
+      {:ok, issues} ->
+        dispatch_start_issue(state, Enum.find(issues, &(&1.identifier == identifier)), identifier)
+
+      {:error, reason} ->
+        {{:error, tracker_action_error(reason)}, state}
+    end
+  end
+
+  defp dispatch_start_issue(state, %Issue{} = issue, identifier) do
+    next_state = dispatch_issue(state, issue)
+
+    if MapSet.member?(next_state.claimed, issue.id) do
+      {{:ok, %{issue_identifier: identifier, status: "running"}}, next_state}
+    else
+      {{:error, :not_dispatchable}, next_state}
+    end
+  end
+
+  defp dispatch_start_issue(state, nil, _identifier), do: {{:error, :not_found}, state}
 
   defp retry_issue_action(state, issue_id, metadata, identifier) do
     case Tracker.fetch_issues_by_ids([issue_id]) do
