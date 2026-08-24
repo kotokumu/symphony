@@ -117,7 +117,10 @@ final class NamespaceDaemonController: ObservableObject {
   private func markIssueRuns(_ namespaceID: Namespace.ID, status: String, error: String? = nil) {
     guard let runs = issueRuns[namespaceID], !runs.isEmpty else { return }
     issueRuns[namespaceID] = runs.map {
-      NamespaceIssueRun(
+      guard $0.status == "running" || $0.status == "retrying" || $0.status == "blocked" else {
+        return $0
+      }
+      return NamespaceIssueRun(
         issueIdentifier: $0.issueIdentifier,
         issueURL: $0.issueURL,
         status: status,

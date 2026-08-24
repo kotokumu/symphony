@@ -257,7 +257,15 @@ public actor NamespaceDaemonSupervisor {
     decoder.keyDecodingStrategy = .convertFromSnakeCase
     let payload = try decoder.decode(NamespaceIssueStatePayload.self, from: data)
     if payload.trackerError?.code == "tracker_auth_expired" {
-      recoveryIssueRuns[namespaceID] = payload.runs
+      recoveryIssueRuns[namespaceID] = payload.runs.map {
+        NamespaceIssueRun(
+          issueIdentifier: $0.issueIdentifier,
+          issueURL: $0.issueURL,
+          status: "recovering",
+          error: "Reconnecting the issue run after refreshing GitHub credentials.",
+          workspacePath: $0.workspacePath
+        )
+      }
       try await refreshGitHubRuntime(namespaceID: namespaceID, runtime: runtime)
       throw NamespaceDaemonError.githubCredentialsUnavailable
     }

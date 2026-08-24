@@ -237,6 +237,30 @@ final class NamespaceDaemonControllerTests: XCTestCase {
     XCTAssertEqual(controller.issueRuns[second.id]?.map(\.status), ["stopped"])
   }
 
+  func testDaemonStopPreservesTerminalIssueRunHistory() async throws {
+    let namespace = try makeNamespace(named: "Research")
+    let supervisor = TestDaemonSupervisor()
+    let controller = NamespaceDaemonController(
+      supervisor: supervisor,
+      directoryURL: { _ in URL(fileURLWithPath: "/namespaces/research") }
+    )
+    await controller.startObserving()
+    await supervisor.setIssueRuns([
+      NamespaceIssueRun(issueIdentifier: "GH-1", status: "running"),
+      NamespaceIssueRun(issueIdentifier: "GH-2", status: "completed"),
+    ], for: namespace.id)
+    await supervisor.emit(.init(namespaceID: namespace.id, state: .running(endpoint: endpoint(43301))))
+    await eventually { controller.state(for: namespace.id) == .running(endpoint: self.endpoint(43301)) }
+    await controller.refreshIssueRuns()
+
+    await supervisor.emit(.init(namespaceID: namespace.id, state: .stopped))
+    await eventually {
+      let statuses = controller.issueRuns[namespace.id, default: []]
+        .reduce(into: [:]) { $0[$1.issueIdentifier] = $1.status }
+      return statuses["GH-1"] == "stopped" && statuses["GH-2"] == "completed"
+    }
+  }
+
   private func makeNamespace(named name: String) throws -> DesktopNamespace {
     DesktopNamespace(id: UUID(), name: try NamespaceName(validating: name))
   }
