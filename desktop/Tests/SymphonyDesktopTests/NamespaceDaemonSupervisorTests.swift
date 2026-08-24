@@ -137,7 +137,7 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
         if [ -n "${GH_TOKEN:-}" ] || [ -n "${OPENAI_API_KEY:-}" ]; then
           exit 42
         fi
-        touch '(readySignal.path)'
+        touch '\(readySignal.path)'
         trap 'exit 0' TERM INT
         while :; do sleep 1; done
         """
