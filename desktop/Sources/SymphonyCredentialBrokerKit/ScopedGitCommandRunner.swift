@@ -650,6 +650,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       "-D", "WRITE_ROOT=\(writeRoot)",
       "-D", "TEMP_ROOT=\(temporaryRoot)",
       "-D", "GIT_EXECUTABLE=\(Self.canonicalSandboxPath(gitExecutableURL.path))",
+      "-D", "GIT_CORE=\(Self.canonicalSandboxPath(gitExecutableURL.deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("libexec/git-core").path))",
       "-p", Self.sandboxProfile(proxyPort: proxyPort),
     ]
   }
@@ -687,7 +688,11 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     (allow process-fork)
     (allow process-exec
       (literal (param "GIT_EXECUTABLE"))
+      (subpath (param "GIT_CORE"))
       (literal "/bin/sh")
+      (literal "/bin/bash")
+      (literal "/bin/sleep")
+      (literal "/usr/bin/touch")
       (literal "/usr/bin/base64")
       (literal "/usr/bin/tr"))
     (allow signal (target same-sandbox))
