@@ -131,7 +131,7 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
     let executable = try makeExecutable(
       named: "check-github-token",
       body: """
-        if [ "${GITHUB_TOKEN:-}" != "installation-token-for-(namespaceID.uuidString)" ]; then
+        if [ "${GITHUB_TOKEN:-}" != "installation-token-for-\(namespaceID.uuidString)" ]; then
           exit 41
         fi
         if [ -n "${GH_TOKEN:-}" ] || [ -n "${OPENAI_API_KEY:-}" ]; then
