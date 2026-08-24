@@ -156,10 +156,11 @@ Repository URLs and configuration remain credential-free. The broker passes Git 
 filesystem authority instead of asking it to reopen a workspace path. A macOS process sandbox limits
 filesystem writes to that authority and outbound network access to a broker-owned localhost tunnel
 that accepts only GitHub connections. Clone writes to a broker-named staging directory and publishes
-the workspace name atomically only after Git succeeds. A failed clone atomically detaches its staging
-directory under a broker-owned descriptor. Cleanup unlinks a verified entry before clearing its contents and
-refuses to clear an inode that remains linked elsewhere. Symphony preserves any replacement and
-reports that cleanup is required before access can resume.
+the workspace name atomically only after Git succeeds. A failed clone preserves its staging directory as
+diagnostic residue; the broker does not recursively delete or unlink a mutable pathname. A reserved
+staging residue blocks subsequent operations until explicit recovery removes it, preserving replacement
+entries and unrelated user data. Temporary operation directories are retained empty because macOS has no
+unlink-by-directory-descriptor primitive; they contain no credential material.
 
 Locking protected credentials stops active GitHub and Git access, cancels queued access, clears
 short-lived credentials, and prevents replacement access until owned processes have exited. A stop

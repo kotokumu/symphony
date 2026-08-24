@@ -115,6 +115,52 @@ final class GitCredentialHelperTests: XCTestCase {
     XCTAssertTrue(oversized.output.isEmpty)
   }
 
+  func testRealGitInvokesTheInheritedCredentialHelperOverTheCapabilityFD() async throws {
+    let fixture = try makeServer()
+    let serverTask = Task.detached { fixture.server.serve() }
+    defer {
+      fixture.server.stop()
+      try? fixture.server.clientHandle.close()
+    }
+
+    let input = Pipe()
+    let output = Pipe()
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    let helper = ScopedGitCommandRunner.inheritedCredentialHelper
+    let gitArguments = [
+      "-c", "credential.helper=",
+      "-c", "credential.helper=!\(helper)",
+      "-c", "credential.useHttpPath=true",
+      "credential", "fill",
+    ]
+    process.arguments = [
+      "-c",
+      "exec 3<&2; exec 2>/dev/null; exec /usr/bin/git \(gitArguments.map(shellQuote).joined(separator: " "))",
+    ]
+    process.standardInput = input
+    process.standardOutput = output
+    // Process exposes only the standard descriptors. Hand the capability socket
+    // through stderr, then duplicate it to fd 3 before Git starts.
+    process.standardError = fixture.server.clientHandle
+    try process.run()
+
+    input.fileHandleForWriting.write(
+      Data("protocol=https\nhost=github.com\npath=octo/repo.git\n\n".utf8)
+    )
+    try input.fileHandleForWriting.close()
+    process.waitUntilExit()
+    let result = output.fileHandleForReading.readDataToEndOfFile()
+    fixture.server.closeClientCopy()
+    _ = await serverTask.value
+
+    XCTAssertEqual(process.terminationStatus, 0)
+    XCTAssertEqual(
+      String(decoding: result, as: UTF8.self),
+      "protocol=https\nhost=github.com\npath=octo/repo.git\nusername=x-access-token\npassword=canary-token\n\n"
+    )
+  }
+
   func testOversizedWireRequestAndPeerResponseFailWithinTheFrameDeadline() async throws {
     let fixture = try makeServer()
     let serverTask = Task.detached { fixture.server.serve() }
@@ -222,5 +268,9 @@ final class GitCredentialHelperTests: XCTestCase {
       result.append(byte)
     }
     throw GitCommandRunnerError.outputTooLarge("")
+  }
+
+  private func shellQuote(_ value: String) -> String {
+    "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
   }
 }

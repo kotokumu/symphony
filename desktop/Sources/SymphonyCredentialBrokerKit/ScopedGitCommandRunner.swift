@@ -71,7 +71,6 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
 
   private let policy: GitRepositoryTrustPolicy
   private let gitExecutableURL: URL
-  private let brokerExecutableURL: URL
   private let sandboxExecutableURL: URL
   private let operationTimeout: TimeInterval
   private let stopTimeout: TimeInterval
@@ -80,10 +79,8 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
   private let beforeCloneCleanup: @Sendable () -> Void
   private let beforeCloneTargetOpen: @Sendable (Int32, String) -> Void
   private let afterExecutionAuthorityPrepared: @Sendable (URL) -> Void
-  private let beforeNestedCloneCleanup: @Sendable (Int32, String) -> Void
   private let beforeClonePublish: @Sendable (Int32, String) -> Void
   private let afterClonePublish: @Sendable (Int32, String) -> Void
-  private let beforeDestructiveCloneCleanup: @Sendable (Int32, String) -> Void
   private let afterProcessGroupEstablished: @Sendable (Int32) -> Void
   private let processGroupController: GitProcessGroupController
   private let lock = NSLock()
@@ -97,7 +94,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     policy: GitRepositoryTrustPolicy = GitRepositoryTrustPolicy(),
     gitExecutableURL: URL = TrustedSystemGitExecutable.locate()
       ?? URL(fileURLWithPath: "/nonexistent/symphony-git"),
-    brokerExecutableURL: URL = URL(fileURLWithPath: CommandLine.arguments[0]),
+    brokerExecutableURL _: URL = URL(fileURLWithPath: CommandLine.arguments[0]),
     sandboxExecutableURL: URL = URL(fileURLWithPath: "/usr/bin/sandbox-exec"),
     operationTimeout: TimeInterval = 300,
     stopTimeout: TimeInterval = 0.4,
@@ -106,16 +103,13 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     beforeCloneCleanup: @escaping @Sendable () -> Void = {},
     beforeCloneTargetOpen: @escaping @Sendable (Int32, String) -> Void = { _, _ in },
     afterExecutionAuthorityPrepared: @escaping @Sendable (URL) -> Void = { _ in },
-    beforeNestedCloneCleanup: @escaping @Sendable (Int32, String) -> Void = { _, _ in },
     beforeClonePublish: @escaping @Sendable (Int32, String) -> Void = { _, _ in },
     afterClonePublish: @escaping @Sendable (Int32, String) -> Void = { _, _ in },
-    beforeDestructiveCloneCleanup: @escaping @Sendable (Int32, String) -> Void = { _, _ in },
     afterProcessGroupEstablished: @escaping @Sendable (Int32) -> Void = { _ in },
     processGroupController: GitProcessGroupController = .system
   ) {
     self.policy = policy
     self.gitExecutableURL = gitExecutableURL
-    self.brokerExecutableURL = brokerExecutableURL
     self.sandboxExecutableURL = sandboxExecutableURL
     self.operationTimeout = operationTimeout
     self.stopTimeout = stopTimeout
@@ -124,10 +118,8 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     self.beforeCloneCleanup = beforeCloneCleanup
     self.beforeCloneTargetOpen = beforeCloneTargetOpen
     self.afterExecutionAuthorityPrepared = afterExecutionAuthorityPrepared
-    self.beforeNestedCloneCleanup = beforeNestedCloneCleanup
     self.beforeClonePublish = beforeClonePublish
     self.afterClonePublish = afterClonePublish
-    self.beforeDestructiveCloneCleanup = beforeDestructiveCloneCleanup
     self.afterProcessGroupEstablished = afterProcessGroupEstablished
     self.processGroupController = processGroupController
   }
@@ -699,14 +691,12 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     (allow process-info* (target same-sandbox))
     (allow file-read*)
     (allow file-ioctl)
-    (allow file-write-data (require-not (vnode-type REGULAR-FILE)))
     (allow file-write*
       (literal (param "WRITE_ROOT"))
       (subpath (param "WRITE_ROOT"))
       (literal (param "TEMP_ROOT"))
       (subpath (param "TEMP_ROOT"))
       (literal "/dev/null"))
-    (allow network* (socket-domain AF_UNIX))
     (allow network-outbound (remote tcp "localhost:\(proxyPort)"))
     (allow sysctl-read)
     (allow iokit-open (iokit-registry-entry-class "RootDomainUserClient"))
@@ -792,16 +782,6 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     )
   }
 
-  private func waitForProcessGroup(_ processID: Int32) -> Bool {
-    let deadline = ContinuousClock.now.advanced(by: .seconds(1))
-    while ContinuousClock.now < deadline {
-      if Darwin.getpgid(processID) == processID { return true }
-      if Darwin.kill(processID, 0) != 0, errno != EPERM { return false }
-      usleep(1_000)
-    }
-    return Darwin.getpgid(processID) == processID
-  }
-
   private func isolatedEnvironment() throws -> (
     environment: [String: String], temporaryDirectory: URL, descriptor: Int32
   ) {
@@ -824,6 +804,9 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       "LANG": "C",
       "GIT_CONFIG_NOSYSTEM": "1",
       "GIT_CONFIG_GLOBAL": "/dev/null",
+      // Local repository configuration is mutable by the workspace owner and
+      // must not be able to replace the broker's pinned transport policy.
+      "GIT_CONFIG": "/dev/null",
       "GIT_TERMINAL_PROMPT": "0",
       "GIT_ASKPASS": "/usr/bin/false",
       "NO_PROXY": "",
@@ -832,10 +815,10 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
   }
 
   private func removeIsolatedDirectory(_ directory: URL) {
-    // Never recursively delete a pathname that another same-UID process can
-    // replace. A clean Git operation leaves this directory empty; non-empty
-    // diagnostic residue is preserved for explicit recovery.
-    _ = Darwin.rmdir(directory.path)
+    // The directory descriptor is the authority, but macOS has no unlink-by-
+    // directory-descriptor primitive. Keep the empty directory instead of
+    // deleting a mutable pathname that a same-UID process could replace.
+    _ = directory
   }
 
   private func stop(_ process: GitProcessReference) async throws {
@@ -854,10 +837,6 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
       try? await Task.sleep(for: .milliseconds(20))
     }
     return !process.groupExists
-  }
-
-  private func shellQuote(_ value: String) -> String {
-    "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
   }
 
   private func requireAdmission() throws {
@@ -1173,9 +1152,15 @@ final class GitHubConnectProxy: @unchecked Sendable {
     }
     for descriptor in openConnections.0 { Darwin.shutdown(descriptor, SHUT_RDWR) }
     for connection in openConnections.1 { connection.cancel() }
-    _ = workers.wait(timeout: .now() + .seconds(1))
-    localCredential.clear()
+    // A worker may still be inside the bounded TLS connect. Do not clear the
+    // grant until every worker has observed the stop barrier; the worker owns
+    // the request buffer and must be allowed to discard it before teardown.
+    if workers.wait(timeout: .now() + .seconds(1)) == .success {
+      localCredential.clear()
+    }
   }
+
+  private var isStopped: Bool { lock.withLock { stopped } }
 
   private func acceptLoop() {
     while !lock.withLock({ stopped }) {
@@ -1202,7 +1187,8 @@ final class GitHubConnectProxy: @unchecked Sendable {
   }
 
   private func handle(_ client: Int32) {
-    guard let request = readRequestHeader(from: client),
+    guard !isStopped,
+      let request = readRequestHeader(from: client),
       let rewritten = rewriteRequest(request.header),
       let upstream = connectToGitHub()
     else {
@@ -1210,14 +1196,22 @@ final class GitHubConnectProxy: @unchecked Sendable {
       return
     }
     let identifier = ObjectIdentifier(upstream)
-    lock.withLock { upstreams[identifier] = upstream }
+    let admitted = lock.withLock { () -> Bool in
+      guard !stopped else { return false }
+      upstreams[identifier] = upstream
+      return true
+    }
+    guard admitted, !isStopped else {
+      upstream.cancel()
+      return
+    }
     defer {
       _ = lock.withLock { upstreams.removeValue(forKey: identifier) }
       upstream.cancel()
     }
     var initial = rewritten
     initial.append(request.remainder)
-    guard send(initial, to: upstream) else { return }
+    guard !isStopped, send(initial, to: upstream) else { return }
     relayRequestBody(
       from: client,
       to: upstream,
