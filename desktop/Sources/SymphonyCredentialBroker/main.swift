@@ -211,6 +211,12 @@ struct SymphonyCredentialBrokerMain {
               try await session.performGitHubIssueRequest(request)
             )
           )
+        case .githubInstallationToken:
+          write(
+            CredentialBrokerResult.githubInstallationToken(
+              try await session.githubInstallationToken()
+            )
+          )
         case .performGitHubGitOperation:
           guard let request = command.githubGitRequest else {
             throw BrokerCommandError.missingPayload

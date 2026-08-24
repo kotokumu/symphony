@@ -137,16 +137,21 @@ final class NamespaceDaemonController: ObservableObject {
       issueIdentifier: identifier,
       action: .start
     )
+    issueRuns[namespaceID]?.removeAll { $0.issueIdentifier == identifier }
     await refreshIssueRuns()
   }
 
   func stopIssue(_ identifier: String, in namespaceID: Namespace.ID) async throws {
-    _ = try await supervisor.issueAction(
+    let result = try await supervisor.issueAction(
       namespaceID: namespaceID,
       issueIdentifier: identifier,
       action: .stop
     )
     await refreshIssueRuns()
+    issueRuns[namespaceID, default: []].removeAll { $0.issueIdentifier == identifier }
+    issueRuns[namespaceID, default: []].append(
+      NamespaceIssueRun(issueIdentifier: result.issueIdentifier, status: result.status)
+    )
   }
 
   func retryIssue(_ identifier: String, in namespaceID: Namespace.ID) async throws {
@@ -155,6 +160,7 @@ final class NamespaceDaemonController: ObservableObject {
       issueIdentifier: identifier,
       action: .retry
     )
+    issueRuns[namespaceID]?.removeAll { $0.issueIdentifier == identifier }
     await refreshIssueRuns()
   }
 }

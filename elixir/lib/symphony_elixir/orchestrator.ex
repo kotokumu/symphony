@@ -1488,7 +1488,9 @@ defmodule SymphonyElixir.Orchestrator do
        completed:
          state.completed
          |> MapSet.to_list()
-         |> Enum.map(fn issue_id -> %{issue_id: issue_id, identifier: issue_id, status: "completed"} end),
+         |> Enum.map(fn issue_id ->
+           %{issue_id: issue_id, issue_identifier: issue_id, status: "completed"}
+         end),
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{

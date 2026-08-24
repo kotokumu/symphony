@@ -230,7 +230,10 @@ final class NamespaceDaemonControllerTests: XCTestCase {
         .init(namespaceID: first.id, issueIdentifier: "GH-33", action: .retry),
       ]
     )
-    XCTAssertEqual(issueRunRequests, [first.id, second.id, first.id])
+    XCTAssertEqual(
+      issueRunRequests,
+      [first.id, second.id, first.id, second.id, first.id, second.id]
+    )
   }
 
   private func makeNamespace(named name: String) throws -> DesktopNamespace {

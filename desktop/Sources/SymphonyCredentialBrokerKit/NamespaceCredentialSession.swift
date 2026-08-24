@@ -205,6 +205,13 @@ public actor NamespaceCredentialSession {
     }
   }
 
+  public func githubInstallationToken() async throws -> String {
+    try await githubAccess.installationTokenString { [weak self] in
+      guard let self else { throw NamespaceCredentialSessionError.locked }
+      return try await self.githubJWT()
+    }
+  }
+
   public func performGitHubGitOperation(
     _ request: GitRepositoryCapabilityRequest
   ) async throws -> GitRepositoryCapabilityResult {

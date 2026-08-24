@@ -38,6 +38,18 @@ actor NamespaceGitHubAccessSession {
     let cancel: @Sendable () -> Void
     let wait: @Sendable () async -> Void
   }
+
+  func installationTokenString(
+    jwtProvider: @escaping JWTProvider
+  ) async throws -> String {
+    guard let scope, !quiescing else { throw GitHubRepositoryAccessError.locked }
+    let token = try await installationToken(
+      scope: scope,
+      jwtProvider: jwtProvider,
+      generation: generation
+    )
+    return token.withTemporaryData { String(decoding: $0, as: UTF8.self) }
+  }
   private let api: any GitHubRepositoryAPIRequesting
   private let now: @Sendable () -> Date
   private let git: any ScopedGitRunning

@@ -177,6 +177,7 @@ struct ContentView: View {
           namespace: namespace,
           daemonState: daemonController.state(for: namespace.id),
           issueRuns: daemonController.issueRuns[namespace.id] ?? [],
+          issueRunError: daemonController.issueRunErrors[namespace.id],
           authenticationState: authenticationController.state(for: namespace.id),
           lockState: lockController.state(for: namespace.id),
           githubConnectionState: githubConnectionController.state(for: namespace.id),
@@ -389,6 +390,7 @@ private struct NamespaceDetailView: View {
   let namespace: DesktopNamespace
   let daemonState: NamespaceDaemonState
   let issueRuns: [NamespaceIssueRun]
+  let issueRunError: String?
   let authenticationState: CodexAuthenticationState
   let lockState: NamespaceLockState
   let githubConnectionState: GitHubConnectionOperationState
@@ -620,6 +622,11 @@ private struct NamespaceDetailView: View {
     VStack(alignment: .leading, spacing: 10) {
       Text("GitHub issue runs")
         .font(.headline)
+      if let issueRunError {
+        Label(issueRunError, systemImage: "exclamationmark.triangle")
+          .font(.caption)
+          .foregroundStyle(.red)
+      }
       HStack {
         TextField("Issue identifier", text: $issueIdentifier)
           .textFieldStyle(.roundedBorder)

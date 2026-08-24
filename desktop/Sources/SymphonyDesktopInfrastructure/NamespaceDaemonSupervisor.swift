@@ -10,6 +10,7 @@ public actor NamespaceDaemonSupervisor {
       @escaping @Sendable () async -> Void
     ) -> Void
   public typealias ForceKill = @Sendable (Int32) -> Int32
+  public typealias GitHubTokenProvider = @Sendable (Namespace.ID) async throws -> String
 
   private struct Runtime {
     let generation: UUID
@@ -32,6 +33,7 @@ public actor NamespaceDaemonSupervisor {
   private let forceKill: ForceKill
   private let fileManager: FileManager
   private let environment: [String: String]
+  private let githubTokenProvider: GitHubTokenProvider?
 
   private var generations: [Namespace.ID: UUID] = [:]
   private var runtimes: [Namespace.ID: Runtime] = [:]
@@ -60,7 +62,8 @@ public actor NamespaceDaemonSupervisor {
     forcedStopTimeout: TimeInterval = 2,
     forceKill: @escaping ForceKill = { Darwin.kill($0, SIGKILL) },
     fileManager: FileManager = .default,
-    environment: [String: String] = ProcessInfo.processInfo.environment
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    githubTokenProvider: GitHubTokenProvider? = nil
   ) {
     self.executableURL = executableURL
     self.codexExecutableURL = codexExecutableURL
@@ -75,6 +78,7 @@ public actor NamespaceDaemonSupervisor {
     self.forceKill = forceKill
     self.fileManager = fileManager
     self.environment = environment
+    self.githubTokenProvider = githubTokenProvider
   }
 
   public func events() -> AsyncStream<NamespaceDaemonEvent> {
@@ -112,6 +116,13 @@ public actor NamespaceDaemonSupervisor {
 
     do {
       let executableURL = try requireExecutable()
+      let githubToken: String?
+      if trackerConfigurations[namespaceID]?.kind == .github {
+        guard let githubTokenProvider else { throw NamespaceDaemonError.githubCredentialsUnavailable }
+        githubToken = try await githubTokenProvider(namespaceID)
+      } else {
+        githubToken = nil
+      }
       let layout = try prepareRuntime(
         in: namespaceDirectory,
         tracker: trackerConfigurations[namespaceID] ?? .memory
@@ -124,7 +135,8 @@ public actor NamespaceDaemonSupervisor {
         endpoint: endpoint,
         port: port,
         namespaceID: namespaceID,
-        generation: generation
+        generation: generation,
+        githubToken: githubToken
       )
       runtimes[namespaceID] = runtime
 
@@ -401,7 +413,8 @@ public actor NamespaceDaemonSupervisor {
     endpoint: URL,
     port: UInt16,
     namespaceID: Namespace.ID,
-    generation: UUID
+    generation: UUID,
+    githubToken: String?
   ) throws -> Runtime {
     for logURL in [layout.standardOutputURL, layout.standardErrorURL] {
       if !fileManager.fileExists(atPath: logURL.path) {
@@ -443,7 +456,11 @@ public actor NamespaceDaemonSupervisor {
         layout.workflowURL.path,
       ]
     process.currentDirectoryURL = workingDirectoryURL
-    process.environment = NamespaceProcessEnvironment.sanitized(environment)
+    var processEnvironment = NamespaceProcessEnvironment.sanitized(environment)
+    if let githubToken {
+      processEnvironment["GITHUB_TOKEN"] = githubToken
+    }
+    process.environment = processEnvironment
     process.standardOutput = output
     process.standardError = errorOutput
     let terminationDelivery = self.terminationDelivery
@@ -749,6 +766,7 @@ public enum NamespaceDaemonError: LocalizedError, Sendable {
   case executableNotExecutable(URL)
   case codexExecutableNotFound
   case codexExecutableNotExecutable(URL)
+  case githubCredentialsUnavailable
   case runtimePreparationFailed
   case endpointUnavailable
   case launchFailed
@@ -765,6 +783,8 @@ public enum NamespaceDaemonError: LocalizedError, Sendable {
       "The Codex CLI could not be found. Install Codex and try again."
     case .codexExecutableNotExecutable(let url):
       "The Codex CLI at \(url.path) is not executable. Reinstall Codex and try again."
+    case .githubCredentialsUnavailable:
+      "GitHub credentials are unavailable for this namespace. Unlock the namespace and try again."
     case .runtimePreparationFailed:
       "The namespace runtime could not be prepared. Check disk space and permissions, then try again."
     case .endpointUnavailable:

@@ -195,6 +195,10 @@ public actor NamespaceCredentialBroker: NamespaceGitHubRepositoryCapabilityServi
     try await availableSession(namespaceID).performGitHubIssueRequest(request)
   }
 
+  public func githubInstallationToken(namespaceID: Namespace.ID) async throws -> String {
+    try await availableSession(namespaceID).githubInstallationToken()
+  }
+
   public func performGitHubGitOperation(
     _ request: GitRepositoryCapabilityRequest,
     namespaceID: Namespace.ID
