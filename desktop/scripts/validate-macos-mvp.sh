@@ -24,7 +24,7 @@ if find "$application" -type f -print0 | xargs -0 strings 2>/dev/null | grep -E 
 fi
 
 if [ -n "${SYMPHONY_PACKAGE_ARCHIVE:-}" ] && [ -f "$SYMPHONY_PACKAGE_ARCHIVE" ]; then
-  if unzip -Z1 "$SYMPHONY_PACKAGE_ARCHIVE" | grep -E -q '(^|/)(\.env|.*\.(pem|key|log))$'; then
+  if unzip -Z1 "$SYMPHONY_PACKAGE_ARCHIVE" | grep -E -q '(^|/)(\.env|.*\.(pem|key|p8|p12|log))$'; then
     echo "error: sensitive file type found in the package archive" >&2
     exit 1
   fi
@@ -33,7 +33,11 @@ if [ -n "${SYMPHONY_PACKAGE_ARCHIVE:-}" ] && [ -f "$SYMPHONY_PACKAGE_ARCHIVE" ];
     exit 1
   fi
 fi
-if find "$application" -type f \( -name '*.env' -o -name '*.pem' -o -name '*.key' -o -name '*.log' \) -print -quit | grep -q .; then
+if [ -n "${SYMPHONY_PACKAGE_ARCHIVE:-}" ] && [ ! -f "$SYMPHONY_PACKAGE_ARCHIVE" ]; then
+  echo "error: package archive not found: $SYMPHONY_PACKAGE_ARCHIVE" >&2
+  exit 1
+fi
+if find "$application" -type f \( -name '*.env' -o -name '*.pem' -o -name '*.key' -o -name '*.p8' -o -name '*.p12' -o -name '*.log' \) -print -quit | grep -q .; then
   echo "error: sensitive file type found in the application bundle" >&2
   exit 1
 fi

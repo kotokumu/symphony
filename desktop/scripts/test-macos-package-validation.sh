@@ -33,10 +33,27 @@ assert_rejected 'ghp_123456789012345678901234567890' github-token
 assert_rejected 'github_pat_123456789012345678901234567890' github-pat
 assert_rejected 'sk-123456789012345678901234567890' api-key
 assert_rejected '-----BEGIN RSA PRIVATE KEY-----' private-key
+assert_rejected '-----BEGIN EC PRIVATE KEY-----' ec-private-key
+assert_rejected '-----BEGIN OPENSSH PRIVATE KEY-----' openssh-private-key
+for extension in env pem key p8 p12 log; do
+  create_fixture
+  touch "$application/Contents/secret.$extension"
+  if SYMPHONY_ALLOW_UNSIGNED=1 "$script_directory/validate-macos-mvp.sh" "$application" >/dev/null 2>&1; then
+    echo "error: validator accepted sensitive file fixture .$extension" >&2
+    exit 1
+  fi
+done
+
 create_fixture
-touch "$application/Contents/.env"
-if SYMPHONY_ALLOW_UNSIGNED=1 "$script_directory/validate-macos-mvp.sh" "$application" >/dev/null 2>&1; then
-  echo "error: validator accepted sensitive file fixture" >&2
+archive="$root/Symphony-fixture-macos.zip"
+(cd "$root" && zip -qr "$archive" Symphony.app)
+unzip -q "$archive" -d "$root/archive-fixture"
+printf '%s\n' 'github_pat_123456789012345678901234567890' \
+  >> "$root/archive-fixture/Symphony.app/Contents/MacOS/SymphonyDesktop"
+(cd "$root/archive-fixture" && rm -f "$archive" && zip -qr "$archive" Symphony.app)
+if SYMPHONY_ALLOW_UNSIGNED=1 SYMPHONY_PACKAGE_ARCHIVE="$archive" \
+  "$script_directory/validate-macos-mvp.sh" "$root/archive-fixture/Symphony.app" >/dev/null 2>&1; then
+  echo "error: validator accepted secret in archive fixture" >&2
   exit 1
 fi
 echo "Package security validation fixtures passed"

@@ -67,10 +67,15 @@ cp "$binary_directory/SymphonyDesktop" "$application/Contents/MacOS/SymphonyDesk
 cp "$binary_directory/SymphonyCredentialBroker" "$application/Contents/Helpers/SymphonyCredentialBroker"
 cp "$daemon_source" "$application/Contents/bin/symphony"
 chmod 755 "$application/Contents/MacOS/SymphonyDesktop" "$application/Contents/Helpers/SymphonyCredentialBroker" "$application/Contents/bin/symphony"
-case "$(file -b "$daemon_source")" in
-  *arm64*) ;;
-  *) echo "error: daemon must be an arm64 macOS Burrito executable" >&2; exit 1 ;;
-esac
+for executable in \
+  "$application/Contents/MacOS/SymphonyDesktop" \
+  "$application/Contents/Helpers/SymphonyCredentialBroker" \
+  "$application/Contents/bin/symphony"; do
+  case "$(file -b "$executable")" in
+    *Mach-O*arm64*) ;;
+    *) echo "error: packaged executable must be an arm64 Mach-O binary: $executable" >&2; exit 1 ;;
+  esac
+done
 sed -e "s/__VERSION__/$version/g" -e "s/__BUILD_NUMBER__/$build_number/g" \
   "$script_directory/Symphony-Info.plist.template" > "$application/Contents/Info.plist"
 plutil -lint "$application/Contents/Info.plist" >/dev/null

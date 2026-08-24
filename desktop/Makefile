@@ -24,6 +24,7 @@ run: check-xcode
 package: check-xcode
 	@test -n "$(SYMPHONY_VERSION)" || { echo "error: set SYMPHONY_VERSION" >&2; exit 1; }
 	@test -n "$(SYMPHONY_CODE_SIGN_IDENTITY)" || { echo "error: set SYMPHONY_CODE_SIGN_IDENTITY" >&2; exit 1; }
+	@test -n "$(SYMPHONY_NOTARY_PROFILE)" || { echo "error: set SYMPHONY_NOTARY_PROFILE for a notarized release" >&2; exit 1; }
 	./scripts/package-macos.sh --identity "$(SYMPHONY_CODE_SIGN_IDENTITY)" \
 	  --version "$(SYMPHONY_VERSION)" --output "$(SYMPHONY_OUTPUT_DIR)" \
 	  $(if $(SYMPHONY_NOTARY_PROFILE),--notary-profile "$(SYMPHONY_NOTARY_PROFILE)",)
@@ -32,6 +33,8 @@ validate-package: check-xcode
 	@test -n "$(SYMPHONY_VERSION)" || { echo "error: set SYMPHONY_VERSION" >&2; exit 1; }
 	./scripts/package-macos.sh --unsigned --version "$(SYMPHONY_VERSION)" \
 	  --output "$(SYMPHONY_OUTPUT_DIR)"
-	SYMPHONY_ALLOW_UNSIGNED=1 SYMPHONY_PACKAGE_ARCHIVE="$(SYMPHONY_OUTPUT_DIR)/Symphony-$(SYMPHONY_VERSION)-macos.zip" \
+	version="$(SYMPHONY_VERSION)"; case "$$version" in desktop-v*) version="$${version#desktop-v}";; esac; \
+	archive="$(SYMPHONY_OUTPUT_DIR)/Symphony-$$version-macos.zip"; test -f "$$archive"; \
+	SYMPHONY_ALLOW_UNSIGNED=1 SYMPHONY_PACKAGE_ARCHIVE="$$archive" \
 	  ./scripts/validate-macos-mvp.sh "$(SYMPHONY_OUTPUT_DIR)/Symphony.app"
 	./scripts/test-macos-package-validation.sh

@@ -40,6 +40,7 @@ Create and validate a signed package with an Apple Developer ID identity:
 (cd elixir && mix deps.get && BURRITO_TARGET=macos_arm64 MIX_ENV=prod mise exec zig@0.15.2 -- mix release symphony --overwrite)
 SYMPHONY_CODE_SIGN_IDENTITY="Developer ID Application: Your Team (TEAMID)" \
 SYMPHONY_DAEMON_PATH="$PWD/elixir/burrito_out/symphony_macos_arm64" \
+SYMPHONY_NOTARY_PROFILE="symphony-notary" \
 SYMPHONY_VERSION="0.1.0" SYMPHONY_OUTPUT_DIR="$PWD/dist" \
   make -C desktop package
 desktop/scripts/validate-macos-mvp.sh "$PWD/dist/Symphony.app"
