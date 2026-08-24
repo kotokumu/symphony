@@ -67,6 +67,7 @@ public struct CredentialBrokerCommand: Codable, Equatable, Sendable {
     case performGitHubIssueRequest
     case performGitHubGitOperation
     case githubInstallationToken
+    case invalidateGitHubInstallationToken
     case lock
   }
 
@@ -172,6 +173,7 @@ public struct CredentialBrokerCommand: Codable, Equatable, Sendable {
   }
 
   public static let githubInstallationToken = Self(operation: .githubInstallationToken)
+  public static let invalidateGitHubInstallationToken = Self(operation: .invalidateGitHubInstallationToken)
 
   public func validatePayloadShape() throws {
     let values: [Bool] = [
@@ -186,7 +188,7 @@ public struct CredentialBrokerCommand: Codable, Equatable, Sendable {
     switch operation {
     case .signChallenge: expectedIndex = 0
     case .configureGitHubApp: expectedIndex = 1
-    case .listGitHubInstallations, .githubInstallationToken, .lock: expectedIndex = nil
+    case .listGitHubInstallations, .githubInstallationToken, .invalidateGitHubInstallationToken, .lock: expectedIndex = nil
     case .listGitHubRepositories: expectedIndex = 2
     case .authorizeGitHubRepository: expectedIndex = 3
     case .performGitHubIssueRequest: expectedIndex = 4
@@ -302,6 +304,7 @@ public enum CredentialBrokerResult: Codable, Equatable, Sendable {
   case githubIssueResponse(GitHubIssueCapabilityResponse)
   case githubGitResult(GitRepositoryCapabilityResult)
   case githubInstallationToken(String)
+  case githubInstallationTokenInvalidated
   case githubCapabilityFailed(GitHubCapabilityFailure)
   case locked
   case failed(message: String)
@@ -314,6 +317,7 @@ public enum CredentialBrokerResult: Codable, Equatable, Sendable {
     case githubIssueResponse
     case githubGitResult
     case githubInstallationToken
+    case githubInstallationTokenInvalidated
     case githubCapabilityFailure
     case message
   }
@@ -327,6 +331,7 @@ public enum CredentialBrokerResult: Codable, Equatable, Sendable {
     case githubIssueResponse
     case githubGitResult
     case githubInstallationToken
+    case githubInstallationTokenInvalidated
     case githubCapabilityFailed
     case locked
     case failed
@@ -349,6 +354,7 @@ public enum CredentialBrokerResult: Codable, Equatable, Sendable {
     case .githubGitResult: expectedKeys = [.status, .githubGitResult]
     case .githubCapabilityFailed: expectedKeys = [.status, .githubCapabilityFailure]
     case .githubInstallationToken: expectedKeys = [.status, .githubInstallationToken]
+    case .githubInstallationTokenInvalidated: expectedKeys = [.status]
     case .failed: expectedKeys = [.status, .message]
     }
     guard Set(container.allKeys) == expectedKeys else {
@@ -381,6 +387,8 @@ public enum CredentialBrokerResult: Codable, Equatable, Sendable {
       self = .githubInstallationToken(
         try container.decode(String.self, forKey: .githubInstallationToken)
       )
+    case .githubInstallationTokenInvalidated:
+      self = .githubInstallationTokenInvalidated
     case .githubCapabilityFailed:
       self = .githubCapabilityFailed(
         try container.decode(GitHubCapabilityFailure.self, forKey: .githubCapabilityFailure)
@@ -417,6 +425,8 @@ public enum CredentialBrokerResult: Codable, Equatable, Sendable {
     case .githubInstallationToken(let token):
       try container.encode(Status.githubInstallationToken, forKey: .status)
       try container.encode(token, forKey: .githubInstallationToken)
+    case .githubInstallationTokenInvalidated:
+      try container.encode(Status.githubInstallationTokenInvalidated, forKey: .status)
     case .githubCapabilityFailed(let failure):
       try container.encode(Status.githubCapabilityFailed, forKey: .status)
       try container.encode(failure, forKey: .githubCapabilityFailure)

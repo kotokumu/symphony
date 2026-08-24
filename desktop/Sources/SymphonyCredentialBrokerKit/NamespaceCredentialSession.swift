@@ -212,6 +212,10 @@ public actor NamespaceCredentialSession {
     }
   }
 
+  public func invalidateGitHubInstallationToken() async {
+    await githubAccess.invalidateInstallationToken()
+  }
+
   public func performGitHubGitOperation(
     _ request: GitRepositoryCapabilityRequest
   ) async throws -> GitRepositoryCapabilityResult {

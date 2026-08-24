@@ -31,6 +31,9 @@ struct SymphonyDesktopApp: App {
       workingDirectoryURL: command?.workingDirectoryURL,
       githubTokenProvider: { namespaceID in
         try await credentialBroker.githubInstallationToken(namespaceID: namespaceID)
+      },
+      githubTokenInvalidator: { namespaceID in
+        try await credentialBroker.invalidateGitHubInstallationToken(namespaceID: namespaceID)
       }
     )
     let authenticationManager = CodexAuthenticationManager(

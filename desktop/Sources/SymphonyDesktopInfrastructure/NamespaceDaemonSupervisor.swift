@@ -11,6 +11,7 @@ public actor NamespaceDaemonSupervisor {
     ) -> Void
   public typealias ForceKill = @Sendable (Int32) -> Int32
   public typealias GitHubTokenProvider = @Sendable (Namespace.ID) async throws -> String
+  public typealias GitHubTokenInvalidator = @Sendable (Namespace.ID) async throws -> Void
 
   private struct Runtime {
     let generation: UUID
@@ -35,6 +36,7 @@ public actor NamespaceDaemonSupervisor {
   private let fileManager: FileManager
   private let environment: [String: String]
   private let githubTokenProvider: GitHubTokenProvider?
+  private let githubTokenInvalidator: GitHubTokenInvalidator?
 
   private var generations: [Namespace.ID: UUID] = [:]
   private var runtimes: [Namespace.ID: Runtime] = [:]
@@ -65,7 +67,8 @@ public actor NamespaceDaemonSupervisor {
     forceKill: @escaping ForceKill = { Darwin.kill($0, SIGKILL) },
     fileManager: FileManager = .default,
     environment: [String: String] = ProcessInfo.processInfo.environment,
-    githubTokenProvider: GitHubTokenProvider? = nil
+    githubTokenProvider: GitHubTokenProvider? = nil,
+    githubTokenInvalidator: GitHubTokenInvalidator? = nil
   ) {
     self.executableURL = executableURL
     self.codexExecutableURL = codexExecutableURL
@@ -81,6 +84,7 @@ public actor NamespaceDaemonSupervisor {
     self.fileManager = fileManager
     self.environment = environment
     self.githubTokenProvider = githubTokenProvider
+    self.githubTokenInvalidator = githubTokenInvalidator
   }
 
   public func events() -> AsyncStream<NamespaceDaemonEvent> {
@@ -294,6 +298,7 @@ public actor NamespaceDaemonSupervisor {
 
   private func refreshGitHubRuntime(namespaceID: Namespace.ID, runtime: Runtime) async throws {
     guard trackerConfigurations[namespaceID]?.kind == .github else { return }
+    try? await githubTokenInvalidator?(namespaceID)
     try await stop(namespaceID: namespaceID)
     await start(namespaceID: namespaceID, namespaceDirectory: runtime.namespaceDirectory)
   }

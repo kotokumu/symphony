@@ -50,6 +50,10 @@ actor NamespaceGitHubAccessSession {
     )
     return token.withTemporaryData { String(decoding: $0, as: UTF8.self) }
   }
+
+  func invalidateInstallationToken() {
+    clearLease()
+  }
   private let api: any GitHubRepositoryAPIRequesting
   private let now: @Sendable () -> Date
   private let git: any ScopedGitRunning
