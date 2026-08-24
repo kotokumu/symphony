@@ -71,6 +71,9 @@ struct ContentView: View {
             repository,
             namespaceID: namespace.id,
             save: { connection in
+              if case .running = daemonController.state(for: namespace.id) {
+                try await daemonController.stop(namespace.id)
+              }
               try await controller.connectNamespace(namespace.id, to: connection)
             }
           )
@@ -255,6 +258,9 @@ struct ContentView: View {
           disconnectGitHub: {
             Task {
               await reportErrors {
+                if case .running = daemonController.state(for: namespace.id) {
+                  try await daemonController.stop(namespace.id)
+                }
                 let warning = try await githubConnectionController.disconnect(
                   namespaceID: namespace.id,
                   remove: {
