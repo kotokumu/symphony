@@ -22,6 +22,13 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 [ -n "$version" ] && [ -n "$output_directory" ] || usage
+case "$version" in
+  desktop-v*) version=${version#desktop-v} ;;
+esac
+printf '%s\n' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$' || {
+  echo "error: version must be a semantic version such as 0.1.0" >&2
+  exit 2
+}
 if [ "$unsigned" = false ] && [ -z "$signing_identity" ]; then
   echo "error: --identity is required for a signed package" >&2
   exit 2
@@ -45,14 +52,9 @@ swift_build() {
 swift_build SymphonyDesktop
 swift_build SymphonyCredentialBroker
 
-daemon_source=${SYMPHONY_DAEMON_PATH:-$repository_root/elixir/bin/symphony}
-if [ ! -x "$daemon_source" ]; then
-  if command -v mise >/dev/null 2>&1 && [ -f "$repository_root/elixir/mix.exs" ]; then
-    (cd "$repository_root/elixir" && mise exec -- mix release symphony --overwrite)
-  fi
-fi
-[ -x "$daemon_source" ] || {
-  echo "error: Symphony daemon executable not found at $daemon_source; set SYMPHONY_DAEMON_PATH" >&2
+daemon_source=${SYMPHONY_DAEMON_PATH:-}
+[ -n "$daemon_source" ] && [ -x "$daemon_source" ] || {
+  echo "error: set SYMPHONY_DAEMON_PATH to a self-contained Burrito daemon executable" >&2
   exit 1
 }
 
@@ -65,8 +67,13 @@ cp "$binary_directory/SymphonyDesktop" "$application/Contents/MacOS/SymphonyDesk
 cp "$binary_directory/SymphonyCredentialBroker" "$application/Contents/Helpers/SymphonyCredentialBroker"
 cp "$daemon_source" "$application/Contents/bin/symphony"
 chmod 755 "$application/Contents/MacOS/SymphonyDesktop" "$application/Contents/Helpers/SymphonyCredentialBroker" "$application/Contents/bin/symphony"
+case "$(file -b "$daemon_source")" in
+  *arm64*) ;;
+  *) echo "error: daemon must be an arm64 macOS Burrito executable" >&2; exit 1 ;;
+esac
 sed -e "s/__VERSION__/$version/g" -e "s/__BUILD_NUMBER__/$build_number/g" \
   "$script_directory/Symphony-Info.plist.template" > "$application/Contents/Info.plist"
+plutil -lint "$application/Contents/Info.plist" >/dev/null
 
 if [ "$unsigned" = false ]; then
   codesign --force --timestamp --options runtime --sign "$signing_identity" \
@@ -94,6 +101,7 @@ if [ -n "$notary_profile" ]; then
   xcrun stapler staple "$final_application"
   rm -f "$archive"
   ditto -c -k --keepParent "$final_application" "$archive"
+  xcrun stapler validate "$final_application"
 fi
 
 echo "SYMPHONY_APP=$final_application"

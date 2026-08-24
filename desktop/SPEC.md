@@ -179,7 +179,7 @@ does not publish the connection and schedules cleanup of the imported credential
 
 ## 9. Supported Packaged Runtime
 
-The packaged MVP supports macOS 13 or later on Apple Silicon and Intel hardware. The application
+The packaged MVP supports macOS 13 or later on Apple Silicon hardware. The application
 bundle contains the signed desktop executable, the credential broker, and the Symphony daemon. Codex
 is installed separately by the user and is located at launch rather than copied into the bundle.
 

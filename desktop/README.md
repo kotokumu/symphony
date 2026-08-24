@@ -30,18 +30,26 @@ SYMPHONY_CODE_SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" make -C desk
 
 ## Release packaging
 
-The supported release target is macOS 13 or later on Apple Silicon or Intel hardware. A release
+The supported release target is macOS 13 or later on Apple Silicon hardware. A release
 package contains the signed desktop app, credential broker, and Symphony daemon in one sealed
 bundle; Codex remains a user-installed dependency and is never copied into the bundle.
 
 Create and validate a signed package with an Apple Developer ID identity:
 
 ```sh
+(cd elixir && mix deps.get && BURRITO_TARGET=macos_arm64 MIX_ENV=prod mise exec zig@0.15.2 -- mix release symphony --overwrite)
 SYMPHONY_CODE_SIGN_IDENTITY="Developer ID Application: Your Team (TEAMID)" \
+SYMPHONY_DAEMON_PATH="$PWD/elixir/burrito_out/symphony_macos_arm64" \
 SYMPHONY_VERSION="0.1.0" SYMPHONY_OUTPUT_DIR="$PWD/dist" \
   make -C desktop package
 desktop/scripts/validate-macos-mvp.sh "$PWD/dist/Symphony.app"
 ```
+
+The hosted release workflow expects `SYMPHONY_CODE_SIGN_IDENTITY`, an exported Developer ID
+certificate (`APPLE_CERTIFICATE_P12_BASE64` and `APPLE_CERTIFICATE_PASSWORD`), and App Store
+Connect API-key secrets (`APPLE_NOTARY_API_KEY_BASE64`, `APPLE_NOTARY_KEY_ID`, and
+`APPLE_NOTARY_ISSUER`). It imports these into a temporary keychain and removes that keychain after
+the package job.
 
 The validator also runs an isolated install/upgrade/uninstall simulation. It verifies that replacing
 or removing the app does not remove a namespace metadata sentinel; real launch, restart, and

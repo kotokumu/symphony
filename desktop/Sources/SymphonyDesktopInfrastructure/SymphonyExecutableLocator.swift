@@ -1,18 +1,33 @@
 import Foundation
 
-public struct SymphonyExecutableLocator: Sendable {
-  public init() {}
+public struct SymphonyExecutableLocator {
+  private let fileManager: FileManager
+  private let bundleURL: URL
+
+  public init(
+    fileManager: FileManager = .default,
+    bundleURL: URL = Bundle.main.bundleURL
+  ) {
+    self.fileManager = fileManager
+    self.bundleURL = bundleURL
+  }
 
   public func locate() -> SymphonyDaemonCommand? {
-    if let bundled = Bundle.main.url(
+    let packagedDaemon = bundleURL
+      .appendingPathComponent("Contents", isDirectory: true)
+      .appendingPathComponent("bin", isDirectory: true)
+      .appendingPathComponent("symphony")
+    if fileManager.isExecutableFile(atPath: packagedDaemon.path) {
+      return SymphonyDaemonCommand(executableURL: packagedDaemon)
+    }
+    if let bundled = Bundle(url: bundleURL)?.url(
       forResource: "symphony",
       withExtension: nil,
       subdirectory: "bin"
-    ) {
+    ), fileManager.isExecutableFile(atPath: bundled.path) {
       return SymphonyDaemonCommand(executableURL: bundled)
     }
 
-    let fileManager = FileManager.default
     let currentDirectory = URL(
       fileURLWithPath: fileManager.currentDirectoryPath,
       isDirectory: true

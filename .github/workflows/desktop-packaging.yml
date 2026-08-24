@@ -1,6 +1,10 @@
 name: desktop-packaging
 
 on:
+  pull_request:
+    paths:
+      - "desktop/**"
+      - ".github/workflows/desktop-packaging.yml"
   workflow_dispatch:
     inputs:
       version:
@@ -15,12 +19,14 @@ permissions:
   contents: read
 
 jobs:
-  package:
+  validate-package:
+    if: github.event_name == 'pull_request'
     runs-on: macos-15
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
-      SYMPHONY_VERSION: ${{ inputs.version || github.ref_name }}
-      SYMPHONY_OUTPUT_DIR: ${{ github.workspace }}/dist
+      SYMPHONY_VERSION: 0.1.0
+      SYMPHONY_OUTPUT_DIR: ${{ runner.temp }}/symphony-package
+      SYMPHONY_DAEMON_PATH: ${{ github.workspace }}/elixir/burrito_out/symphony_macos_arm64
     steps:
       - name: Checkout
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -30,17 +36,101 @@ jobs:
           install: true
           cache: true
           working_directory: elixir
+      - name: Install Zig
+        working-directory: elixir
+        run: mise install zig@0.15.2
+      - name: Install Mix dependencies
+        working-directory: elixir
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          mix deps.get
+      - name: Build arm64 Burrito daemon
+        working-directory: elixir
+        run: BURRITO_TARGET=macos_arm64 MIX_ENV=prod mise exec zig@0.15.2 -- mix release symphony --overwrite
+      - name: Build and validate unsigned package
+        run: make -C desktop validate-package
+
+  package:
+    if: github.event_name != 'pull_request'
+    runs-on: macos-15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      SYMPHONY_VERSION: ${{ inputs.version || github.ref_name }}
+      SYMPHONY_OUTPUT_DIR: ${{ github.workspace }}/dist
+      SYMPHONY_NOTARY_PROFILE: symphony-notary
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Set up mise tools
+        uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          install: true
+          cache: true
+          working_directory: elixir
+      - name: Install Zig
+        working-directory: elixir
+        run: mise install zig@0.15.2
+      - name: Install Mix dependencies
+        working-directory: elixir
+        run: |
+          mix local.hex --force
+          mix local.rebar --force
+          mix deps.get
+      - name: Build arm64 Burrito daemon
+        working-directory: elixir
+        run: BURRITO_TARGET=macos_arm64 MIX_ENV=prod mise exec zig@0.15.2 -- mix release symphony --overwrite
+      - name: Import Developer ID signing certificate
+        env:
+          APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          test -n "$APPLE_CERTIFICATE_P12_BASE64"
+          test -n "$APPLE_CERTIFICATE_PASSWORD"
+          keychain="$RUNNER_TEMP/symphony-build.keychain-db"
+          certificate="$RUNNER_TEMP/symphony-developer-id.p12"
+          printf '%s' "$APPLE_CERTIFICATE_P12_BASE64" | base64 --decode > "$certificate"
+          security create-keychain -p "$RUNNER_TEMP" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$RUNNER_TEMP" "$keychain"
+          security import "$certificate" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security default-keychain -s "$keychain"
+          echo "SYMPHONY_KEYCHAIN_PATH=$keychain" >> "$GITHUB_ENV"
+      - name: Configure notarization profile
+        env:
+          APPLE_NOTARY_API_KEY_BASE64: ${{ secrets.APPLE_NOTARY_API_KEY_BASE64 }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER }}
+        run: |
+          test -n "$APPLE_NOTARY_API_KEY_BASE64"
+          test -n "$APPLE_NOTARY_KEY_ID"
+          test -n "$APPLE_NOTARY_ISSUER"
+          key="$RUNNER_TEMP/symphony-notary-key.p8"
+          printf '%s' "$APPLE_NOTARY_API_KEY_BASE64" | base64 --decode > "$key"
+          xcrun notarytool store-credentials "$SYMPHONY_NOTARY_PROFILE" \
+            --key "$key" --key-id "$APPLE_NOTARY_KEY_ID" --issuer "$APPLE_NOTARY_ISSUER" \
+            --keychain "$SYMPHONY_KEYCHAIN_PATH"
       - name: Build and package signed app
         env:
           SYMPHONY_CODE_SIGN_IDENTITY: ${{ secrets.SYMPHONY_CODE_SIGN_IDENTITY }}
-          SYMPHONY_NOTARY_PROFILE: ${{ secrets.SYMPHONY_NOTARY_PROFILE }}
         run: |
           test -n "$SYMPHONY_CODE_SIGN_IDENTITY"
-          test -n "$SYMPHONY_NOTARY_PROFILE"
+          export SYMPHONY_DAEMON_PATH="$GITHUB_WORKSPACE/elixir/burrito_out/symphony_macos_arm64"
           make -C desktop package
-          desktop/scripts/validate-macos-mvp.sh "$SYMPHONY_OUTPUT_DIR/Symphony.app"
+          archive="$(find "$SYMPHONY_OUTPUT_DIR" -name 'Symphony-*-macos.zip' -print -quit)"
+          test -n "$archive"
+          SYMPHONY_PACKAGE_ARCHIVE="$archive" desktop/scripts/validate-macos-mvp.sh \
+            "$SYMPHONY_OUTPUT_DIR/Symphony.app"
+      - name: Remove temporary signing material
+        if: always()
+        run: |
+          if test -n "${SYMPHONY_KEYCHAIN_PATH:-}" && test -f "$SYMPHONY_KEYCHAIN_PATH"; then
+            security delete-keychain "$SYMPHONY_KEYCHAIN_PATH" || true
+          fi
+          rm -f "$RUNNER_TEMP/symphony-developer-id.p12" "$RUNNER_TEMP/symphony-notary-key.p8"
       - name: Upload package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: Symphony-${{ env.SYMPHONY_VERSION }}-macos
           path: dist/Symphony-*-macos.zip

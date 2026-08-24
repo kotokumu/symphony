@@ -32,4 +32,6 @@ validate-package: check-xcode
 	@test -n "$(SYMPHONY_VERSION)" || { echo "error: set SYMPHONY_VERSION" >&2; exit 1; }
 	./scripts/package-macos.sh --unsigned --version "$(SYMPHONY_VERSION)" \
 	  --output "$(SYMPHONY_OUTPUT_DIR)"
-	SYMPHONY_ALLOW_UNSIGNED=1 ./scripts/validate-macos-mvp.sh "$(SYMPHONY_OUTPUT_DIR)/Symphony.app"
+	SYMPHONY_ALLOW_UNSIGNED=1 SYMPHONY_PACKAGE_ARCHIVE="$(SYMPHONY_OUTPUT_DIR)/Symphony-$(SYMPHONY_VERSION)-macos.zip" \
+	  ./scripts/validate-macos-mvp.sh "$(SYMPHONY_OUTPUT_DIR)/Symphony.app"
+	./scripts/test-macos-package-validation.sh
