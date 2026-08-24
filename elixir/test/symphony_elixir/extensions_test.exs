@@ -273,7 +273,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1},
+             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1, "completed" => 0},
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -319,6 +319,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_event_at" => state_payload["blocked"] |> List.first() |> Map.fetch!("last_event_at")
                }
              ],
+             "completed" => [],
              "codex_totals" => %{
                "input_tokens" => 4,
                "output_tokens" => 8,
