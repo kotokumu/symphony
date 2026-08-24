@@ -52,6 +52,9 @@ Connect API-key secrets (`APPLE_NOTARY_API_KEY_BASE64`, `APPLE_NOTARY_KEY_ID`, a
 `APPLE_NOTARY_ISSUER`). It imports these into a temporary keychain and removes that keychain after
 the package job.
 
+The protected clean-Mac launch, GitHub flow, sleep/wake, upgrade, uninstall, and runtime-secret
+checks are recorded in [`RELEASE_CHECKLIST.md`](RELEASE_CHECKLIST.md) before distribution.
+
 The validator also runs an isolated install/upgrade/uninstall simulation. It verifies that replacing
 or removing the app does not remove a namespace metadata sentinel; real launch, restart, and
 sleep/wake checks are performed on a supported Mac using the Launch Check above.
