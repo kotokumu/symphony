@@ -396,7 +396,13 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
         throw GitCommandRunnerError.cleanupRequired
       }
     }
-    proxy?.stop()
+    guard proxy?.stop() ?? true else {
+      lock.withLock {
+        active = nil
+        retained = ownedRuntime
+      }
+      throw GitCommandRunnerError.cleanupRequired
+    }
     server.stop()
     watchdog?.stop()
     _ = await serverTask.value
@@ -457,7 +463,13 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     }
     if let runtime {
       try await stop(runtime.process)
-      runtime.proxy?.stop()
+      guard runtime.proxy?.stop() ?? true else {
+        lock.withLock {
+          active = nil
+          retained = runtime
+        }
+        throw GitCommandRunnerError.cleanupRequired
+      }
       runtime.server.stop()
       runtime.watchdog?.stop()
     }
@@ -480,7 +492,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     if let retained = lock.withLock({ self.retained }) {
       guard !retained.process.groupExists else { throw GitCommandRunnerError.cleanupRequired }
       retained.server.stop()
-      retained.proxy?.stop()
+      guard retained.proxy?.stop() ?? true else { throw GitCommandRunnerError.cleanupRequired }
       retained.watchdog?.stop()
       retained.credential.clear()
       try cleanupFailedClone(
@@ -1074,6 +1086,7 @@ final class GitHubConnectProxy: @unchecked Sendable {
   private let credential: OperationCredential
   private let lock = NSLock()
   private let workers = DispatchGroup()
+  private let networkWorkers = DispatchGroup()
   private var stopped = false
   private var clients: Set<Int32> = []
   private var upstreams: [ObjectIdentifier: NWConnection] = [:]
@@ -1142,7 +1155,8 @@ final class GitHubConnectProxy: @unchecked Sendable {
 
   deinit { stop() }
 
-  func stop() {
+  @discardableResult
+  func stop() -> Bool {
     let openConnections = lock.withLock { () -> ([Int32], [NWConnection]) in
       guard !stopped else { return ([], []) }
       stopped = true
@@ -1152,12 +1166,16 @@ final class GitHubConnectProxy: @unchecked Sendable {
     }
     for descriptor in openConnections.0 { Darwin.shutdown(descriptor, SHUT_RDWR) }
     for connection in openConnections.1 { connection.cancel() }
-    // A worker may still be inside the bounded TLS connect. Do not clear the
-    // grant until every worker has observed the stop barrier; the worker owns
-    // the request buffer and must be allowed to discard it before teardown.
-    if workers.wait(timeout: .now() + .seconds(1)) == .success {
+    // A worker may still be inside the bounded TLS connect or relay. Do not
+    // clear the grant until every admitted network worker has observed the
+    // stop barrier and discarded its request buffer.
+    let networkWorkersStopped = networkWorkers.wait(timeout: .now() + .seconds(35)) == .success
+    let workersStopped = workers.wait(timeout: .now() + .seconds(1)) == .success
+    let completed = networkWorkersStopped && workersStopped
+    if completed {
       localCredential.clear()
     }
+    return completed
   }
 
   private var isStopped: Bool { lock.withLock { stopped } }
@@ -1199,6 +1217,7 @@ final class GitHubConnectProxy: @unchecked Sendable {
     let admitted = lock.withLock { () -> Bool in
       guard !stopped else { return false }
       upstreams[identifier] = upstream
+      networkWorkers.enter()
       return true
     }
     guard admitted, !isStopped else {
@@ -1208,6 +1227,7 @@ final class GitHubConnectProxy: @unchecked Sendable {
     defer {
       _ = lock.withLock { upstreams.removeValue(forKey: identifier) }
       upstream.cancel()
+      networkWorkers.leave()
     }
     var initial = rewritten
     initial.append(request.remainder)
