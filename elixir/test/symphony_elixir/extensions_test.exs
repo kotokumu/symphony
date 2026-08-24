@@ -319,6 +319,7 @@ defmodule SymphonyElixir.ExtensionsTest do
                }
              ],
              "completed" => [],
+             "tracker_error" => nil,
              "codex_totals" => %{
                "input_tokens" => 4,
                "output_tokens" => 8,
@@ -418,6 +419,46 @@ defmodule SymphonyElixir.ExtensionsTest do
     assert json_response(post(build_conn(), "/api/v1/MT-HTTP/unknown", %{}), 400) == %{
              "error" => %{"code" => "invalid_action", "message" => "Unsupported issue action"}
            }
+  end
+
+  test "state exposes completed issue metadata and tracker authentication errors" do
+    orchestrator = Module.concat(__MODULE__, :CompletedStateOrchestrator)
+
+    snapshot =
+      static_snapshot()
+      |> Map.put(:completed, [
+        %{
+          issue_id: "issue-completed",
+          issue_identifier: "GH-42",
+          issue_url: "https://github.com/acme/research/issues/42",
+          workspace_path: "/workspaces/GH-42",
+          status: "completed"
+        }
+      ])
+      |> Map.put(:tracker_error, %{
+        code: "tracker_auth_expired",
+        message: "Issue tracker credentials expired"
+      })
+
+    start_test_endpoint(orchestrator: orchestrator, snapshot_timeout_ms: 50)
+    start_supervised!({StaticOrchestrator, name: orchestrator, snapshot: snapshot})
+
+    payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+
+    assert payload["tracker_error"] == %{
+             "code" => "tracker_auth_expired",
+             "message" => "Issue tracker credentials expired"
+           }
+
+    assert payload["completed"] == [
+             %{
+               "issue_id" => "issue-completed",
+               "issue_identifier" => "GH-42",
+               "issue_url" => "https://github.com/acme/research/issues/42",
+               "workspace_path" => "/workspaces/GH-42",
+               "status" => "completed"
+             }
+           ]
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do

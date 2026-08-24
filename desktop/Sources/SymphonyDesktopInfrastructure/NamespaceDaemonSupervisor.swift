@@ -250,7 +250,12 @@ public actor NamespaceDaemonSupervisor {
     guard http.statusCode == 200 else { throw NamespaceDaemonError.endpointUnavailable }
     let decoder = JSONDecoder()
     decoder.keyDecodingStrategy = .convertFromSnakeCase
-    return try decoder.decode(NamespaceIssueStatePayload.self, from: data).runs
+    let payload = try decoder.decode(NamespaceIssueStatePayload.self, from: data)
+    if payload.trackerError?.code == "tracker_auth_expired" {
+      try await refreshGitHubRuntime(namespaceID: namespaceID, runtime: runtime)
+      throw NamespaceDaemonError.githubCredentialsUnavailable
+    }
+    return payload.runs
   }
 
   public func issueAction(
@@ -738,6 +743,7 @@ private struct NamespaceIssueStatePayload: Decodable {
   private let retrying: [Entry]
   private let blocked: [Entry]
   private let completed: [Entry]
+  let trackerError: TrackerError?
 
   var runs: [NamespaceIssueRun] {
     [
@@ -765,11 +771,17 @@ private struct NamespaceIssueStatePayload: Decodable {
     let workspacePath: String?
   }
 
+  struct TrackerError: Decodable {
+    let code: String
+    let message: String
+  }
+
   private enum CodingKeys: String, CodingKey {
     case running
     case retrying
     case blocked
     case completed
+    case trackerError
   }
 
   init(from decoder: Decoder) throws {
@@ -778,6 +790,7 @@ private struct NamespaceIssueStatePayload: Decodable {
     retrying = try container.decodeIfPresent([Entry].self, forKey: .retrying) ?? []
     blocked = try container.decodeIfPresent([Entry].self, forKey: .blocked) ?? []
     completed = try container.decodeIfPresent([Entry].self, forKey: .completed) ?? []
+    trackerError = try container.decodeIfPresent(TrackerError.self, forKey: .trackerError)
   }
 }
 

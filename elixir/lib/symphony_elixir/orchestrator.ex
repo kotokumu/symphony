@@ -35,7 +35,8 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_token,
       task_supervisor: SymphonyElixir.TaskSupervisor,
       running: %{},
-      completed: MapSet.new(),
+      completed: %{},
+      tracker_error: nil,
       claimed: MapSet.new(),
       blocked: %{},
       retry_attempts: %{},
@@ -212,7 +213,7 @@ defmodule SymphonyElixir.Orchestrator do
       Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
       state
-      |> complete_issue(issue_id)
+      |> complete_issue(issue_id, running_entry)
       |> schedule_issue_retry(issue_id, 1, %{
         identifier: running_entry.identifier,
         issue_url: running_entry.issue.url,
@@ -262,45 +263,46 @@ defmodule SymphonyElixir.Orchestrator do
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
          true <- available_slots(state) > 0 do
+      state = clear_tracker_error(state)
       choose_issues(issues, state)
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Tracker API token missing in WORKFLOW.md")
-        state
+        mark_tracker_error(state, :tracker_unavailable)
 
       {:error, :missing_linear_project_slug} ->
         Logger.error("Tracker project scope missing in WORKFLOW.md")
-        state
+        mark_tracker_error(state, :tracker_unavailable)
 
       {:error, :missing_tracker_kind} ->
         Logger.error("Tracker kind missing in WORKFLOW.md")
 
-        state
+        mark_tracker_error(state, :tracker_unavailable)
 
       {:error, {:unsupported_tracker_kind, kind}} ->
         Logger.error("Unsupported tracker kind in WORKFLOW.md: #{inspect(kind)}")
 
-        state
+        mark_tracker_error(state, :tracker_unavailable)
 
       {:error, {:invalid_workflow_config, message}} ->
         Logger.error("Invalid WORKFLOW.md config: #{message}")
-        state
+        mark_tracker_error(state, :tracker_unavailable)
 
       {:error, {:missing_workflow_file, path, reason}} ->
         Logger.error("Missing WORKFLOW.md at #{path}: #{inspect(reason)}")
-        state
+        mark_tracker_error(state, :tracker_unavailable)
 
       {:error, :workflow_front_matter_not_a_map} ->
         Logger.error("Failed to parse WORKFLOW.md: workflow front matter must decode to a map")
-        state
+        mark_tracker_error(state, :tracker_unavailable)
 
       {:error, {:workflow_parse_error, reason}} ->
         Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
-        state
+        mark_tracker_error(state, :tracker_unavailable)
 
       {:error, reason} ->
         Logger.error("Failed to fetch from issue tracker: #{inspect(reason)}")
-        state
+        mark_tracker_error(state, reason)
 
       false ->
         state
@@ -1023,13 +1025,35 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
 
-  defp complete_issue(%State{} = state, issue_id) do
+  defp complete_issue(%State{} = state, issue_id, metadata) do
+    completed_entry = %{
+      issue_id: issue_id,
+      issue_identifier: metadata.identifier,
+      issue_url: metadata.issue.url,
+      workspace_path: Map.get(metadata, :workspace_path),
+      status: "completed"
+    }
+
     %{
       state
-      | completed: MapSet.put(state.completed, issue_id),
+      | completed: Map.put(state.completed, issue_id, completed_entry),
         retry_attempts: Map.delete(state.retry_attempts, issue_id)
     }
   end
+
+  defp clear_tracker_error(%State{} = state), do: %{state | tracker_error: nil}
+
+  defp mark_tracker_error(%State{} = state, reason) do
+    code = if tracker_auth_expired?(reason), do: "tracker_auth_expired", else: "tracker_unavailable"
+    %{state | tracker_error: %{code: code, message: tracker_error_message(code)}}
+  end
+
+  defp tracker_auth_expired?({:github_api_status, status}) when status in [401, 403], do: true
+  defp tracker_auth_expired?(:missing_github_token), do: true
+  defp tracker_auth_expired?(_reason), do: false
+
+  defp tracker_error_message("tracker_auth_expired"), do: "Issue tracker credentials expired"
+  defp tracker_error_message("tracker_unavailable"), do: "Issue tracker is unavailable"
 
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do
@@ -1485,12 +1509,8 @@ defmodule SymphonyElixir.Orchestrator do
        running: running,
        retrying: retrying,
        blocked: blocked,
-       completed:
-         state.completed
-         |> MapSet.to_list()
-         |> Enum.map(fn issue_id ->
-           %{issue_id: issue_id, issue_identifier: issue_id, status: "completed"}
-         end),
+       completed: Map.values(state.completed),
+       tracker_error: state.tracker_error,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
