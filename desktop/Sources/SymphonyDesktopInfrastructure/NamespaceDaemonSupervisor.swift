@@ -97,7 +97,7 @@ public actor NamespaceDaemonSupervisor {
   public func configure(
     namespaceID: Namespace.ID,
     tracker: NamespaceDaemonTrackerConfiguration
-  ) {
+  ) async {
     trackerConfigurations[namespaceID] = tracker
   }
 
