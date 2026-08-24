@@ -73,9 +73,11 @@ final class NamespaceDaemonController: ObservableObject {
         self?.states[event.namespaceID] = event.state
         if case .stopped = event.state {
           self?.issueRuns.removeValue(forKey: event.namespaceID)
+          self?.issueRunErrors.removeValue(forKey: event.namespaceID)
         }
         if case .failed = event.state {
           self?.issueRuns.removeValue(forKey: event.namespaceID)
+          self?.issueRunErrors.removeValue(forKey: event.namespaceID)
           try? await self?.afterStop(event.namespaceID)
         }
       }

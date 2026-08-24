@@ -18,6 +18,7 @@ public actor NamespaceDaemonSupervisor {
     let endpoint: URL
     let output: FileHandle
     let errorOutput: FileHandle
+    let namespaceDirectory: URL
   }
 
   private let executableURL: URL?
@@ -123,6 +124,9 @@ public actor NamespaceDaemonSupervisor {
       } else {
         githubToken = nil
       }
+      guard generations[namespaceID] == generation else {
+        return
+      }
       let layout = try prepareRuntime(
         in: namespaceDirectory,
         tracker: trackerConfigurations[namespaceID] ?? .memory
@@ -136,8 +140,15 @@ public actor NamespaceDaemonSupervisor {
         port: port,
         namespaceID: namespaceID,
         generation: generation,
-        githubToken: githubToken
+        githubToken: githubToken,
+        namespaceDirectory: namespaceDirectory
       )
+      guard generations[namespaceID] == generation else {
+        try? await terminate(runtime.process)
+        close(runtime)
+        releasePort(for: namespaceID, generation: generation)
+        return
+      }
       runtimes[namespaceID] = runtime
 
       guard await waitUntilReady(runtime, namespaceID: namespaceID) else {
@@ -229,9 +240,14 @@ public actor NamespaceDaemonSupervisor {
     request.httpMethod = "GET"
     request.timeoutInterval = 5
     let (data, response) = try await URLSession.shared.data(for: request)
-    guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+    guard let http = response as? HTTPURLResponse else {
       throw NamespaceDaemonError.endpointUnavailable
     }
+    if http.statusCode == 401 {
+      try await refreshGitHubRuntime(namespaceID: namespaceID, runtime: runtime)
+      throw NamespaceDaemonError.githubCredentialsUnavailable
+    }
+    guard http.statusCode == 200 else { throw NamespaceDaemonError.endpointUnavailable }
     let decoder = JSONDecoder()
     decoder.keyDecodingStrategy = .convertFromSnakeCase
     return try decoder.decode(NamespaceIssueStatePayload.self, from: data).runs
@@ -255,12 +271,22 @@ public actor NamespaceDaemonSupervisor {
     guard let http = response as? HTTPURLResponse else {
       throw NamespaceDaemonError.endpointUnavailable
     }
+    if http.statusCode == 401 {
+      try await refreshGitHubRuntime(namespaceID: namespaceID, runtime: runtime)
+      throw NamespaceDaemonError.githubCredentialsUnavailable
+    }
     guard http.statusCode == 202 else {
       throw NamespaceIssueActionError(statusCode: http.statusCode, body: data)
     }
     let decoder = JSONDecoder()
     decoder.keyDecodingStrategy = .convertFromSnakeCase
     return try decoder.decode(NamespaceIssueActionResult.self, from: data)
+  }
+
+  private func refreshGitHubRuntime(namespaceID: Namespace.ID, runtime: Runtime) async throws {
+    guard trackerConfigurations[namespaceID]?.kind == .github else { return }
+    try await stop(namespaceID: namespaceID)
+    await start(namespaceID: namespaceID, namespaceDirectory: runtime.namespaceDirectory)
   }
 
   private func isActive(_ namespaceID: Namespace.ID) -> Bool {
@@ -414,7 +440,8 @@ public actor NamespaceDaemonSupervisor {
     port: UInt16,
     namespaceID: Namespace.ID,
     generation: UUID,
-    githubToken: String?
+    githubToken: String?,
+    namespaceDirectory: URL
   ) throws -> Runtime {
     for logURL in [layout.standardOutputURL, layout.standardErrorURL] {
       if !fileManager.fileExists(atPath: logURL.path) {
@@ -488,7 +515,8 @@ public actor NamespaceDaemonSupervisor {
       process: process,
       endpoint: endpoint,
       output: output,
-      errorOutput: errorOutput
+      errorOutput: errorOutput,
+      namespaceDirectory: namespaceDirectory
     )
   }
 
