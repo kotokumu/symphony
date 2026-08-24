@@ -127,7 +127,7 @@ private actor WindowTestGitHubBroker: GitHubConnectionBrokering {
         id: 20,
         accountLogin: "octo",
         accountType: "Organization",
-        permissions: ["issues": "read", "contents": "write"],
+        permissions: ["issues": "write", "contents": "write"],
         isSuspended: false
       )
     ]

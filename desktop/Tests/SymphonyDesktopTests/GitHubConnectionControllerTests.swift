@@ -101,7 +101,7 @@ final class GitHubConnectionControllerTests: XCTestCase {
     guard case .failed(let message) = controller.state(for: namespaceID) else {
       return XCTFail("Expected permission failure")
     }
-    XCTAssertTrue(message.contains("Issues: Read-only or Read and write"))
+    XCTAssertTrue(message.contains("Issues: Read and write"))
     XCTAssertTrue(message.contains("Contents: Read and write"))
     let repositoryRequestCount = await broker.repositoryRequestCount
     XCTAssertEqual(repositoryRequestCount, 0)
@@ -433,7 +433,7 @@ final class GitHubConnectionControllerTests: XCTestCase {
   func testSavedConnectionCheckCoversSuccessPermissionDriftAndRepositoryRevocation() async throws {
     let namespaceID = UUID()
     let connection = try makeConnection()
-    let validInstallation = makeInstallation(["issues": "read", "contents": "write"])
+    let validInstallation = makeInstallation(["issues": "write", "contents": "write"])
     let repository = GitHubRepository(
       id: 30,
       fullName: "octo/research",
@@ -442,7 +442,8 @@ final class GitHubConnectionControllerTests: XCTestCase {
     )
     let scenarios: [([GitHubInstallation], [GitHubRepository], String?)] = [
       ([validInstallation], [repository], nil),
-      ([makeInstallation(["issues": "read", "contents": "read"])], [repository], "Contents"),
+      ([makeInstallation(["issues": "read", "contents": "write"])], [repository], "Issues"),
+      ([makeInstallation(["issues": "write", "contents": "read"])], [repository], "Contents"),
       ([validInstallation], [], "repository is no longer accessible"),
     ]
 
@@ -682,10 +683,7 @@ final class GitHubConnectionControllerTests: XCTestCase {
   }
 
   func testPermissionRequirementMatrix() {
-    let accepted = [
-      ["issues": "read", "contents": "write"],
-      ["issues": "write", "contents": "write"],
-    ]
+    let accepted = [["issues": "write", "contents": "write"]]
     for permissions in accepted {
       XCTAssertNoThrow(try GitHubPermissionRequirements.validate(makeInstallation(permissions)))
     }
@@ -693,6 +691,10 @@ final class GitHubConnectionControllerTests: XCTestCase {
       [:],
       ["issues": "read", "contents": "read"],
       ["issues": "none", "contents": "write"],
+      ["issues": "read", "contents": "write"],
+      ["issues": "write", "contents": "read"],
+      ["issues": "write"],
+      ["contents": "write"],
     ]
     for permissions in rejected {
       XCTAssertThrowsError(try GitHubPermissionRequirements.validate(makeInstallation(permissions)))
@@ -745,7 +747,7 @@ private actor RecordingGitHubConnectionBroker: GitHubConnectionBrokering {
         id: 20,
         accountLogin: "octo",
         accountType: "Organization",
-        permissions: ["issues": "read", "contents": "write"],
+        permissions: ["issues": "write", "contents": "write"],
         isSuspended: false
       )
     ],
@@ -865,7 +867,7 @@ private actor GatedGitHubConnectionBroker: GitHubConnectionBrokering {
         id: 20,
         accountLogin: "octo",
         accountType: "Organization",
-        permissions: ["issues": "read", "contents": "write"],
+        permissions: ["issues": "write", "contents": "write"],
         isSuspended: false
       )
     ]
@@ -923,7 +925,7 @@ private actor RetryingGitHubConnectionBroker: GitHubConnectionBrokering {
         id: 20,
         accountLogin: "octo",
         accountType: "Organization",
-        permissions: ["issues": "read", "contents": "write"],
+        permissions: ["issues": "write", "contents": "write"],
         isSuspended: false
       )
     ]

@@ -492,8 +492,8 @@ enum GitHubPermissionRequirements {
       throw GitHubConnectionSetupError.installationSuspended
     }
     var missing: [String] = []
-    if !allowsRead(installation.permissions["issues"]) {
-      missing.append("Issues: Read-only or Read and write")
+    if installation.permissions["issues"] != "write" {
+      missing.append("Issues: Read and write")
     }
     if installation.permissions["contents"] != "write" {
       missing.append("Contents: Read and write")
@@ -503,9 +503,6 @@ enum GitHubPermissionRequirements {
     }
   }
 
-  private static func allowsRead(_ level: String?) -> Bool {
-    level == "read" || level == "write"
-  }
 }
 
 enum GitHubConnectionSetupError: LocalizedError, Equatable {

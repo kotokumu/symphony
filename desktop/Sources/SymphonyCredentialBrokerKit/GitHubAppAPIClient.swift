@@ -153,6 +153,16 @@ private final class BoundedURLSessionReader: NSObject, URLSessionDataDelegate,
 
   func urlSession(
     _ session: URLSession,
+    task: URLSessionTask,
+    willPerformHTTPRedirection response: HTTPURLResponse,
+    newRequest request: URLRequest,
+    completionHandler: @escaping (URLRequest?) -> Void
+  ) {
+    completionHandler(nil)
+  }
+
+  func urlSession(
+    _ session: URLSession,
     dataTask: URLSessionDataTask,
     didReceive data: Data
   ) {
@@ -221,7 +231,7 @@ public protocol GitHubAppAPIRequesting: Sendable {
   ) async throws -> [GitHubRepositoryDescriptor]
 }
 
-public struct GitHubAppAPIClient: GitHubAppAPIRequesting {
+public struct GitHubAppAPIClient: GitHubAppAPIRequesting, GitHubRepositoryAPIRequesting {
   private let baseURL: URL
   private let transport: any GitHubHTTPTransporting
   private let operationTimeout: Duration
@@ -298,8 +308,360 @@ public struct GitHubAppAPIClient: GitHubAppAPIRequesting {
     throw GitHubAppAPIError.paginationLimit
   }
 
+  func mintInstallationToken(
+    scope: AuthorizedGitHubRepositoryScope,
+    jwt: String
+  ) async throws -> InstallationTokenLease {
+    let deadline = ContinuousClock.now.advanced(by: operationTimeout)
+    var request = try makeRequest(
+      path: "/app/installations/\(scope.installationID)/access_tokens",
+      bearer: jwt,
+      deadline: deadline
+    )
+    request.httpMethod = "POST"
+    request.httpBody = try JSONSerialization.data(withJSONObject: [
+      "repository_ids": [scope.repositoryID],
+      "permissions": ["contents": "write", "issues": "write", "metadata": "read"],
+    ])
+    let (data, response) = try await sendRepositoryRequest(
+      request,
+      deadline: deadline,
+      isMint: true
+    )
+    guard (200..<300).contains(response.statusCode) else {
+      throw repositoryError(response: response, isMint: true)
+    }
+    let decoded: InstallationTokenResponse
+    do {
+      decoded = try JSONDecoder().decode(InstallationTokenResponse.self, from: data)
+    } catch {
+      throw GitHubRepositoryAPIError.failure(
+        GitHubCapabilityFailure(
+          category: .invalidServiceResponse,
+          message: "GitHub returned an unreadable installation credential response."
+        ),
+        invalidatesLease: true,
+        retryGET: false
+      )
+    }
+    guard let expiresAt = decoded.expirationDate else {
+      throw GitHubRepositoryAPIError.failure(
+        GitHubCapabilityFailure(
+          category: .invalidServiceResponse,
+          message: "GitHub omitted the installation credential expiration."
+        ),
+        invalidatesLease: true,
+        retryGET: false
+      )
+    }
+    var tokenData = Data(decoded.token.utf8)
+    defer { tokenData.resetBytes(in: tokenData.startIndex..<tokenData.endIndex) }
+    return InstallationTokenLease(
+      token: SecureSecretBuffer(copying: tokenData),
+      expiresAt: expiresAt
+    )
+  }
+
+  func performIssueRequest(
+    _ request: GitHubIssueCapabilityRequest,
+    scope: AuthorizedGitHubRepositoryScope,
+    token: SecureSecretBuffer
+  ) async throws -> GitHubIssueCapabilityResponse {
+    let deadline = ContinuousClock.now.advanced(by: operationTimeout)
+    if let issueNumber = request.issueNumberRequiringTypeValidation {
+      try await requireIssueTarget(
+        issueNumber,
+        scope: scope,
+        token: token,
+        deadline: deadline
+      )
+    }
+    let rendered = try render(request, scope: scope)
+    let bearer = token.withTemporaryData { String(decoding: $0, as: UTF8.self) }
+    var urlRequest = try makeRequest(
+      path: rendered.path,
+      bearer: bearer,
+      queryItems: rendered.queryItems,
+      deadline: deadline
+    )
+    urlRequest.httpMethod = rendered.method
+    urlRequest.httpBody = rendered.body
+    let data: Data
+    let response: HTTPURLResponse
+    do {
+      (data, response) = try await sendRepositoryRequest(
+        urlRequest,
+        deadline: deadline,
+        isMint: false
+      )
+    } catch let error as GitHubRepositoryAPIError {
+      throw request.isMutation ? error.markingEffectMayHaveOccurred() : error
+    }
+    guard (200..<300).contains(response.statusCode) else {
+      let error = repositoryError(response: response, isMint: false)
+      throw request.isMutation ? error.markingEffectMayHaveOccurred() : error
+    }
+    do {
+      let decoder = JSONDecoder()
+      switch request {
+      case .listIssues:
+        let values = try decoder.decode([GitHubIssueAPIResponse].self, from: data)
+          .filter { !$0.isPullRequest }
+          .map(\.record)
+        guard values.allSatisfy({ $0.number > 0 }) else { throw GitHubAppAPIError.invalidResponse }
+        return .issueList(values)
+      case .getIssue:
+        let response = try decoder.decode(GitHubIssueAPIResponse.self, from: data)
+        guard !response.isPullRequest else {
+          throw GitHubRepositoryAPIError.unsupportedPullRequest
+        }
+        let value = response.record
+        guard value.number > 0 else { throw GitHubAppAPIError.invalidResponse }
+        return .issue(value)
+      case .listComments:
+        let values = try decoder.decode([GitHubCommentAPIResponse].self, from: data).map(\.record)
+        guard values.allSatisfy({ $0.id > 0 }) else { throw GitHubAppAPIError.invalidResponse }
+        return .comments(values)
+      case .createComment:
+        let value = try decoder.decode(GitHubCommentAPIResponse.self, from: data).record
+        guard value.id > 0 else { throw GitHubAppAPIError.invalidResponse }
+        return .comment(value)
+      case .setIssueState:
+        let response = try decoder.decode(GitHubIssueAPIResponse.self, from: data)
+        guard !response.isPullRequest else { throw GitHubAppAPIError.invalidResponse }
+        let value = response.record
+        guard value.number > 0 else { throw GitHubAppAPIError.invalidResponse }
+        return .stateChanged(value)
+      }
+    } catch let error as GitHubRepositoryAPIError {
+      throw request.isMutation ? error.markingEffectMayHaveOccurred() : error
+    } catch {
+      let responseError = GitHubRepositoryAPIError.failure(
+        GitHubCapabilityFailure(
+          category: .invalidServiceResponse,
+          message: "GitHub returned an unreadable issue response."
+        ),
+        invalidatesLease: false,
+        retryGET: false
+      )
+      throw request.isMutation ? responseError.markingEffectMayHaveOccurred() : responseError
+    }
+  }
+
+  private func requireIssueTarget(
+    _ issueNumber: Int32,
+    scope: AuthorizedGitHubRepositoryScope,
+    token: SecureSecretBuffer,
+    deadline: ContinuousClock.Instant
+  ) async throws {
+    let bearer = token.withTemporaryData { String(decoding: $0, as: UTF8.self) }
+    let request = try makeRequest(
+      path: "/repos/\(scope.owner)/\(scope.repository)/issues/\(issueNumber)",
+      bearer: bearer,
+      deadline: deadline
+    )
+    let (data, response) = try await sendRepositoryRequest(
+      request,
+      deadline: deadline,
+      isMint: false
+    )
+    guard (200..<300).contains(response.statusCode) else {
+      throw repositoryError(response: response, isMint: false)
+    }
+    do {
+      let target = try JSONDecoder().decode(GitHubIssueAPIResponse.self, from: data)
+      guard target.number == issueNumber, !target.isPullRequest else {
+        throw GitHubAppAPIError.invalidResponse
+      }
+    } catch {
+      throw GitHubRepositoryAPIError.failure(
+        GitHubCapabilityFailure(
+          category: .invalidRequest,
+          message: "The selected number is not a GitHub issue."
+        ),
+        invalidatesLease: false,
+        retryGET: false
+      )
+    }
+  }
+
   private func pageQuery(_ page: Int) -> [URLQueryItem] {
     [URLQueryItem(name: "per_page", value: "100"), URLQueryItem(name: "page", value: "\(page)")]
+  }
+
+  private func render(
+    _ request: GitHubIssueCapabilityRequest,
+    scope: AuthorizedGitHubRepositoryScope
+  ) throws -> (method: String, path: String, queryItems: [URLQueryItem], body: Data?) {
+    let base = "/repos/\(scope.owner)/\(scope.repository)/issues"
+    switch request {
+    case .listIssues(let query):
+      var items = [
+        URLQueryItem(name: "state", value: query.state.rawValue),
+        URLQueryItem(name: "per_page", value: String(query.pagination.perPage)),
+        URLQueryItem(name: "page", value: String(query.pagination.page)),
+      ]
+      if !query.labels.isEmpty {
+        items.append(URLQueryItem(name: "labels", value: query.labels.joined(separator: ",")))
+      }
+      if let assignee = query.assignee {
+        items.append(URLQueryItem(name: "assignee", value: assignee))
+      }
+      if let since = query.since { items.append(URLQueryItem(name: "since", value: since)) }
+      return ("GET", base, items, nil)
+    case .getIssue(let number):
+      return ("GET", "\(base)/\(number)", [], nil)
+    case .listComments(let number, let page):
+      return (
+        "GET",
+        "\(base)/\(number)/comments",
+        [
+          URLQueryItem(name: "per_page", value: String(page.perPage)),
+          URLQueryItem(name: "page", value: String(page.page)),
+        ],
+        nil
+      )
+    case .createComment(let number, let body):
+      return (
+        "POST",
+        "\(base)/\(number)/comments",
+        [],
+        try JSONSerialization.data(withJSONObject: ["body": body])
+      )
+    case .setIssueState(let number, let state):
+      return (
+        "PATCH",
+        "\(base)/\(number)",
+        [],
+        try JSONSerialization.data(withJSONObject: ["state": state.rawValue])
+      )
+    }
+  }
+
+  private func sendRepositoryRequest(
+    _ request: URLRequest,
+    deadline: ContinuousClock.Instant,
+    isMint: Bool
+  ) async throws -> (Data, HTTPURLResponse) {
+    do {
+      return try await transport.data(
+        for: request,
+        maximumBytes: CredentialBrokerProtocolLimits.maximumGitHubAPIResponseBytes,
+        deadline: deadline
+      )
+    } catch let error as GitHubAppAPIError {
+      let category: GitHubCapabilityFailure.Category
+      switch error {
+      case .requestTimedOut:
+        category = .timedOut
+      case .responseTooLarge:
+        category = .invalidServiceResponse
+      default:
+        category = .networkUnavailable
+      }
+      throw GitHubRepositoryAPIError.failure(
+        GitHubCapabilityFailure(category: category, message: error.localizedDescription),
+        invalidatesLease: isMint,
+        retryGET: false
+      )
+    } catch {
+      throw GitHubRepositoryAPIError.failure(
+        GitHubCapabilityFailure(
+          category: .networkUnavailable,
+          message: "GitHub could not be reached. Try again."
+        ),
+        invalidatesLease: isMint,
+        retryGET: false
+      )
+    }
+  }
+
+  private func repositoryError(
+    response: HTTPURLResponse,
+    isMint: Bool
+  ) -> GitHubRepositoryAPIError {
+    let status = response.statusCode
+    let rateLimited = status == 429
+      || (status == 403
+        && (response.value(forHTTPHeaderField: "X-RateLimit-Remaining")?.trimmingCharacters(in: .whitespaces) == "0"
+          || response.value(forHTTPHeaderField: "Retry-After") != nil))
+    let category: GitHubCapabilityFailure.Category
+    let message: String
+    let invalidates: Bool
+    let retryGET: Bool
+    switch status {
+    case 300..<400:
+      category = .redirectRejected
+      message = "GitHub redirected the scoped request. Check the selected repository."
+      invalidates = false
+      retryGET = false
+    case 401:
+      category = isMint ? .appCredentialRejected : .authExpired
+      message = isMint
+        ? "GitHub rejected the App credential. Import a current private key."
+        : "The GitHub installation credential expired. Retry the operation."
+      invalidates = true
+      retryGET = !isMint
+    case 403 where rateLimited, 429:
+      category = .rateLimited
+      message = "GitHub rate limited the request. Retry after the reported reset."
+      invalidates = false
+      retryGET = false
+    case 403:
+      category = .permissionDenied
+      message = "The GitHub App lacks the required repository permission."
+      invalidates = true
+      retryGET = false
+    case 404:
+      category = isMint ? .installationRevoked : .resourceNotFound
+      message = isMint
+        ? "The GitHub App installation is no longer accessible. Reconnect this namespace."
+        : "The selected issue or repository is unavailable. Check the connection."
+      invalidates = true
+      retryGET = false
+    case 422:
+      category = isMint ? .repositoryUnavailable : .invalidRequest
+      message = "GitHub rejected the selected repository request."
+      invalidates = true
+      retryGET = false
+    case 500..<600:
+      category = .serviceUnavailable
+      message = "GitHub is temporarily unavailable. Try again."
+      invalidates = false
+      retryGET = false
+    default:
+      category = (100..<200).contains(status) ? .invalidServiceResponse : .invalidRequest
+      message = "GitHub rejected the scoped request."
+      invalidates = false
+      retryGET = false
+    }
+    return .failure(
+      GitHubCapabilityFailure(
+        category: category,
+        message: message,
+        status: status,
+        retryAt: retryDate(from: response)
+      ),
+      invalidatesLease: invalidates,
+      retryGET: retryGET
+    )
+  }
+
+  private func retryDate(from response: HTTPURLResponse) -> Date? {
+    if let raw = response.value(forHTTPHeaderField: "Retry-After") {
+      if let seconds = TimeInterval(raw), seconds >= 0 { return Date().addingTimeInterval(seconds) }
+      let formatter = DateFormatter()
+      formatter.locale = Locale(identifier: "en_US_POSIX")
+      formatter.timeZone = TimeZone(secondsFromGMT: 0)
+      formatter.dateFormat = "EEE',' dd MMM yyyy HH':'mm':'ss 'GMT'"
+      if let date = formatter.date(from: raw) { return date }
+    }
+    if let raw = response.value(forHTTPHeaderField: "X-RateLimit-Reset"),
+      let seconds = TimeInterval(raw), seconds >= 0
+    {
+      return Date(timeIntervalSince1970: seconds)
+    }
+    return nil
   }
 
   private func makeRequest(
@@ -426,6 +788,18 @@ private struct InstallationResponse: Decodable {
 
 private struct InstallationTokenResponse: Decodable {
   let token: String
+  let expiresAt: String?
+
+  enum CodingKeys: String, CodingKey {
+    case token
+    case expiresAt = "expires_at"
+  }
+
+  var expirationDate: Date? {
+    guard let expiresAt else { return nil }
+    let formatter = ISO8601DateFormatter()
+    return formatter.date(from: expiresAt)
+  }
 }
 
 private struct RepositoriesResponse: Decodable {
@@ -457,6 +831,92 @@ private struct RepositoryResponse: Decodable {
 
 private struct APIErrorResponse: Decodable {
   let message: String
+}
+
+private struct GitHubIssueAPIResponse: Decodable {
+  struct User: Decodable { let login: String }
+  struct Label: Decodable { let name: String }
+
+  let number: Int32
+  let title: String?
+  let body: String?
+  let state: GitHubIssueState?
+  let htmlURL: URL?
+  let user: User?
+  let labels: [Label]?
+  let assignees: [User]?
+  let pullRequest: PullRequest?
+
+  struct PullRequest: Decodable {}
+
+  enum CodingKeys: String, CodingKey {
+    case number, title, body, state, user, labels, assignees
+    case htmlURL = "html_url"
+    case pullRequest = "pull_request"
+  }
+
+  var isPullRequest: Bool { pullRequest != nil }
+
+  var record: GitHubIssueRecord {
+    GitHubIssueRecord(
+      number: number,
+      title: title,
+      body: body,
+      state: state,
+      htmlURL: htmlURL,
+      authorLogin: user?.login,
+      labels: labels?.map(\.name) ?? [],
+      assigneeLogins: assignees?.map(\.login) ?? []
+    )
+  }
+}
+
+private extension GitHubIssueCapabilityRequest {
+  var issueNumberRequiringTypeValidation: Int32? {
+    switch self {
+    case .listComments(let issueNumber, _), .createComment(let issueNumber, _),
+      .setIssueState(let issueNumber, _):
+      return issueNumber
+    case .listIssues, .getIssue:
+      return nil
+    }
+  }
+
+  var isMutation: Bool {
+    switch self {
+    case .createComment, .setIssueState: true
+    case .listIssues, .getIssue, .listComments: false
+    }
+  }
+}
+
+private struct GitHubCommentAPIResponse: Decodable {
+  struct User: Decodable { let login: String }
+
+  let id: Int64
+  let body: String?
+  let htmlURL: URL?
+  let user: User?
+  let createdAt: String?
+  let updatedAt: String?
+
+  enum CodingKeys: String, CodingKey {
+    case id, body, user
+    case htmlURL = "html_url"
+    case createdAt = "created_at"
+    case updatedAt = "updated_at"
+  }
+
+  var record: GitHubIssueCommentRecord {
+    GitHubIssueCommentRecord(
+      id: id,
+      body: body,
+      htmlURL: htmlURL,
+      authorLogin: user?.login,
+      createdAt: createdAt,
+      updatedAt: updatedAt
+    )
+  }
 }
 
 public enum GitHubAppAPIError: LocalizedError, Sendable {

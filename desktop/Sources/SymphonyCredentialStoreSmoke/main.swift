@@ -10,7 +10,7 @@ struct SymphonyCredentialStoreSmokeMain {
       try await session.unlock(
         reason: "Verify Symphony development credential storage."
       )
-      await session.lock()
+      try await session.lock()
       try await session.unlock(
         reason: "Verify Symphony can reload protected development credentials."
       )

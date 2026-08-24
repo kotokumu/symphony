@@ -24,6 +24,7 @@ let package = Package(
       linkerSettings: [
         .linkedFramework("CryptoKit"),
         .linkedFramework("LocalAuthentication"),
+        .linkedFramework("Network"),
         .linkedFramework("Security"),
       ]
     ),

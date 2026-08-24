@@ -7,26 +7,53 @@ import SymphonyCredentialBrokerProtocol
 public actor NamespaceCredentialSession {
   public typealias CredentialGenerator = @Sendable () throws -> SecureSecretBuffer
 
+  private struct TrackedDiscoveryOperation: Sendable {
+    let cancel: @Sendable () -> Void
+    let wait: @Sendable () async -> Void
+  }
+
   private let namespaceID: UUID
   private let authorizer: any NamespaceUnlockAuthorizing
   private let storage: any NamespaceCredentialStoring
   private let credentialGenerator: CredentialGenerator
   private let githubAPI: any GitHubAppAPIRequesting
+  private let githubAccess: NamespaceGitHubAccessSession
   private var authorization: NamespaceUnlockAuthorization?
   private var credential: SecureSecretBuffer?
+  private var discoveryGeneration = UUID()
+  private var discoveryOperations: [UUID: TrackedDiscoveryOperation] = [:]
+  private var discoveryAdmissionClosed = true
 
   public init(
     namespaceID: UUID,
     authorizer: any NamespaceUnlockAuthorizing = LocalAuthenticationNamespaceUnlockAuthorizer(),
     storage: any NamespaceCredentialStoring = KeychainNamespaceCredentialStorage(),
     credentialGenerator: @escaping CredentialGenerator = NamespaceCredentialSession.randomCredential,
-    githubAPI: any GitHubAppAPIRequesting = GitHubAppAPIClient()
+    githubService: GitHubAppAPIClient = GitHubAppAPIClient()
+  ) {
+    self.namespaceID = namespaceID
+    self.authorizer = authorizer
+    self.storage = storage
+    self.credentialGenerator = credentialGenerator
+    githubAPI = githubService
+    githubAccess = NamespaceGitHubAccessSession(api: githubService)
+  }
+
+  init(
+    namespaceID: UUID,
+    authorizer: any NamespaceUnlockAuthorizing,
+    storage: any NamespaceCredentialStoring,
+    credentialGenerator: @escaping CredentialGenerator,
+    githubAPI: any GitHubAppAPIRequesting,
+    githubRepositoryAPI: any GitHubRepositoryAPIRequesting,
+    now: @escaping @Sendable () -> Date
   ) {
     self.namespaceID = namespaceID
     self.authorizer = authorizer
     self.storage = storage
     self.credentialGenerator = credentialGenerator
     self.githubAPI = githubAPI
+    githubAccess = NamespaceGitHubAccessSession(api: githubRepositoryAPI, now: now)
   }
 
   deinit {
@@ -64,21 +91,25 @@ public actor NamespaceCredentialSession {
         }
       }
       self.authorization = authorization
+      discoveryGeneration = UUID()
+      discoveryAdmissionClosed = false
     } catch {
       authorization.invalidate()
       throw error
     }
   }
 
-  public func lock() {
+  public func lock() async throws {
+    await quiesceDiscovery()
+    try await githubAccess.quiesceAndClear()
     credential?.clear()
     credential = nil
     authorization?.invalidate()
     authorization = nil
   }
 
-  public func removeStoredCredential() throws {
-    lock()
+  public func removeStoredCredential() async throws {
+    try await lock()
     try storage.removeAll(namespaceID: namespaceID)
   }
 
@@ -96,10 +127,12 @@ public actor NamespaceCredentialSession {
     }
   }
 
-  public func configureGitHubApp(appID: Int64, privateKeyFilePath: String) throws {
+  public func configureGitHubApp(appID: Int64, privateKeyFilePath: String) async throws {
     guard let authorization, credential != nil else {
       throw NamespaceCredentialSessionError.locked
     }
+    await quiesceDiscovery()
+    try await githubAccess.quiesceAndClear()
     var pemData = try Self.readPrivateKey(at: privateKeyFilePath)
     defer { pemData.resetBytes(in: pemData.startIndex..<pemData.endIndex) }
     var githubCredential = try StoredGitHubAppCredential(appID: appID, pemData: pemData)
@@ -120,22 +153,73 @@ public actor NamespaceCredentialSession {
     }
     credential?.clear()
     credential = replacement
+    discoveryGeneration = UUID()
+    discoveryAdmissionClosed = false
   }
 
   public func listGitHubInstallations() async throws -> [GitHubInstallationDescriptor] {
     let jwt = try githubJWT()
-    return try await githubAPI.listInstallations(jwt: jwt)
+    let api = githubAPI
+    return try await trackedDiscovery {
+      try await api.listInstallations(jwt: jwt)
+    }
   }
 
   public func listGitHubRepositories(
     installationID: Int64
   ) async throws -> [GitHubRepositoryDescriptor] {
     let jwt = try githubJWT()
-    return try await githubAPI.listRepositories(installationID: installationID, jwt: jwt)
+    let api = githubAPI
+    return try await trackedDiscovery {
+      try await api.listRepositories(installationID: installationID, jwt: jwt)
+    }
+  }
+
+  public func authorizeGitHubRepository(
+    _ authorization: GitHubRepositoryAuthorization
+  ) async throws {
+    let jwt = try githubJWT()
+    let api = githubAPI
+    let repositories = try await trackedDiscovery {
+      try await api.listRepositories(
+        installationID: authorization.installationID,
+        jwt: jwt
+      )
+    }
+    guard repositories.contains(where: {
+      $0.id == authorization.repositoryID
+        && $0.fullName.caseInsensitiveCompare(authorization.repositoryFullName) == .orderedSame
+        && $0.htmlURL == authorization.repositoryURL
+    }) else {
+      throw GitHubRepositoryAccessError.unauthorizedScope
+    }
+    try await githubAccess.authorize(authorization, storedAppID: try githubCredentialAppID())
+  }
+
+  public func performGitHubIssueRequest(
+    _ request: GitHubIssueCapabilityRequest
+  ) async throws -> GitHubIssueCapabilityResponse {
+    try await githubAccess.performIssueRequest(request) { [weak self] in
+      guard let self else { throw NamespaceCredentialSessionError.locked }
+      return try await self.githubJWT()
+    }
+  }
+
+  public func performGitHubGitOperation(
+    _ request: GitRepositoryCapabilityRequest
+  ) async throws -> GitRepositoryCapabilityResult {
+    try await githubAccess.performGitOperation(request) { [weak self] in
+      guard let self else { throw NamespaceCredentialSessionError.locked }
+      return try await self.githubJWT()
+    }
   }
 
   var retainedByteCount: Int {
     credential?.retainedByteCount ?? 0
+  }
+
+  var retainedInstallationTokenByteCount: Int {
+    get async { await githubAccess.retainedTokenByteCount }
   }
 
   public static func randomCredential() throws -> SecureSecretBuffer {
@@ -159,6 +243,50 @@ public actor NamespaceCredentialSession {
       defer { githubCredential.clear() }
       return try githubCredential.makeJWT()
     }
+  }
+
+  private func githubCredentialAppID() throws -> Int64 {
+    guard let credential else { throw NamespaceCredentialSessionError.locked }
+    return try credential.withTemporaryData { data in
+      var githubCredential = try StoredGitHubAppCredential.decode(from: data)
+      defer { githubCredential.clear() }
+      return githubCredential.appID
+    }
+  }
+
+  private func trackedDiscovery<Value: Sendable>(
+    _ operation: @escaping @Sendable () async throws -> Value
+  ) async throws -> Value {
+    guard credential != nil, !discoveryAdmissionClosed else {
+      throw NamespaceCredentialSessionError.locked
+    }
+    let generation = discoveryGeneration
+    let id = UUID()
+    let task = Task { try await operation() }
+    discoveryOperations[id] = TrackedDiscoveryOperation(
+      cancel: { task.cancel() },
+      wait: { _ = try? await task.value }
+    )
+    do {
+      let value = try await task.value
+      discoveryOperations.removeValue(forKey: id)
+      guard generation == discoveryGeneration, credential != nil, !discoveryAdmissionClosed else {
+        throw NamespaceCredentialSessionError.locked
+      }
+      return value
+    } catch {
+      discoveryOperations.removeValue(forKey: id)
+      throw error
+    }
+  }
+
+  private func quiesceDiscovery() async {
+    discoveryAdmissionClosed = true
+    discoveryGeneration = UUID()
+    let operations = Array(discoveryOperations.values)
+    operations.forEach { $0.cancel() }
+    for operation in operations { await operation.wait() }
+    discoveryOperations.removeAll()
   }
 
   private static func readPrivateKey(at path: String) throws -> Data {

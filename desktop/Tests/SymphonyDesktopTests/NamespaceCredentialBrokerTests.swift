@@ -5,6 +5,28 @@ import XCTest
 @testable import SymphonyDesktopCore
 @testable import SymphonyDesktopInfrastructure
 
+private extension NamespaceCredentialBrokerSessionHandle {
+  func authorizeGitHubRepository(_ authorization: GitHubRepositoryAuthorization) async throws {
+    throw TestBrokerCapabilityError.unsupported
+  }
+
+  func performGitHubIssueRequest(
+    _ request: GitHubIssueCapabilityRequest
+  ) async throws -> GitHubIssueCapabilityResponse {
+    throw TestBrokerCapabilityError.unsupported
+  }
+
+  func performGitHubGitOperation(
+    _ request: GitRepositoryCapabilityRequest
+  ) async throws -> GitRepositoryCapabilityResult {
+    throw TestBrokerCapabilityError.unsupported
+  }
+}
+
+private enum TestBrokerCapabilityError: Error {
+  case unsupported
+}
+
 final class NamespaceCredentialBrokerTests: XCTestCase {
   func testLockingOneNamespaceLeavesAnotherSessionUnlocked() async throws {
     let first = UUID()
@@ -213,6 +235,76 @@ final class NamespaceCredentialBrokerTests: XCTestCase {
     XCTAssertEqual(stillAvailable.first?.accountLogin, second.uuidString.lowercased())
   }
 
+  func testIssueAndGitCapabilitiesNeverCrossNamespaceSessions() async throws {
+    let first = UUID()
+    let second = UUID()
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent("broker-isolation-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+    let launcher = RecordingBrokerLauncher()
+    let broker = NamespaceCredentialBroker(launcher: launcher)
+    try await broker.unlock(namespaceID: first)
+    try await broker.unlock(namespaceID: second)
+    let firstConnection = try GitHubConnection(
+      appID: 10,
+      installationID: 20,
+      accountLogin: "first",
+      repositoryID: 31,
+      repositoryFullName: "octo/first",
+      repositoryURL: URL(string: "https://github.com/octo/first")!
+    )
+    let secondConnection = try GitHubConnection(
+      appID: 10,
+      installationID: 21,
+      accountLogin: "second",
+      repositoryID: 32,
+      repositoryFullName: "octo/second",
+      repositoryURL: URL(string: "https://github.com/octo/second")!
+    )
+    try await broker.authorizeGitHubRepository(
+      connection: firstConnection,
+      workspacesRoot: root,
+      namespaceID: first
+    )
+    try await broker.authorizeGitHubRepository(
+      connection: secondConnection,
+      workspacesRoot: root,
+      namespaceID: second
+    )
+
+    let firstIssue = try await broker.performGitHubIssueRequest(
+      .getIssue(issueNumber: 31),
+      namespaceID: first
+    )
+    let secondIssue = try await broker.performGitHubIssueRequest(
+      .getIssue(issueNumber: 32),
+      namespaceID: second
+    )
+    let firstGit = try await broker.performGitHubGitOperation(
+      .clone(targetName: "first"),
+      namespaceID: first
+    )
+    let secondGit = try await broker.performGitHubGitOperation(
+      .clone(targetName: "second"),
+      namespaceID: second
+    )
+
+    XCTAssertEqual(firstIssue, .issue(GitHubIssueRecord(number: 31, title: first.uuidString)))
+    XCTAssertEqual(secondIssue, .issue(GitHubIssueRecord(number: 32, title: second.uuidString)))
+    XCTAssertEqual(firstGit.output, "\(first.uuidString):31:first")
+    XCTAssertEqual(secondGit.output, "\(second.uuidString):32:second")
+
+    try await broker.lock(namespaceID: first)
+    do {
+      _ = try await broker.performGitHubGitOperation(.clone(targetName: "blocked"), namespaceID: first)
+      XCTFail("Expected locked namespace rejection")
+    } catch {
+      XCTAssertEqual(error.localizedDescription, "Protected namespace credentials are locked.")
+    }
+    _ = try await broker.performGitHubIssueRequest(.getIssue(issueNumber: 32), namespaceID: second)
+  }
+
   func testRemovalCoalescesWithInFlightLockBeforePurging() async throws {
     let namespaceID = UUID()
     let launcher = GatedCapabilityBrokerLauncher()
@@ -407,6 +499,7 @@ private actor RecordingBrokerSession: NamespaceCredentialBrokerSessionHandle {
   let namespaceID: UUID
   let launcher: RecordingBrokerLauncher
   private var locked = false
+  private var authorization: GitHubRepositoryAuthorization?
 
   init(namespaceID: UUID, launcher: RecordingBrokerLauncher) {
     self.namespaceID = namespaceID
@@ -437,6 +530,35 @@ private actor RecordingBrokerSession: NamespaceCredentialBrokerSessionHandle {
   }
   func listGitHubRepositories(installationID: Int64) async throws
     -> [GitHubRepositoryDescriptor] { [] }
+
+  func authorizeGitHubRepository(_ authorization: GitHubRepositoryAuthorization) async throws {
+    self.authorization = authorization
+  }
+
+  func performGitHubIssueRequest(
+    _ request: GitHubIssueCapabilityRequest
+  ) async throws -> GitHubIssueCapabilityResponse {
+    guard let authorization else { throw TestBrokerCapabilityError.unsupported }
+    guard case .getIssue(let issueNumber) = request,
+      Int64(issueNumber) == authorization.repositoryID
+    else { throw TestBrokerCapabilityError.unsupported }
+    return .issue(
+      GitHubIssueRecord(number: issueNumber, title: namespaceID.uuidString)
+    )
+  }
+
+  func performGitHubGitOperation(
+    _ request: GitRepositoryCapabilityRequest
+  ) async throws -> GitRepositoryCapabilityResult {
+    guard let authorization, case .clone(let targetName) = request else {
+      throw TestBrokerCapabilityError.unsupported
+    }
+    return GitRepositoryCapabilityResult(
+      exitStatus: 0,
+      output: "\(namespaceID.uuidString):\(authorization.repositoryID):\(targetName)",
+      wasTruncated: false
+    )
+  }
 }
 
 private actor GatedBrokerLauncher: CredentialBrokerSessionLaunching {

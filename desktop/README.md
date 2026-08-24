@@ -115,7 +115,20 @@ are never written to application files, command lines, environment variables, or
 Requests use GitHub's versioned REST API and bounded pagination and response frames.
 
 The desktop persists only the App ID, installation and account identities, and selected repository
-identity and URL in `namespaces.json`. It requires Issues read access and Contents write access for
+identity and URL in `namespaces.json`. It requires Issues write access and Contents write access for
 the initial Symphony workflow. A separate owner-only cleanup ledger makes connection rollback,
 setup cancellation, and disconnection credential deletion retryable without deleting a credential
 before the namespace metadata transaction commits.
+
+After connection, the trusted desktop authorizes the existing namespace broker with the persisted
+repository identity and namespace workspace root. The broker mints installation tokens constrained
+to that repository and to Issues and Contents write permissions. Its wire protocol exposes only
+typed issue reads, comment creation, issue state changes, and clone, fetch, or push results. It does
+not expose raw REST paths, authorization headers, or installation tokens.
+
+Git operations run as broker-owned subprocesses with system and global Git configuration disabled.
+The broker validates the workspace, repository metadata, origin, branch, and an allowlisted local
+configuration before it copies a token for the operation. A private, operation-scoped credential
+helper channel supplies that copy to Git. The Git environment disables ambient credential helpers,
+proxies, custom TLS configuration, redirects, hooks, and terminal prompts. Returned Git output is
+bounded and redacts the active raw, encoded, and HTTP credential forms.

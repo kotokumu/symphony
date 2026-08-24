@@ -6,13 +6,16 @@ public enum CredentialBrokerProtocolLimits {
   public static let maximumGitHubDescriptorBytes = 1_000_000
   public static let defaultGitHubOperationTimeout: Duration = .seconds(50)
   public static let defaultCapabilityTimeout: TimeInterval = 60
+  public static let maximumGitHubAPIResponseBytes = 512 * 1_024
+  public static let maximumGitOutputBytes = 65_536
+  public static let maximumGitCredentialInputBytes = 16_384
 }
 
 public enum CredentialBrokerHandshake: Codable, Equatable, Sendable {
   case unlocked
   case failed(message: String)
 
-  private enum CodingKeys: String, CodingKey {
+  private enum CodingKeys: String, CodingKey, CaseIterable {
     case status
     case message
   }
@@ -23,11 +26,21 @@ public enum CredentialBrokerHandshake: Codable, Equatable, Sendable {
   }
 
   public init(from decoder: any Decoder) throws {
+    try StrictProtocolCoding.rejectUnknownKeys(
+      in: decoder,
+      allowed: CodingKeys.allCases.map(\.stringValue)
+    )
     let container = try decoder.container(keyedBy: CodingKeys.self)
     switch try container.decode(Status.self, forKey: .status) {
     case .unlocked:
+      guard container.allKeys == [.status] else {
+        throw GitHubCapabilityProtocolError.invalidPayload
+      }
       self = .unlocked
     case .failed:
+      guard Set(container.allKeys) == Set([.status, .message]) else {
+        throw GitHubCapabilityProtocolError.invalidPayload
+      }
       self = .failed(message: try container.decode(String.self, forKey: .message))
     }
   }
@@ -50,6 +63,9 @@ public struct CredentialBrokerCommand: Codable, Equatable, Sendable {
     case configureGitHubApp
     case listGitHubInstallations
     case listGitHubRepositories
+    case authorizeGitHubRepository
+    case performGitHubIssueRequest
+    case performGitHubGitOperation
     case lock
   }
 
@@ -57,17 +73,61 @@ public struct CredentialBrokerCommand: Codable, Equatable, Sendable {
   public let payload: Data?
   public let githubAppConfiguration: GitHubAppConfigurationRequest?
   public let installationID: Int64?
+  public let githubRepositoryAuthorization: GitHubRepositoryAuthorization?
+  public let githubIssueRequest: GitHubIssueCapabilityRequest?
+  public let githubGitRequest: GitRepositoryCapabilityRequest?
 
   public init(
     operation: Operation,
     payload: Data? = nil,
     githubAppConfiguration: GitHubAppConfigurationRequest? = nil,
-    installationID: Int64? = nil
+    installationID: Int64? = nil,
+    githubRepositoryAuthorization: GitHubRepositoryAuthorization? = nil,
+    githubIssueRequest: GitHubIssueCapabilityRequest? = nil,
+    githubGitRequest: GitRepositoryCapabilityRequest? = nil
   ) {
     self.operation = operation
     self.payload = payload
     self.githubAppConfiguration = githubAppConfiguration
     self.installationID = installationID
+    self.githubRepositoryAuthorization = githubRepositoryAuthorization
+    self.githubIssueRequest = githubIssueRequest
+    self.githubGitRequest = githubGitRequest
+  }
+
+  public init(from decoder: any Decoder) throws {
+    try StrictProtocolCoding.rejectUnknownKeys(
+      in: decoder,
+      allowed: CodingKeys.allCases.map(\.stringValue)
+    )
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    self.init(
+      operation: try container.decode(Operation.self, forKey: .operation),
+      payload: try container.decodeIfPresent(Data.self, forKey: .payload),
+      githubAppConfiguration: try container.decodeIfPresent(
+        GitHubAppConfigurationRequest.self,
+        forKey: .githubAppConfiguration
+      ),
+      installationID: try container.decodeIfPresent(Int64.self, forKey: .installationID),
+      githubRepositoryAuthorization: try container.decodeIfPresent(
+        GitHubRepositoryAuthorization.self,
+        forKey: .githubRepositoryAuthorization
+      ),
+      githubIssueRequest: try container.decodeIfPresent(
+        GitHubIssueCapabilityRequest.self,
+        forKey: .githubIssueRequest
+      ),
+      githubGitRequest: try container.decodeIfPresent(
+        GitRepositoryCapabilityRequest.self,
+        forKey: .githubGitRequest
+      )
+    )
+    try validatePayloadShape()
+  }
+
+  private enum CodingKeys: String, CodingKey, CaseIterable {
+    case operation, payload, githubAppConfiguration, installationID
+    case githubRepositoryAuthorization, githubIssueRequest, githubGitRequest
   }
 
   public static func signChallenge(_ challenge: Data) -> Self {
@@ -94,6 +154,47 @@ public struct CredentialBrokerCommand: Codable, Equatable, Sendable {
   }
 
   public static let lock = Self(operation: .lock)
+
+  public static func authorizeGitHubRepository(_ authorization: GitHubRepositoryAuthorization) -> Self {
+    Self(
+      operation: .authorizeGitHubRepository,
+      githubRepositoryAuthorization: authorization
+    )
+  }
+
+  public static func performGitHubIssueRequest(_ request: GitHubIssueCapabilityRequest) -> Self {
+    Self(operation: .performGitHubIssueRequest, githubIssueRequest: request)
+  }
+
+  public static func performGitHubGitOperation(_ request: GitRepositoryCapabilityRequest) -> Self {
+    Self(operation: .performGitHubGitOperation, githubGitRequest: request)
+  }
+
+  public func validatePayloadShape() throws {
+    let values: [Bool] = [
+      payload != nil,
+      githubAppConfiguration != nil,
+      installationID != nil,
+      githubRepositoryAuthorization != nil,
+      githubIssueRequest != nil,
+      githubGitRequest != nil,
+    ]
+    let expectedIndex: Int?
+    switch operation {
+    case .signChallenge: expectedIndex = 0
+    case .configureGitHubApp: expectedIndex = 1
+    case .listGitHubInstallations, .lock: expectedIndex = nil
+    case .listGitHubRepositories: expectedIndex = 2
+    case .authorizeGitHubRepository: expectedIndex = 3
+    case .performGitHubIssueRequest: expectedIndex = 4
+    case .performGitHubGitOperation: expectedIndex = 5
+    }
+    guard values.enumerated().allSatisfy({ index, isPresent in
+      isPresent == (index == expectedIndex)
+    }) else {
+      throw GitHubCapabilityProtocolError.invalidPayload
+    }
+  }
 }
 
 public struct GitHubAppConfigurationRequest: Codable, Equatable, Sendable {
@@ -103,6 +204,22 @@ public struct GitHubAppConfigurationRequest: Codable, Equatable, Sendable {
   public init(appID: Int64, privateKeyFilePath: String) {
     self.appID = appID
     self.privateKeyFilePath = privateKeyFilePath
+  }
+
+  public init(from decoder: any Decoder) throws {
+    try StrictProtocolCoding.rejectUnknownKeys(
+      in: decoder,
+      allowed: CodingKeys.allCases.map(\.stringValue)
+    )
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    self.init(
+      appID: try container.decode(Int64.self, forKey: .appID),
+      privateKeyFilePath: try container.decode(String.self, forKey: .privateKeyFilePath)
+    )
+  }
+
+  private enum CodingKeys: String, CodingKey, CaseIterable {
+    case appID, privateKeyFilePath
   }
 }
 
@@ -126,6 +243,22 @@ public struct GitHubInstallationDescriptor: Codable, Equatable, Identifiable, Se
     self.permissions = permissions
     self.isSuspended = isSuspended
   }
+
+  public init(from decoder: any Decoder) throws {
+    try StrictProtocolCoding.rejectUnknownKeys(in: decoder, allowed: CodingKeys.allCases.map(\.stringValue))
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    self.init(
+      id: try container.decode(Int64.self, forKey: .id),
+      accountLogin: try container.decode(String.self, forKey: .accountLogin),
+      accountType: try container.decode(String.self, forKey: .accountType),
+      permissions: try container.decode([String: String].self, forKey: .permissions),
+      isSuspended: try container.decode(Bool.self, forKey: .isSuspended)
+    )
+  }
+
+  private enum CodingKeys: String, CodingKey, CaseIterable {
+    case id, accountLogin, accountType, permissions, isSuspended
+  }
 }
 
 public struct GitHubRepositoryDescriptor: Codable, Equatable, Identifiable, Sendable {
@@ -140,6 +273,21 @@ public struct GitHubRepositoryDescriptor: Codable, Equatable, Identifiable, Send
     self.htmlURL = htmlURL
     self.isPrivate = isPrivate
   }
+
+  public init(from decoder: any Decoder) throws {
+    try StrictProtocolCoding.rejectUnknownKeys(in: decoder, allowed: CodingKeys.allCases.map(\.stringValue))
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    self.init(
+      id: try container.decode(Int64.self, forKey: .id),
+      fullName: try container.decode(String.self, forKey: .fullName),
+      htmlURL: try container.decode(URL.self, forKey: .htmlURL),
+      isPrivate: try container.decode(Bool.self, forKey: .isPrivate)
+    )
+  }
+
+  private enum CodingKeys: String, CodingKey, CaseIterable {
+    case id, fullName, htmlURL, isPrivate
+  }
 }
 
 public enum CredentialBrokerResult: Codable, Equatable, Sendable {
@@ -147,14 +295,21 @@ public enum CredentialBrokerResult: Codable, Equatable, Sendable {
   case githubAppConfigured
   case githubInstallations([GitHubInstallationDescriptor])
   case githubRepositories([GitHubRepositoryDescriptor])
+  case githubRepositoryAuthorized
+  case githubIssueResponse(GitHubIssueCapabilityResponse)
+  case githubGitResult(GitRepositoryCapabilityResult)
+  case githubCapabilityFailed(GitHubCapabilityFailure)
   case locked
   case failed(message: String)
 
-  private enum CodingKeys: String, CodingKey {
+  private enum CodingKeys: String, CodingKey, CaseIterable {
     case status
     case payload
     case installations
     case repositories
+    case githubIssueResponse
+    case githubGitResult
+    case githubCapabilityFailure
     case message
   }
 
@@ -163,13 +318,36 @@ public enum CredentialBrokerResult: Codable, Equatable, Sendable {
     case githubAppConfigured
     case githubInstallations
     case githubRepositories
+    case githubRepositoryAuthorized
+    case githubIssueResponse
+    case githubGitResult
+    case githubCapabilityFailed
     case locked
     case failed
   }
 
   public init(from decoder: any Decoder) throws {
+    try StrictProtocolCoding.rejectUnknownKeys(
+      in: decoder,
+      allowed: CodingKeys.allCases.map(\.stringValue)
+    )
     let container = try decoder.container(keyedBy: CodingKeys.self)
-    switch try container.decode(Status.self, forKey: .status) {
+    let status = try container.decode(Status.self, forKey: .status)
+    let expectedKeys: Set<CodingKeys>
+    switch status {
+    case .signature: expectedKeys = [.status, .payload]
+    case .githubAppConfigured, .githubRepositoryAuthorized, .locked: expectedKeys = [.status]
+    case .githubInstallations: expectedKeys = [.status, .installations]
+    case .githubRepositories: expectedKeys = [.status, .repositories]
+    case .githubIssueResponse: expectedKeys = [.status, .githubIssueResponse]
+    case .githubGitResult: expectedKeys = [.status, .githubGitResult]
+    case .githubCapabilityFailed: expectedKeys = [.status, .githubCapabilityFailure]
+    case .failed: expectedKeys = [.status, .message]
+    }
+    guard Set(container.allKeys) == expectedKeys else {
+      throw GitHubCapabilityProtocolError.invalidPayload
+    }
+    switch status {
     case .signature:
       self = .signature(try container.decode(Data.self, forKey: .payload))
     case .githubAppConfigured:
@@ -181,6 +359,20 @@ public enum CredentialBrokerResult: Codable, Equatable, Sendable {
     case .githubRepositories:
       self = .githubRepositories(
         try container.decode([GitHubRepositoryDescriptor].self, forKey: .repositories)
+      )
+    case .githubRepositoryAuthorized:
+      self = .githubRepositoryAuthorized
+    case .githubIssueResponse:
+      self = .githubIssueResponse(
+        try container.decode(GitHubIssueCapabilityResponse.self, forKey: .githubIssueResponse)
+      )
+    case .githubGitResult:
+      self = .githubGitResult(
+        try container.decode(GitRepositoryCapabilityResult.self, forKey: .githubGitResult)
+      )
+    case .githubCapabilityFailed:
+      self = .githubCapabilityFailed(
+        try container.decode(GitHubCapabilityFailure.self, forKey: .githubCapabilityFailure)
       )
     case .locked:
       self = .locked
@@ -203,6 +395,17 @@ public enum CredentialBrokerResult: Codable, Equatable, Sendable {
     case .githubRepositories(let repositories):
       try container.encode(Status.githubRepositories, forKey: .status)
       try container.encode(repositories, forKey: .repositories)
+    case .githubRepositoryAuthorized:
+      try container.encode(Status.githubRepositoryAuthorized, forKey: .status)
+    case .githubIssueResponse(let response):
+      try container.encode(Status.githubIssueResponse, forKey: .status)
+      try container.encode(response, forKey: .githubIssueResponse)
+    case .githubGitResult(let result):
+      try container.encode(Status.githubGitResult, forKey: .status)
+      try container.encode(result, forKey: .githubGitResult)
+    case .githubCapabilityFailed(let failure):
+      try container.encode(Status.githubCapabilityFailed, forKey: .status)
+      try container.encode(failure, forKey: .githubCapabilityFailure)
     case .locked:
       try container.encode(Status.locked, forKey: .status)
     case .failed(let message):

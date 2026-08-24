@@ -121,14 +121,51 @@ cleanup is reported and retried without restoring the deleted namespace.
 A namespace can connect to one platform. The first supported connection is one GitHub App
 installation and one repository. A user supplies the numeric GitHub App ID and selects its private
 key file, then chooses from the installations and repositories accessible to that app. Connection
-setup requires the namespace to be unlocked.
+setup requires the namespace to be unlocked. Before repository capabilities are activated, the
+broker verifies the selected repository ID, name, and URL against GitHub for that installation.
 
 The GitHub App private key is imported and used through the protected credential boundary. Symphony
 Desktop does not read or return the private key. GitHub App authentication and installation-token
 use during connection discovery remain inside that boundary. The connection is accepted only when
-the installation is active, can read issues, can write repository contents, and can access the
+the installation is active, can read and write issues and repository contents, and can access the
 selected repository. Missing permissions, suspended or revoked installations, inaccessible
 repositories, rejected credentials, and GitHub service failures produce actionable errors.
+
+After the namespace is unlocked, Symphony can list issues, read an issue and its comments, add an
+issue comment, and open or close an issue in the selected repository. Requests for another
+installation or repository, unsupported GitHub operations, and malformed or oversized requests are
+rejected before GitHub credentials are used. Pull requests returned by GitHub's issues endpoints are
+excluded and cannot be read or mutated through issue capabilities. Read requests recover once from
+an expired credential.
+Issue mutations are not repeated automatically after dispatch because their effect may already have
+occurred. Successful operations return typed issue or comment records rather than raw GitHub REST
+response bytes.
+
+Symphony mints repository-scoped installation credentials inside the protected credential boundary.
+It reuses an unexpired credential only in protected process memory and refreshes it before expiry.
+The credential is cleared when access is rejected, the namespace is locked, or the broker exits. It
+is not returned to the desktop application, daemon, or Codex and is not written to namespace files,
+repository configuration, process arguments, environment variables, or logs.
+
+Symphony can clone the selected repository into a new namespace workspace and fetch or push that
+repository over HTTPS. Fetch and push reject repositories outside the namespace workspace,
+repositories whose origin does not match the selected repository, unsafe Git configuration, and
+unsupported push destinations. Git receives its short-lived credential through an operation-scoped
+credential helper over an inherited socket capability that is unavailable to unrelated processes.
+Repository URLs and configuration remain credential-free. The broker passes Git a verified
+filesystem authority instead of asking it to reopen a workspace path. A macOS process sandbox limits
+filesystem writes to that authority and outbound network access to a broker-owned localhost tunnel
+that accepts only GitHub connections. Clone writes to a broker-named staging directory and publishes
+the workspace name atomically only after Git succeeds. A failed clone preserves its staging directory as
+diagnostic residue; the broker does not recursively delete or unlink a mutable pathname. A reserved
+staging residue blocks subsequent operations until explicit recovery removes it, preserving replacement
+entries and unrelated user data. Temporary operation directories are retained empty because macOS has no
+unlink-by-directory-descriptor primitive; they contain no credential material.
+
+Locking protected credentials stops active GitHub and Git access, cancels queued access, clears
+short-lived credentials, and prevents replacement access until owned processes have exited. A stop
+failure remains retryable through the namespace lock operation. Git runs in an owned process group;
+the desktop verifies descendant groups are gone even when the broker must be terminated forcibly.
 
 The selected app identity, installation, account, and repository remain associated with the
 namespace's stable identity across application restarts and namespace renames. Stored private-key

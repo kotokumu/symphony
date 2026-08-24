@@ -2,6 +2,7 @@ import Foundation
 import XCTest
 
 @testable import SymphonyCredentialBrokerKit
+@testable import SymphonyCredentialBrokerProtocol
 
 final class GitHubAppAPIClientTests: XCTestCase {
   func testListsInstallationsAndRepositoriesWithoutReturningInstallationToken() async throws {
@@ -174,6 +175,78 @@ final class GitHubAppAPIClientTests: XCTestCase {
     } catch {
       XCTAssertTrue(error.localizedDescription.contains("could not be reached"))
       XCTAssertFalse(error.localizedDescription.contains("secret-jwt"))
+    }
+  }
+
+  func testIssueListFiltersPullRequestsAndGetRejectsPullRequests() async throws {
+    let scope = try makeRepositoryScope()
+    let token = SecureSecretBuffer(copying: Data("installation-token".utf8))
+    defer { token.clear() }
+    let pullRequest = """
+      {"number":7,"title":"PR","state":"open","pull_request":{"url":"https://api.github.test/pulls/7"}}
+      """
+    let issue = """
+      {"number":8,"title":"Issue","state":"open"}
+      """
+    let transport = StubGitHubTransport(
+      responses: [
+        .json(status: 200, body: "[\(pullRequest),\(issue)]"),
+        .json(status: 200, body: pullRequest),
+      ]
+    )
+    let client = GitHubAppAPIClient(
+      baseURL: URL(string: "https://api.github.test")!,
+      transport: transport
+    )
+
+    let listed = try await client.performIssueRequest(
+      .listIssues(try GitHubIssueListQuery()),
+      scope: scope,
+      token: token
+    )
+    XCTAssertEqual(listed, .issueList([GitHubIssueRecord(number: 8, title: "Issue", state: .open)]))
+
+    do {
+      _ = try await client.performIssueRequest(.getIssue(issueNumber: 7), scope: scope, token: token)
+      XCTFail("Expected pull request rejection")
+    } catch let error as GitHubRepositoryAPIError {
+      XCTAssertEqual(error.failure.category, .invalidRequest)
+    }
+  }
+
+  func testIssueMutationsValidateTargetTypeBeforeSendingMutation() async throws {
+    let operations: [GitHubIssueCapabilityRequest] = [
+      .listComments(issueNumber: 7, page: .default),
+      .createComment(issueNumber: 7, body: "comment"),
+      .setIssueState(issueNumber: 7, state: .closed),
+    ]
+    for operation in operations {
+      let scope = try makeRepositoryScope()
+      let token = SecureSecretBuffer(copying: Data("installation-token".utf8))
+      defer { token.clear() }
+      let transport = StubGitHubTransport(
+        responses: [
+          .json(
+            status: 200,
+            body: "{\"number\":7,\"state\":\"open\",\"pull_request\":{\"url\":\"https://api.github.test/pulls/7\"}}"
+          )
+        ]
+      )
+      let client = GitHubAppAPIClient(
+        baseURL: URL(string: "https://api.github.test")!,
+        transport: transport
+      )
+
+      do {
+        _ = try await client.performIssueRequest(operation, scope: scope, token: token)
+        XCTFail("Expected pull request rejection")
+      } catch let error as GitHubRepositoryAPIError {
+        XCTAssertEqual(error.failure.category, .invalidRequest)
+      }
+      let requests = await transport.requests
+      XCTAssertEqual(requests.count, 1)
+      XCTAssertEqual(requests[0].httpMethod, "GET")
+      XCTAssertEqual(requests[0].url?.path, "/repos/octo/repo/issues/7")
     }
   }
 
@@ -396,6 +469,24 @@ final class GitHubAppAPIClientTests: XCTestCase {
       "{\"id\":\(id),\"full_name\":\"octo/repository-\(id)\",\"html_url\":\"https://github.com/octo/repository-\(id)\",\"private\":true}"
     }
     return "{\"repositories\":[\(values.joined(separator: ","))]}"
+  }
+
+  private func makeRepositoryScope() throws -> AuthorizedGitHubRepositoryScope {
+    let root = FileManager.default.temporaryDirectory
+      .appendingPathComponent("github-api-scope-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: false)
+    addTeardownBlock { try? FileManager.default.removeItem(at: root) }
+    return try AuthorizedGitHubRepositoryScope(
+      GitHubRepositoryAuthorization(
+        appID: 10,
+        installationID: 20,
+        repositoryID: 30,
+        repositoryFullName: "octo/repo",
+        repositoryURL: URL(string: "https://github.com/octo/repo")!,
+        workspacesRoot: root
+      ),
+      storedAppID: 10
+    )
   }
 }
 
