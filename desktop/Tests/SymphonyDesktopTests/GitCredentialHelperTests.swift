@@ -154,11 +154,14 @@ final class GitCredentialHelperTests: XCTestCase {
     if process.isRunning {
       process.terminate()
       process.waitUntilExit()
+      fixture.server.stop()
+      _ = await serverTask.value
       XCTFail("git credential helper did not complete within the test deadline")
       return
     }
     let result = output.fileHandleForReading.readDataToEndOfFile()
     fixture.server.closeClientCopy()
+    fixture.server.stop()
     _ = await serverTask.value
 
     XCTAssertEqual(process.terminationStatus, 0)
