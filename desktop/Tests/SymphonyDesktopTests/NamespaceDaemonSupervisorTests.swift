@@ -171,7 +171,8 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
     )
 
     _ = try runningEndpoint(await supervisor.state(for: namespaceID))
-    XCTAssertEqual(await tokenRequests.values, [namespaceID])
+    let requestedNamespaces = await tokenRequests.values
+    XCTAssertEqual(requestedNamespaces, [namespaceID])
     let workflow = try String(
       contentsOf: temporaryDirectory
         .appendingPathComponent(namespaceID.uuidString)
