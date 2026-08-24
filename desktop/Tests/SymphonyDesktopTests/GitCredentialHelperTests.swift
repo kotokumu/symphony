@@ -167,7 +167,7 @@ final class GitCredentialHelperTests: XCTestCase {
     XCTAssertEqual(process.terminationStatus, 0)
     XCTAssertEqual(
       String(decoding: result, as: UTF8.self),
-      "protocol=https\nhost=github.com\npath=octo/repo.git\nusername=x-access-token\npassword=canary-token\n\n"
+      "protocol=https\nhost=github.com\npath=octo/repo.git\nusername=x-access-token\npassword=canary-token\n"
     )
   }
 
