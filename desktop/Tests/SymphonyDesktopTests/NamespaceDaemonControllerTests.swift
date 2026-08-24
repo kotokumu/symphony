@@ -3,6 +3,7 @@ import XCTest
 
 @testable import SymphonyDesktop
 @testable import SymphonyDesktopCore
+@testable import SymphonyDesktopInfrastructure
 
 @MainActor
 final class NamespaceDaemonControllerTests: XCTestCase {
