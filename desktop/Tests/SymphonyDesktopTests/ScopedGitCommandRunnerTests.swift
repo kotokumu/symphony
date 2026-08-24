@@ -914,26 +914,34 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     }
   }
 
-  func testInheritedSocketCapabilityWorksThroughTheRealBrokerHelperExecutable() async throws {
+  func testInheritedCredentialCapabilityAndDescriptorWritesStayInsideTheSandbox() async throws {
     let fixture = try makeFixture()
     let broker = try brokerExecutable()
-    let systemGit = try XCTUnwrap(TrustedSystemGitExecutable.locate())
     let groupObservation = ProcessGroupObservation()
     let executable = try makeExecutable(
       """
       #!/bin/sh
       set -e
-      printf 'STEP=started\n'
-      credential_output=$(printf 'protocol=https\nhost=github.com\npath=octo/repo\n\n' | \
-        "\(systemGit.path)" "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9" "${10}" credential fill)
-      printf 'STEP=credential\n'
-      "\(systemGit.path)" init --quiet .
+      repository=
+      for argument in "$@"; do
+        case "$argument" in http://127.0.0.1:*) repository="$argument" ;; esac
+      done
+      authority=${repository#http://}
+      host=${authority%%/*}
+      path=${authority#*/}
+      printf '%s' "$HOME" > live-home
+      request=$(printf 'protocol=http\nhost=%s\npath=%s\n\n' "$host" "$path" | \
+        /usr/bin/base64 | /usr/bin/tr -d '\n')
+      printf 'get %s\n' "$request" >&3
+      IFS=' ' read -r status response <&3
+      [ "$status" = OK ]
+      credential_output=$(printf '%s' "$response" | /usr/bin/base64 -D)
+      case "$credential_output" in *username=x-access-token*) ;; *) exit 92 ;; esac
+      touch credential-ready
+      while [ ! -e release ]; do sleep 0.01; done
       touch sandbox-write-probe
-      printf 'STEP=workspace-write\n'
       if touch "$HOME/../sandbox-escape-$$" 2>/dev/null; then exit 91; fi
-      printf 'STEP=escape-denied\n'
-      sleep 0.5
-      printf 'TEMP_HOME=%s\n%s\n' "$HOME" "$credential_output"
+      printf 'sandboxed\n'
       """
     )
     let runner = ScopedGitCommandRunner(
@@ -952,29 +960,36 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       }
     }
     let processID = try await groupObservation.waitForProcessID()
-    try await Task.sleep(for: .milliseconds(150))
+    let staging = try await waitForCloneStagingDirectory(in: fixture.root)
+    try await waitForFile(staging.appendingPathComponent("credential-ready"))
+    let temporaryHome = URL(
+      fileURLWithPath: String(
+        decoding: try Data(contentsOf: staging.appendingPathComponent("live-home")),
+        as: UTF8.self
+      )
+    )
+    XCTAssertTrue(FileManager.default.fileExists(atPath: temporaryHome.path))
     try assertNoCredentialRepresentations("socket-canary-token", under: fixture.root)
+    try assertNoCredentialRepresentations("socket-canary-token", under: temporaryHome)
     let processListing = try processOutput(
       executable: URL(fileURLWithPath: "/bin/ps"),
       arguments: ["eww", "-p", String(processID)]
     )
     XCTAssertFalse(processListing.contains("socket-canary-token"))
-    let result = try await operation.value
-    let temporaryHome = try XCTUnwrap(
-      result.output.split(separator: "\n")
-        .first(where: { $0.hasPrefix("TEMP_HOME=") })
-        .map { URL(fileURLWithPath: String($0.dropFirst("TEMP_HOME=".count))) }
+    FileManager.default.createFile(
+      atPath: staging.appendingPathComponent("release").path,
+      contents: Data()
     )
+    let result = try await operation.value
 
-    XCTAssertTrue(result.output.contains("username=x-access-token"))
+    XCTAssertTrue(result.output.contains("sandboxed"))
     XCTAssertFalse(result.output.contains("socket-canary-token"))
-    XCTAssertTrue(result.output.contains("[REDACTED]"))
     XCTAssertTrue(
       FileManager.default.fileExists(
         atPath: fixture.root.appendingPathComponent("helper/sandbox-write-probe").path
       )
     )
-    try assertNoCredentialRepresentations("socket-canary-token", under: temporaryHome)
+    XCTAssertFalse(FileManager.default.fileExists(atPath: temporaryHome.path))
   }
 
   func testRedactsEveryCredentialRepresentation() {
@@ -1281,6 +1296,12 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
   }
 
   private func assertNoCredentialRepresentations(_ token: String, under root: URL) throws {
+    var isDirectory: ObjCBool = false
+    XCTAssertTrue(
+      FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory),
+      "Expected credential scan root to exist: \(root.path)"
+    )
+    XCTAssertTrue(isDirectory.boolValue)
     let data = Data(token.utf8)
     let representations = [
       token,
@@ -1289,8 +1310,9 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       "Bearer \(token)",
       "Basic \(Data("x-access-token:\(token)".utf8).base64EncodedString())",
     ]
-    guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil)
-    else { return }
+    let enumerator = try XCTUnwrap(
+      FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil)
+    )
     for case let url as URL in enumerator {
       guard let values = try? url.resourceValues(forKeys: [.isRegularFileKey]),
         values.isRegularFile == true,

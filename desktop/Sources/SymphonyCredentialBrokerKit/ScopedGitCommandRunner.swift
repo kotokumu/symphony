@@ -649,7 +649,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     return [
       "-D", "WRITE_ROOT=\(writeRoot)",
       "-D", "TEMP_ROOT=\(temporaryRoot)",
-      "-D", "GIT_EXECUTABLE=\(gitExecutableURL.path)",
+      "-D", "GIT_EXECUTABLE=\(Self.canonicalSandboxPath(gitExecutableURL.path))",
       "-p", Self.sandboxProfile(proxyPort: proxyPort),
     ]
   }
@@ -666,7 +666,10 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
     guard fcntl(descriptor, F_GETPATH, &buffer) == 0 else {
       throw GitRepositoryTrustError.filesystemChanged
     }
-    let path = String(cString: buffer)
+    let path = String(
+      decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) },
+      as: UTF8.self
+    )
     var opened = stat()
     var atPath = stat()
     guard fstat(descriptor, &opened) == 0,
@@ -1047,7 +1050,10 @@ private final class GitExecutionAuthority: @unchecked Sendable {
     guard fcntl(descriptor, F_GETPATH, &buffer) == 0 else {
       throw GitRepositoryTrustError.filesystemChanged
     }
-    let path = String(cString: buffer)
+    let path = String(
+      decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) },
+      as: UTF8.self
+    )
     var opened = stat()
     var atPath = stat()
     guard fstat(descriptor, &opened) == 0,
@@ -1196,7 +1202,7 @@ final class GitHubConnectProxy: @unchecked Sendable {
     let identifier = ObjectIdentifier(upstream)
     lock.withLock { upstreams[identifier] = upstream }
     defer {
-      lock.withLock { upstreams.removeValue(forKey: identifier) }
+      _ = lock.withLock { upstreams.removeValue(forKey: identifier) }
       upstream.cancel()
     }
     var initial = rewritten
@@ -1234,7 +1240,7 @@ final class GitHubConnectProxy: @unchecked Sendable {
 
   private func rewriteRequest(_ header: Data) -> Data? {
     guard let text = String(data: header, encoding: .utf8) else { return nil }
-    var lines = text.components(separatedBy: "\r\n")
+    let lines = text.components(separatedBy: "\r\n")
     guard let requestLine = lines.first else { return nil }
     let requestFields = requestLine.split(separator: " ", omittingEmptySubsequences: false)
     guard requestFields.count == 3,
