@@ -125,6 +125,66 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
     try await supervisor.stopAll()
   }
 
+  func testGitHubNamespaceRequestsAShortLivedTokenAndInjectsItOnlyIntoThatDaemon() async throws {
+    let namespaceID = UUID()
+    let readySignal = temporaryDirectory.appendingPathComponent("github-token-ready")
+    let executable = try makeExecutable(
+      named: "check-github-token",
+      body: """
+        if [ "${GITHUB_TOKEN:-}" != "installation-token-for-(namespaceID.uuidString)" ]; then
+          exit 41
+        fi
+        if [ -n "${GH_TOKEN:-}" ] || [ -n "${OPENAI_API_KEY:-}" ]; then
+          exit 42
+        fi
+        touch '(readySignal.path)'
+        trap 'exit 0' TERM INT
+        while :; do sleep 1; done
+        """
+    )
+    let tokenRequests = GitHubTokenRequestRecorder()
+    let supervisor = NamespaceDaemonSupervisor(
+      executableURL: executable,
+      codexExecutableURL: URL(fileURLWithPath: "/usr/bin/true"),
+      readinessTimeout: 1,
+      readinessProbe: { _ in FileManager.default.fileExists(atPath: readySignal.path) },
+      portAllocator: { 42401 },
+      environment: [
+        "PATH": "/usr/bin:/bin",
+        "GITHUB_TOKEN": "inherited-token-must-not-leak",
+        "GH_TOKEN": "inherited-token-must-not-leak",
+        "OPENAI_API_KEY": "inherited-key-must-not-leak",
+      ],
+      githubTokenProvider: { requestedNamespaceID in
+        await tokenRequests.append(requestedNamespaceID)
+        return "installation-token-for-\(requestedNamespaceID.uuidString)"
+      }
+    )
+    await supervisor.configure(
+      namespaceID: namespaceID,
+      tracker: .github(repository: "acme/research")
+    )
+
+    await supervisor.start(
+      namespaceID: namespaceID,
+      namespaceDirectory: try makeNamespaceDirectory(namespaceID)
+    )
+
+    _ = try runningEndpoint(await supervisor.state(for: namespaceID))
+    let requestedNamespaces = await tokenRequests.values
+    XCTAssertEqual(requestedNamespaces, [namespaceID])
+    let workflow = try String(
+      contentsOf: temporaryDirectory
+        .appendingPathComponent(namespaceID.uuidString)
+        .appendingPathComponent("Runtime/WORKFLOW.md"),
+      encoding: .utf8
+    )
+    XCTAssertTrue(workflow.contains("kind: github"))
+    XCTAssertTrue(workflow.contains("repo: 'acme/research'"))
+    XCTAssertTrue(workflow.contains("token: \"$GITHUB_TOKEN\""))
+    try await supervisor.stopAll()
+  }
+
   func testRestartDoesNotAcceptTheOldProcessesDelayedTermination() async throws {
     let executable = try makeLongRunningExecutable()
     let ports = PortSequence([42101, 42102])
@@ -529,6 +589,14 @@ private enum TestFailure: Error {
   case expectedRunning(NamespaceDaemonState)
   case fileDidNotAppear(URL)
   case terminationWasNotDeferred
+}
+
+private actor GitHubTokenRequestRecorder {
+  private(set) var values: [Namespace.ID] = []
+
+  func append(_ namespaceID: Namespace.ID) {
+    values.append(namespaceID)
+  }
 }
 
 private final class PortSequence: @unchecked Sendable {
