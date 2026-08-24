@@ -48,15 +48,27 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
             |> put_status(202)
             |> json(payload)
 
-          {:error, :not_found} -> error_response(conn, 404, "issue_not_found", "Issue not found")
-          {:error, :not_running} -> error_response(conn, 409, "issue_not_running", "Issue is not running")
-          {:error, :already_started} -> error_response(conn, 409, "issue_already_started", "Issue is already active")
-          {:error, :not_dispatchable} -> error_response(conn, 409, "issue_not_dispatchable", "Issue cannot be dispatched")
-          {:error, :tracker_unavailable} -> error_response(conn, 503, "tracker_unavailable", "Issue tracker is unavailable")
-          :unavailable -> error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
+          {:error, :not_found} ->
+            error_response(conn, 404, "issue_not_found", "Issue not found")
+
+          {:error, :not_running} ->
+            error_response(conn, 409, "issue_not_running", "Issue is not running")
+
+          {:error, :already_started} ->
+            error_response(conn, 409, "issue_already_started", "Issue is already active")
+
+          {:error, :not_dispatchable} ->
+            error_response(conn, 409, "issue_not_dispatchable", "Issue cannot be dispatched")
+
+          {:error, :tracker_unavailable} ->
+            error_response(conn, 503, "tracker_unavailable", "Issue tracker is unavailable")
+
+          :unavailable ->
+            error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
         end
 
-      :error -> error_response(conn, 400, "invalid_action", "Unsupported issue action")
+      :error ->
+        error_response(conn, 400, "invalid_action", "Unsupported issue action")
     end
   end
 

@@ -1527,6 +1527,7 @@ defmodule SymphonyElixir.Orchestrator do
             case Enum.find(issues, &(&1.identifier == identifier)) do
               %Issue{} = issue ->
                 next_state = dispatch_issue(state, issue)
+
                 if MapSet.member?(next_state.claimed, issue.id) do
                   {{:ok, %{issue_identifier: identifier, status: "running"}}, next_state}
                 else
