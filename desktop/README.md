@@ -28,6 +28,29 @@ SYMPHONY_CODE_SIGN_IDENTITY="Apple Development: Your Name (TEAMID)" make -C desk
 
 `make -C desktop all` runs the build and test checks used by continuous integration.
 
+## Release packaging
+
+The supported release target is macOS 13 or later on Apple Silicon or Intel hardware. A release
+package contains the signed desktop app, credential broker, and Symphony daemon in one sealed
+bundle; Codex remains a user-installed dependency and is never copied into the bundle.
+
+Create and validate a signed package with an Apple Developer ID identity:
+
+```sh
+SYMPHONY_CODE_SIGN_IDENTITY="Developer ID Application: Your Team (TEAMID)" \
+SYMPHONY_VERSION="0.1.0" SYMPHONY_OUTPUT_DIR="$PWD/dist" \
+  make -C desktop package
+desktop/scripts/validate-macos-mvp.sh "$PWD/dist/Symphony.app"
+```
+
+For CI-only structural checks, `make -C desktop validate-package` creates an unsigned package and
+checks its bundle contents. A distributable build must be signed, assessed by Gatekeeper, and
+notarized with `xcrun notarytool` before release. The release workflow supplies the notary profile
+without writing its credentials to the repository. Installing a newer package replaces only the
+application bundle; namespace metadata, workspaces, Codex homes, and Keychain items remain outside
+the bundle. Uninstall removes the app and helper but does not silently delete namespace data or
+protected Keychain items; users must delete namespaces from Symphony when they intend to remove it.
+
 ## Launch Check
 
 Set `SYMPHONY_CODE_SIGN_IDENTITY` to an Apple Development code-signing identity and run

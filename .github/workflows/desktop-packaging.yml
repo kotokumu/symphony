@@ -1,0 +1,46 @@
+name: desktop-packaging
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semantic version to package"
+        required: true
+        type: string
+  push:
+    tags:
+      - "desktop-v*"
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: macos-15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+      SYMPHONY_VERSION: ${{ inputs.version || github.ref_name }}
+      SYMPHONY_OUTPUT_DIR: ${{ github.workspace }}/dist
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Set up mise tools
+        uses: jdx/mise-action@5228313ee0372e111a38da051671ca30fc5a96db # v3
+        with:
+          install: true
+          cache: true
+          working_directory: elixir
+      - name: Build and package signed app
+        env:
+          SYMPHONY_CODE_SIGN_IDENTITY: ${{ secrets.SYMPHONY_CODE_SIGN_IDENTITY }}
+          SYMPHONY_NOTARY_PROFILE: ${{ secrets.SYMPHONY_NOTARY_PROFILE }}
+        run: |
+          test -n "$SYMPHONY_CODE_SIGN_IDENTITY"
+          test -n "$SYMPHONY_NOTARY_PROFILE"
+          make -C desktop package
+          desktop/scripts/validate-macos-mvp.sh "$SYMPHONY_OUTPUT_DIR/Symphony.app"
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Symphony-${{ env.SYMPHONY_VERSION }}-macos
+          path: dist/Symphony-*-macos.zip
