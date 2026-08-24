@@ -1576,7 +1576,7 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-defp retry_issue_action(state, issue_id, metadata, identifier) do
+  defp retry_issue_action(state, issue_id, metadata, identifier) do
     case Tracker.fetch_issues_by_ids([issue_id]) do
       {:ok, [%Issue{} = issue | _]} ->
         dispatch_state = %{

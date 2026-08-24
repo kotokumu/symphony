@@ -61,8 +61,7 @@ defmodule SymphonyElixir.ExtensionsTest do
     def handle_call({:issue_action, action, identifier}, _from, state) do
       actions = Keyword.get(state, :actions, []) ++ [{action, identifier}]
 
-      {:reply, {:ok, %{issue_identifier: identifier, status: Atom.to_string(action)}},
-       Keyword.put(state, :actions, actions)}
+      {:reply, {:ok, %{issue_identifier: identifier, status: Atom.to_string(action)}}, Keyword.put(state, :actions, actions)}
     end
 
     def handle_call(:actions, _from, state) do
@@ -393,11 +392,7 @@ defmodule SymphonyElixir.ExtensionsTest do
   test "issue actions are routed to the namespace orchestrator" do
     orchestrator = Module.concat(__MODULE__, :IssueActionOrchestrator)
     start_test_endpoint(orchestrator: orchestrator, snapshot_timeout_ms: 50)
-    start_supervised!({StaticOrchestrator,
-      name: orchestrator,
-      snapshot: static_snapshot(),
-      actions: []
-    })
+    start_supervised!({StaticOrchestrator, name: orchestrator, snapshot: static_snapshot(), actions: []})
 
     assert json_response(post(build_conn(), "/api/v1/MT-HTTP/start", %{}), 202) == %{
              "issue_identifier" => "MT-HTTP",
