@@ -1485,6 +1485,10 @@ defmodule SymphonyElixir.Orchestrator do
        running: running,
        retrying: retrying,
        blocked: blocked,
+       completed:
+         state.completed
+         |> MapSet.to_list()
+         |> Enum.map(fn issue_id -> %{issue_id: issue_id, identifier: issue_id, status: "completed"} end),
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -1570,22 +1574,28 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
-  defp retry_issue_action(state, issue_id, metadata, identifier) do
-    state = %{
-      state
-      | retry_attempts: Map.delete(state.retry_attempts, issue_id),
-        blocked: Map.delete(state.blocked, issue_id),
-        claimed: MapSet.delete(state.claimed, issue_id)
-    }
-
+defp retry_issue_action(state, issue_id, metadata, identifier) do
     case Tracker.fetch_issues_by_ids([issue_id]) do
       {:ok, [%Issue{} = issue | _]} ->
-        next_state = dispatch_issue(state, issue, Map.get(metadata, :attempt), Map.get(metadata, :worker_host))
+        dispatch_state = %{
+          state
+          | retry_attempts: Map.delete(state.retry_attempts, issue_id),
+            blocked: Map.delete(state.blocked, issue_id),
+            claimed: MapSet.delete(state.claimed, issue_id)
+        }
+
+        next_state =
+          dispatch_issue(
+            dispatch_state,
+            issue,
+            Map.get(metadata, :attempt),
+            Map.get(metadata, :worker_host)
+          )
 
         if MapSet.member?(next_state.claimed, issue_id) do
           {{:ok, %{issue_identifier: identifier, status: "running"}}, next_state}
         else
-          {{:error, :not_dispatchable}, next_state}
+          {{:error, :not_dispatchable}, state}
         end
 
       {:ok, []} ->

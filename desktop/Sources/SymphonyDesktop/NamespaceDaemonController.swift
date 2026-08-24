@@ -5,6 +5,7 @@ import SymphonyDesktopInfrastructure
 
 protocol NamespaceDaemonSupervising: Sendable {
   func events() async -> AsyncStream<NamespaceDaemonEvent>
+  func configure(namespaceID: Namespace.ID, tracker: NamespaceDaemonTrackerConfiguration) async
   func start(namespaceID: Namespace.ID, namespaceDirectory: URL) async
   func stop(namespaceID: Namespace.ID) async throws
   func stopAll() async throws
@@ -16,22 +17,11 @@ protocol NamespaceDaemonSupervising: Sendable {
   ) async throws -> NamespaceIssueActionResult
 }
 
-extension NamespaceDaemonSupervising {
-  func issueRuns(namespaceID: Namespace.ID) async throws -> [NamespaceIssueRun] { [] }
-
-  func issueAction(
-    namespaceID: Namespace.ID,
-    issueIdentifier: String,
-    action: NamespaceIssueAction
-  ) async throws -> NamespaceIssueActionResult {
-    throw NamespaceDaemonError.endpointUnavailable
-  }
-}
-
 @MainActor
 final class NamespaceDaemonController: ObservableObject {
   @Published private(set) var states: [Namespace.ID: NamespaceDaemonState] = [:]
   @Published private(set) var issueRuns: [Namespace.ID: [NamespaceIssueRun]] = [:]
+  @Published private(set) var issueRunErrors: [Namespace.ID: String] = [:]
 
   private let supervisor: any NamespaceDaemonSupervising
   private let directoryURL: @Sendable (Namespace.ID) -> URL
@@ -100,6 +90,13 @@ final class NamespaceDaemonController: ObservableObject {
 
   func start(_ namespace: DesktopNamespace) async {
     await startObserving()
+    let tracker: NamespaceDaemonTrackerConfiguration
+    if case .github(let connection) = namespace.platformConnection {
+      tracker = .github(repository: connection.repositoryFullName)
+    } else {
+      tracker = .memory
+    }
+    await supervisor.configure(namespaceID: namespace.id, tracker: tracker)
     await supervisor.start(
       namespaceID: namespace.id,
       namespaceDirectory: directoryURL(namespace.id)
@@ -124,8 +121,12 @@ final class NamespaceDaemonController: ObservableObject {
   func refreshIssueRuns() async {
     for namespaceID in states.keys {
       guard case .running = states[namespaceID] else { continue }
-      if let runs = try? await supervisor.issueRuns(namespaceID: namespaceID) {
+      do {
+        let runs = try await supervisor.issueRuns(namespaceID: namespaceID)
         issueRuns[namespaceID] = runs
+        issueRunErrors.removeValue(forKey: namespaceID)
+      } catch {
+        issueRunErrors[namespaceID] = error.localizedDescription
       }
     }
   }

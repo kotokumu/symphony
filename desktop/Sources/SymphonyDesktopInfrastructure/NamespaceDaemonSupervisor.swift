@@ -40,6 +40,7 @@ public actor NamespaceDaemonSupervisor {
   private var startSuspensionCount = 0
   private var applicationTerminationRequested = false
   private var states: [Namespace.ID: NamespaceDaemonState] = [:]
+  private var trackerConfigurations: [Namespace.ID: NamespaceDaemonTrackerConfiguration] = [:]
   private var eventContinuations: [UUID: AsyncStream<NamespaceDaemonEvent>.Continuation] = [:]
 
   public init(
@@ -88,6 +89,13 @@ public actor NamespaceDaemonSupervisor {
     }
   }
 
+  public func configure(
+    namespaceID: Namespace.ID,
+    tracker: NamespaceDaemonTrackerConfiguration
+  ) {
+    trackerConfigurations[namespaceID] = tracker
+  }
+
   public func start(namespaceID: Namespace.ID, namespaceDirectory: URL) async {
     guard
       startSuspensionCount == 0,
@@ -104,7 +112,10 @@ public actor NamespaceDaemonSupervisor {
 
     do {
       let executableURL = try requireExecutable()
-      let layout = try prepareRuntime(in: namespaceDirectory)
+      let layout = try prepareRuntime(
+        in: namespaceDirectory,
+        tracker: trackerConfigurations[namespaceID] ?? .memory
+      )
       let port = try reservePort(for: namespaceID, generation: generation)
       let endpoint = URL(string: "http://127.0.0.1:\(port)")!
       let runtime = try launch(
@@ -204,6 +215,7 @@ public actor NamespaceDaemonSupervisor {
     guard let runtime = runtimes[namespaceID] else { throw NamespaceDaemonError.endpointUnavailable }
     var request = URLRequest(url: runtime.endpoint.appendingPathComponent("api/v1/state"))
     request.httpMethod = "GET"
+    request.timeoutInterval = 5
     let (data, response) = try await URLSession.shared.data(for: request)
     guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
       throw NamespaceDaemonError.endpointUnavailable
@@ -226,6 +238,7 @@ public actor NamespaceDaemonSupervisor {
         .appendingPathComponent(action.rawValue)
     )
     request.httpMethod = "POST"
+    request.timeoutInterval = 5
     let (data, response) = try await URLSession.shared.data(for: request)
     guard let http = response as? HTTPURLResponse else {
       throw NamespaceDaemonError.endpointUnavailable
@@ -278,7 +291,10 @@ public actor NamespaceDaemonSupervisor {
     portReservations.removeValue(forKey: namespaceID)
   }
 
-  private func prepareRuntime(in namespaceDirectory: URL) throws -> RuntimeLayout {
+  private func prepareRuntime(
+    in namespaceDirectory: URL,
+    tracker: NamespaceDaemonTrackerConfiguration
+  ) throws -> RuntimeLayout {
     let runtimeDirectory = namespaceDirectory.appendingPathComponent("Runtime", isDirectory: true)
     let workspaceDirectory = namespaceDirectory.appendingPathComponent(
       "Workspaces",
@@ -303,7 +319,8 @@ public actor NamespaceDaemonSupervisor {
       try workflow(
         workspaceDirectory: workspaceDirectory,
         codexHomeDirectory: codexHomeDirectory,
-        codexExecutableURL: codexExecutableURL
+        codexExecutableURL: codexExecutableURL,
+        tracker: tracker
       ).write(
         to: workflowURL,
         atomically: true,
@@ -323,15 +340,33 @@ public actor NamespaceDaemonSupervisor {
   private func workflow(
     workspaceDirectory: URL,
     codexHomeDirectory: URL,
-    codexExecutableURL: URL
+    codexExecutableURL: URL,
+    tracker: NamespaceDaemonTrackerConfiguration
   ) -> String {
     let escapedWorkspacePath = yamlSingleQuoted(workspaceDirectory.path)
     let escapedCodexHomePath = shellSingleQuoted(codexHomeDirectory.path)
     let escapedCodexExecutablePath = shellSingleQuoted(codexExecutableURL.path)
+    let trackerBlock: String
+    if tracker.kind == .github, let repository = tracker.repository {
+      trackerBlock = """
+        kind: github
+        active_states: [open]
+        terminal_states: [closed]
+        provider:
+          repo: '\(yamlSingleQuoted(repository))'
+          token: \"$GITHUB_TOKEN\"
+      """
+    } else {
+      trackerBlock = "kind: memory"
+    }
+    let indentedTrackerBlock = trackerBlock
+      .split(separator: "\n", omittingEmptySubsequences: false)
+      .map { "  \($0)" }
+      .joined(separator: "\n")
     return """
       ---
       tracker:
-        kind: memory
+        \(indentedTrackerBlock)
       workspace:
         root: '\(escapedWorkspacePath)'
       codex:
@@ -654,15 +689,17 @@ public struct NamespaceIssueActionError: LocalizedError, Sendable {
 }
 
 private struct NamespaceIssueStatePayload: Decodable {
-  let running: [Entry]
-  let retrying: [Entry]
-  let blocked: [Entry]
+  private let running: [Entry]
+  private let retrying: [Entry]
+  private let blocked: [Entry]
+  private let completed: [Entry]
 
   var runs: [NamespaceIssueRun] {
     [
       (running, "running"),
       (retrying, "retrying"),
       (blocked, "blocked"),
+      (completed, "completed"),
     ].flatMap { entries, status in
       entries.map {
         NamespaceIssueRun(
@@ -687,6 +724,7 @@ private struct NamespaceIssueStatePayload: Decodable {
     case running
     case retrying
     case blocked
+    case completed
   }
 
   init(from decoder: Decoder) throws {
@@ -694,6 +732,7 @@ private struct NamespaceIssueStatePayload: Decodable {
     running = try container.decodeIfPresent([Entry].self, forKey: .running) ?? []
     retrying = try container.decodeIfPresent([Entry].self, forKey: .retrying) ?? []
     blocked = try container.decodeIfPresent([Entry].self, forKey: .blocked) ?? []
+    completed = try container.decodeIfPresent([Entry].self, forKey: .completed) ?? []
   }
 }
 

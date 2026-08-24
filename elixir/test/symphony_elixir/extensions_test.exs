@@ -58,8 +58,15 @@ defmodule SymphonyElixir.ExtensionsTest do
       {:reply, Keyword.get(state, :refresh, :unavailable), state}
     end
 
-    def handle_call({:issue_action, _action, identifier}, _from, state) do
-      {:reply, {:ok, %{issue_identifier: identifier, status: "running"}}, state}
+    def handle_call({:issue_action, action, identifier}, _from, state) do
+      actions = Keyword.get(state, :actions, []) ++ [{action, identifier}]
+
+      {:reply, {:ok, %{issue_identifier: identifier, status: Atom.to_string(action)}},
+       Keyword.put(state, :actions, actions)}
+    end
+
+    def handle_call(:actions, _from, state) do
+      {:reply, Keyword.get(state, :actions, []), state}
     end
   end
 
@@ -385,15 +392,32 @@ defmodule SymphonyElixir.ExtensionsTest do
   test "issue actions are routed to the namespace orchestrator" do
     orchestrator = Module.concat(__MODULE__, :IssueActionOrchestrator)
     start_test_endpoint(orchestrator: orchestrator, snapshot_timeout_ms: 50)
-    start_supervised!({StaticOrchestrator, name: orchestrator, snapshot: static_snapshot()})
+    start_supervised!({StaticOrchestrator,
+      name: orchestrator,
+      snapshot: static_snapshot(),
+      actions: []
+    })
 
     assert json_response(post(build_conn(), "/api/v1/MT-HTTP/start", %{}), 202) == %{
              "issue_identifier" => "MT-HTTP",
-             "status" => "running"
+             "status" => "start"
            }
 
-    assert json_response(post(build_conn(), "/api/v1/MT-HTTP/stop", %{}), 202)["status"] ==
-             "running"
+    assert json_response(post(build_conn(), "/api/v1/MT-HTTP/stop", %{}), 202) == %{
+             "issue_identifier" => "MT-HTTP",
+             "status" => "stop"
+           }
+
+    assert json_response(post(build_conn(), "/api/v1/MT-HTTP/retry", %{}), 202) == %{
+             "issue_identifier" => "MT-HTTP",
+             "status" => "retry"
+           }
+
+    assert GenServer.call(orchestrator, :actions) == [
+             {:start, "MT-HTTP"},
+             {:stop, "MT-HTTP"},
+             {:retry, "MT-HTTP"}
+           ]
 
     assert json_response(post(build_conn(), "/api/v1/MT-HTTP/unknown", %{}), 400) == %{
              "error" => %{"code" => "invalid_action", "message" => "Unsupported issue action"}
