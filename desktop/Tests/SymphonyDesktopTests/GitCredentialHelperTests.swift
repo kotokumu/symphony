@@ -149,7 +149,14 @@ final class GitCredentialHelperTests: XCTestCase {
       Data("protocol=https\nhost=github.com\npath=octo/repo.git\n\n".utf8)
     )
     try input.fileHandleForWriting.close()
-    process.waitUntilExit()
+    let deadline = Date().addingTimeInterval(10)
+    while process.isRunning && Date() < deadline { usleep(10_000) }
+    if process.isRunning {
+      process.terminate()
+      process.waitUntilExit()
+      XCTFail("git credential helper did not complete within the test deadline")
+      return
+    }
     let result = output.fileHandleForReading.readDataToEndOfFile()
     fixture.server.closeClientCopy()
     _ = await serverTask.value
