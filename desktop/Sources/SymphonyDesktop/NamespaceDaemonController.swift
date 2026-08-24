@@ -82,12 +82,6 @@ final class NamespaceDaemonController: ObservableObject {
         }
       }
     }
-    issuePollingTask = Task { [weak self] in
-      while !Task.isCancelled {
-        await self?.refreshIssueRuns()
-        try? await Task.sleep(for: .seconds(2))
-      }
-    }
   }
 
   func state(for namespaceID: Namespace.ID) -> NamespaceDaemonState {
@@ -107,6 +101,17 @@ final class NamespaceDaemonController: ObservableObject {
       namespaceID: namespace.id,
       namespaceDirectory: directoryURL(namespace.id)
     )
+    startIssuePolling()
+  }
+
+  private func startIssuePolling() {
+    guard issuePollingTask == nil else { return }
+    issuePollingTask = Task { [weak self] in
+      while !Task.isCancelled {
+        await self?.refreshIssueRuns()
+        try? await Task.sleep(for: .seconds(2))
+      }
+    }
   }
 
   func stop(_ namespaceID: Namespace.ID) async throws {
