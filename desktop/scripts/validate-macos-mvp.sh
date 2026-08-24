@@ -18,28 +18,44 @@ if [ "${SYMPHONY_ALLOW_UNSIGNED:-0}" != 1 ]; then
   spctl --assess --type execute --no-cache "$application"
 fi
 
-if find "$application" -type f -print0 | xargs -0 strings 2>/dev/null | grep -E -q 'ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY'; then
-  echo "error: a credential-like value was found in the application bundle" >&2
-  exit 1
-fi
+validation_root=$(mktemp -d "${TMPDIR:-/tmp}/symphony-package-scan.XXXXXX")
+trap 'rm -rf "$validation_root"' EXIT
+credential_pattern='ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY'
 
-if [ -n "${SYMPHONY_PACKAGE_ARCHIVE:-}" ] && [ -f "$SYMPHONY_PACKAGE_ARCHIVE" ]; then
-  if unzip -Z1 "$SYMPHONY_PACKAGE_ARCHIVE" | grep -E -q '(^|/)(\.env|.*\.(pem|key|p8|p12|log))$'; then
-    echo "error: sensitive file type found in the package archive" >&2
+scan_tree() {
+  tree=$1
+  output="$validation_root/strings-$(basename "$tree")"
+  if ! find "$tree" -type f -exec strings {} + > "$output" 2>/dev/null; then
+    echo "error: unable to scan package files: $tree" >&2
     exit 1
   fi
-  if unzip -p "$SYMPHONY_PACKAGE_ARCHIVE" 2>/dev/null | strings | grep -E -q 'ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9]{20,}|BEGIN (RSA |EC |OPENSSH )?PRIVATE KEY'; then
-    echo "error: a credential-like value was found in the package archive" >&2
+  if grep -E -q "$credential_pattern" "$output"; then
+    echo "error: a credential-like value was found in the package" >&2
     exit 1
   fi
-fi
-if [ -n "${SYMPHONY_PACKAGE_ARCHIVE:-}" ] && [ ! -f "$SYMPHONY_PACKAGE_ARCHIVE" ]; then
-  echo "error: package archive not found: $SYMPHONY_PACKAGE_ARCHIVE" >&2
-  exit 1
-fi
-if find "$application" -type f \( -name '*.env' -o -name '*.pem' -o -name '*.key' -o -name '*.p8' -o -name '*.p12' -o -name '*.log' \) -print -quit | grep -q .; then
-  echo "error: sensitive file type found in the application bundle" >&2
-  exit 1
+  sensitive_path=
+  if ! sensitive_path=$(find "$tree" -type f \( -name '*.env' -o -name '*.pem' -o -name '*.key' -o -name '*.p8' -o -name '*.p12' -o -name '*.log' \) -print -quit); then
+    echo "error: unable to inspect package file names: $tree" >&2
+    exit 1
+  fi
+  if [ -n "$sensitive_path" ]; then
+    echo "error: sensitive file type found in the package: $sensitive_path" >&2
+    exit 1
+  fi
+}
+
+scan_tree "$application"
+
+if [ -n "${SYMPHONY_PACKAGE_ARCHIVE:-}" ]; then
+  archive="$SYMPHONY_PACKAGE_ARCHIVE"
+  [ -f "$archive" ] || { echo "error: package archive not found: $archive" >&2; exit 1; }
+  archive_root="$validation_root/archive"
+  mkdir -p "$archive_root"
+  if ! unzip -qq "$archive" -d "$archive_root"; then
+    echo "error: unable to inspect package archive: $archive" >&2
+    exit 1
+  fi
+  scan_tree "$archive_root"
 fi
 
 echo "MVP package validation passed"

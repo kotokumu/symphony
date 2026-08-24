@@ -22,7 +22,7 @@ permissions:
 
 jobs:
   validate-package:
-    if: "${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref_type != 'tag') }}"
+    if: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref_type != 'tag') }}
     runs-on: macos-15
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
@@ -54,7 +54,7 @@ jobs:
         run: make -C desktop validate-package
 
   package:
-    if: "${{ github.event_name == 'workflow_dispatch' || (github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/desktop-v')) }}"
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/desktop-v')) }}
     runs-on: macos-15
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
