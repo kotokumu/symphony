@@ -35,7 +35,8 @@ defmodule SymphonyElixir.Orchestrator do
       :tick_token,
       task_supervisor: SymphonyElixir.TaskSupervisor,
       running: %{},
-      completed: %{},
+      completed: MapSet.new(),
+      completed_metadata: %{},
       tracker_error: nil,
       claimed: MapSet.new(),
       blocked: %{},
@@ -1036,7 +1037,8 @@ defmodule SymphonyElixir.Orchestrator do
 
     %{
       state
-      | completed: Map.put(state.completed, issue_id, completed_entry),
+      | completed: MapSet.put(state.completed, issue_id),
+        completed_metadata: Map.put(state.completed_metadata, issue_id, completed_entry),
         retry_attempts: Map.delete(state.retry_attempts, issue_id)
     }
   end
@@ -1509,7 +1511,16 @@ defmodule SymphonyElixir.Orchestrator do
        running: running,
        retrying: retrying,
        blocked: blocked,
-       completed: Map.values(state.completed),
+       completed:
+         state.completed
+         |> MapSet.to_list()
+         |> Enum.map(fn issue_id ->
+           Map.get(state.completed_metadata, issue_id, %{
+             issue_id: issue_id,
+             issue_identifier: issue_id,
+             status: "completed"
+           })
+         end),
        tracker_error: state.tracker_error,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),

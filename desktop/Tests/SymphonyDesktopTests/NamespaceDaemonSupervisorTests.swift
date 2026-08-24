@@ -162,7 +162,7 @@ final class NamespaceDaemonSupervisorTests: XCTestCase {
     )
     await supervisor.configure(
       namespaceID: namespaceID,
-      tracker: .github(repository: "acme/research")
+      tracker: NamespaceDaemonTrackerConfiguration.github(repository: "acme/research")
     )
 
     await supervisor.start(
@@ -588,6 +588,14 @@ private enum TestFailure: Error {
   case expectedRunning(NamespaceDaemonState)
   case fileDidNotAppear(URL)
   case terminationWasNotDeferred
+}
+
+private actor GitHubTokenRequestRecorder {
+  private(set) var values: [Namespace.ID] = []
+
+  func append(_ namespaceID: Namespace.ID) {
+    values.append(namespaceID)
+  }
 }
 
 private final class PortSequence: @unchecked Sendable {
