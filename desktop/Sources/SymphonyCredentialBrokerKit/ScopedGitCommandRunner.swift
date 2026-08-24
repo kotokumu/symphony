@@ -203,7 +203,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
         temporaryDirectory: isolated.temporaryDirectory
       )
       removeIsolatedDirectory(isolated.temporaryDirectory)
-      throw error
+      throw clonePreparationFailure(error, hasCloneTarget: cloneTarget != nil)
     }
     var acquiredCredential: OperationCredential?
     do {
@@ -224,7 +224,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
         temporaryDirectory: isolated.temporaryDirectory
       )
       removeIsolatedDirectory(isolated.temporaryDirectory)
-      throw error
+      throw clonePreparationFailure(error, hasCloneTarget: cloneTarget != nil)
     }
     guard let credential = acquiredCredential else { throw GitCommandRunnerError.launchFailed }
     let authority: GitExecutionAuthority
@@ -250,7 +250,7 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
         temporaryDirectory: isolated.temporaryDirectory
       )
       removeIsolatedDirectory(isolated.temporaryDirectory)
-      throw error
+      throw clonePreparationFailure(error, hasCloneTarget: cloneTarget != nil)
     }
     let proxy: GitHubConnectProxy?
     do {
@@ -857,6 +857,11 @@ final class ScopedGitCommandRunner: ScopedGitRunning, @unchecked Sendable {
 
   private func requireAdmission() throws {
     guard !lock.withLock({ stopRequested }) else { throw CancellationError() }
+  }
+
+  private func clonePreparationFailure(_ error: Error, hasCloneTarget: Bool) -> Error {
+    guard hasCloneTarget, error is GitRepositoryTrustError else { return error }
+    return GitCommandRunnerError.cleanupRequired
   }
 
   private func requireNoOrphanedCloneResidue(in root: URL) throws {
