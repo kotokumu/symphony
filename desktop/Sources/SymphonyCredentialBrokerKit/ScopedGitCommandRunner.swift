@@ -1220,7 +1220,7 @@ final class GitHubConnectProxy: @unchecked Sendable {
       networkWorkers.enter()
       return true
     }
-    guard admitted, !isStopped else {
+    guard admitted else {
       upstream.cancel()
       return
     }
@@ -1229,6 +1229,7 @@ final class GitHubConnectProxy: @unchecked Sendable {
       upstream.cancel()
       networkWorkers.leave()
     }
+    guard !isStopped else { return }
     var initial = rewritten
     initial.append(request.remainder)
     guard !isStopped, send(initial, to: upstream) else { return }
