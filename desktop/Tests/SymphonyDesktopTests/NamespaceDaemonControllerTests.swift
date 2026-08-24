@@ -234,6 +234,7 @@ final class NamespaceDaemonControllerTests: XCTestCase {
       issueRunRequests,
       [first.id, second.id, first.id, second.id, first.id, second.id]
     )
+    XCTAssertEqual(controller.issueRuns[second.id]?.map(\.status), ["stopped"])
   }
 
   private func makeNamespace(named name: String) throws -> DesktopNamespace {
@@ -350,7 +351,8 @@ private actor TestDaemonSupervisor: NamespaceDaemonSupervising {
       issueIdentifier: issueIdentifier,
       action: action
     ))
-    return NamespaceIssueActionResult(issueIdentifier: issueIdentifier, status: action.rawValue)
+    let status = action == .stop ? "stopped" : "running"
+    return NamespaceIssueActionResult(issueIdentifier: issueIdentifier, status: status)
   }
 
   func setIssueRuns(_ runs: [NamespaceIssueRun], for namespaceID: Namespace.ID) {

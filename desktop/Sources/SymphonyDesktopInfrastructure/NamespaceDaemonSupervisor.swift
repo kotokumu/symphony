@@ -689,7 +689,7 @@ public actor NamespaceDaemonSupervisor {
   }
 }
 
-public enum NamespaceIssueAction: String, Codable, Sendable {
+public enum NamespaceIssueAction: String, Codable, Equatable, Sendable {
   case start
   case stop
   case retry

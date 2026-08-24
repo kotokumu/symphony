@@ -129,7 +129,8 @@ final class NamespaceDaemonController: ObservableObject {
       guard case .running = states[namespaceID] else { continue }
       do {
         let runs = try await supervisor.issueRuns(namespaceID: namespaceID)
-        issueRuns[namespaceID] = runs
+        let stopped = issueRuns[namespaceID, default: []].filter { $0.status == "stopped" }
+        issueRuns[namespaceID] = runs + stopped
         issueRunErrors.removeValue(forKey: namespaceID)
       } catch {
         issueRunErrors[namespaceID] = error.localizedDescription
