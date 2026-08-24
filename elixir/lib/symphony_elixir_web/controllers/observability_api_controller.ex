@@ -63,6 +63,9 @@ defmodule SymphonyElixirWeb.ObservabilityApiController do
           {:error, :tracker_unavailable} ->
             error_response(conn, 503, "tracker_unavailable", "Issue tracker is unavailable")
 
+          {:error, :tracker_auth_expired} ->
+            error_response(conn, 401, "tracker_auth_expired", "Issue tracker credentials expired")
+
           :unavailable ->
             error_response(conn, 503, "orchestrator_unavailable", "Orchestrator is unavailable")
         end

@@ -653,6 +653,14 @@ private struct NamespaceDetailView: View {
           HStack(alignment: .firstTextBaseline) {
             VStack(alignment: .leading, spacing: 2) {
               Text(run.issueIdentifier).font(.body.monospaced())
+              if let issueURL = run.issueURL {
+                Link("Open issue", destination: issueURL)
+                  .font(.caption)
+              }
+              if let workspacePath = run.workspacePath {
+                Link("Open workspace", destination: URL(fileURLWithPath: workspacePath))
+                  .font(.caption)
+              }
               Text(run.status.capitalized)
                 .font(.caption)
                 .foregroundStyle(run.status == "blocked" ? .orange : .secondary)

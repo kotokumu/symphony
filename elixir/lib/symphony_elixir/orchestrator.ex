@@ -1544,8 +1544,8 @@ defmodule SymphonyElixir.Orchestrator do
                 {{:error, :not_found}, state}
             end
 
-          {:error, _reason} ->
-            {{:error, :tracker_unavailable}, state}
+          {:error, reason} ->
+            {{:error, tracker_action_error(reason)}, state}
         end
     end
   end
@@ -1603,8 +1603,8 @@ defmodule SymphonyElixir.Orchestrator do
       {:ok, []} ->
         {{:error, :not_found}, state}
 
-      {:error, _reason} ->
-        {{:error, :tracker_unavailable}, state}
+      {:error, reason} ->
+        {{:error, tracker_action_error(reason)}, state}
     end
   end
 
@@ -1613,6 +1613,12 @@ defmodule SymphonyElixir.Orchestrator do
       find_retry_by_identifier(state.retry_attempts, identifier) != nil or
       find_blocked_by_identifier(state.blocked, identifier) != nil
   end
+
+  defp tracker_action_error({:github_api_status, status}) when status in [401, 403],
+    do: :tracker_auth_expired
+
+  defp tracker_action_error(:missing_github_token), do: :tracker_auth_expired
+  defp tracker_action_error(_reason), do: :tracker_unavailable
 
   defp find_running_by_identifier(running, identifier) do
     Enum.find(running, fn {_id, entry} -> entry.identifier == identifier end)
