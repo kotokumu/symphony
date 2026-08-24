@@ -258,7 +258,8 @@ public actor NamespaceDaemonSupervisor {
     let payload = try decoder.decode(NamespaceIssueStatePayload.self, from: data)
     if payload.trackerError?.code == "tracker_auth_expired" {
       recoveryIssueRuns[namespaceID] = payload.runs.map {
-        NamespaceIssueRun(
+        guard $0.status != "completed" && $0.status != "stopped" else { return $0 }
+        return NamespaceIssueRun(
           issueIdentifier: $0.issueIdentifier,
           issueURL: $0.issueURL,
           status: "recovering",
