@@ -56,4 +56,24 @@ if SYMPHONY_ALLOW_UNSIGNED=1 SYMPHONY_PACKAGE_ARCHIVE="$archive" \
   echo "error: validator accepted secret in archive fixture" >&2
   exit 1
 fi
+
+create_fixture
+printf '%s\n' 'unreadable' > "$application/Contents/unreadable.bin"
+chmod 000 "$application/Contents/unreadable.bin"
+if SYMPHONY_ALLOW_UNSIGNED=1 "$script_directory/validate-macos-mvp.sh" "$application" >/dev/null 2>&1; then
+  echo "error: validator accepted unreadable fixture" >&2
+  exit 1
+fi
+create_fixture
+printf '%s\n' 'not a zip archive' > "$root/corrupt.zip"
+if SYMPHONY_ALLOW_UNSIGNED=1 SYMPHONY_PACKAGE_ARCHIVE="$root/corrupt.zip" \
+  "$script_directory/validate-macos-mvp.sh" "$application" >/dev/null 2>&1; then
+  echo "error: validator accepted corrupt archive fixture" >&2
+  exit 1
+fi
+if SYMPHONY_ALLOW_UNSIGNED=1 SYMPHONY_PACKAGE_ARCHIVE="$root/missing.zip" \
+  "$script_directory/validate-macos-mvp.sh" "$application" >/dev/null 2>&1; then
+  echo "error: validator accepted missing archive fixture" >&2
+  exit 1
+fi
 echo "Package security validation fixtures passed"
