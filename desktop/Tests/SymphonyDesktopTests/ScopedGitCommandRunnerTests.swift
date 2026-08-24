@@ -1282,12 +1282,18 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
   ) async throws -> [Int32] {
     let deadline = ContinuousClock.now.advanced(by: .seconds(2))
     while ContinuousClock.now < deadline {
-      let output = try processOutput(
-        executable: URL(fileURLWithPath: "/usr/bin/pgrep"),
-        arguments: ["-P", String(parent)]
-      )
-      let identifiers = output.split(whereSeparator: \.isNewline).compactMap {
-        Int32(String($0).trimmingCharacters(in: .whitespacesAndNewlines))
+      var pending = [parent]
+      var identifiers = Set<Int32>()
+      while let ancestor = pending.popLast() {
+        let output = try processOutput(
+          executable: URL(fileURLWithPath: "/usr/bin/pgrep"),
+          arguments: ["-P", String(ancestor)]
+        )
+        for identifier in output.split(whereSeparator: \.isNewline).compactMap({
+          Int32(String($0).trimmingCharacters(in: .whitespacesAndNewlines))
+        }) where identifiers.insert(identifier).inserted {
+          pending.append(identifier)
+        }
       }
       if identifiers.count >= minimumCount { return identifiers }
       try await Task.sleep(for: .milliseconds(10))
