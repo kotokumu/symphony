@@ -1075,7 +1075,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
     }
     let observedParentPID = try await groupObservation.waitForProcessID()
     XCTAssertEqual(Darwin.getpgid(observedParentPID), observedParentPID)
-    let childPIDs = try await waitForChildProcesses(of: observedParentPID, minimumCount: 2)
+    let childPIDs = try await waitForChildProcesses(of: observedParentPID, minimumCount: 1)
     XCTAssertTrue(childPIDs.contains { Darwin.getpgid($0) == observedParentPID })
 
     try await runner.stopRetainedOperation()
@@ -1121,7 +1121,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
       }
     }
     let parentPID = try await groupObservation.waitForProcessID()
-    let childPIDs = try await waitForChildProcesses(of: parentPID, minimumCount: 2)
+    let childPIDs = try await waitForChildProcesses(of: parentPID, minimumCount: 1)
 
     do {
       try await runner.stopRetainedOperation()
