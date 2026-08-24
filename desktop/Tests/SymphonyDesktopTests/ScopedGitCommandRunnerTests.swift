@@ -1295,7 +1295,7 @@ final class ScopedGitCommandRunnerTests: XCTestCase {
           pending.append(identifier)
         }
       }
-      if identifiers.count >= minimumCount { return identifiers }
+      if identifiers.count >= minimumCount { return Array(identifiers) }
       try await Task.sleep(for: .milliseconds(10))
     }
     throw GitCommandRunnerError.launchFailed
