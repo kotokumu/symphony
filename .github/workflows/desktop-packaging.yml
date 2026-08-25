@@ -12,8 +12,6 @@ on:
         required: true
         type: string
   push:
-    branches:
-      - "codex/**"
     tags:
       - "desktop-v*"
 
@@ -22,7 +20,7 @@ permissions:
 
 jobs:
   validate-package:
-    if: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref_type != 'tag') }}
+    if: ${{ github.event_name == 'pull_request' }}
     runs-on: macos-15
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
