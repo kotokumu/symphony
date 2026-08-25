@@ -176,3 +176,20 @@ A user can check a saved connection after unlocking the namespace or disconnect 
 commits the removal of connection metadata before protected credential deletion. Failed credential
 cleanup is reported and retried, while the namespace remains disconnected. A failed connection save
 does not publish the connection and schedules cleanup of the imported credential.
+
+## 9. Supported Packaged Runtime
+
+The packaged MVP supports macOS 13 or later on Apple Silicon hardware. The application
+bundle contains the signed desktop executable, the credential broker, and the Symphony daemon. Codex
+is installed separately by the user and is located at launch rather than copied into the bundle.
+
+Installing an updated package replaces only the application bundle. Namespace metadata, workspace
+files, Codex homes, and protected Keychain items remain available after an upgrade. Removing the
+application does not remove namespace-owned data or Keychain items; users delete namespaces from
+Symphony when they want their associated data removed.
+
+The packaged application launches only after its code signature is valid. Release builds are
+notarized before distribution, and package validation rejects credential-like values, private-key
+files, environment files, and log files in the bundle. The daemon, broker, and desktop executable
+remain separate processes with the same namespace and credential boundaries as the development
+application.
