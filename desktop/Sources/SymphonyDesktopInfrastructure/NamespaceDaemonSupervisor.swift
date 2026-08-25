@@ -10,6 +10,8 @@ public actor NamespaceDaemonSupervisor {
       @escaping @Sendable () async -> Void
     ) -> Void
   public typealias ForceKill = @Sendable (Int32) -> Int32
+  public typealias GitHubTokenProvider = @Sendable (Namespace.ID) async throws -> String
+  public typealias GitHubTokenInvalidator = @Sendable (Namespace.ID) async throws -> Void
 
   private struct Runtime {
     let generation: UUID
@@ -17,6 +19,7 @@ public actor NamespaceDaemonSupervisor {
     let endpoint: URL
     let output: FileHandle
     let errorOutput: FileHandle
+    let namespaceDirectory: URL
   }
 
   private let executableURL: URL?
@@ -32,6 +35,8 @@ public actor NamespaceDaemonSupervisor {
   private let forceKill: ForceKill
   private let fileManager: FileManager
   private let environment: [String: String]
+  private let githubTokenProvider: GitHubTokenProvider?
+  private let githubTokenInvalidator: GitHubTokenInvalidator?
 
   private var generations: [Namespace.ID: UUID] = [:]
   private var runtimes: [Namespace.ID: Runtime] = [:]
@@ -40,6 +45,8 @@ public actor NamespaceDaemonSupervisor {
   private var startSuspensionCount = 0
   private var applicationTerminationRequested = false
   private var states: [Namespace.ID: NamespaceDaemonState] = [:]
+  private var trackerConfigurations: [Namespace.ID: NamespaceDaemonTrackerConfiguration] = [:]
+  private var recoveryIssueRuns: [Namespace.ID: [NamespaceIssueRun]] = [:]
   private var eventContinuations: [UUID: AsyncStream<NamespaceDaemonEvent>.Continuation] = [:]
 
   public init(
@@ -59,7 +66,9 @@ public actor NamespaceDaemonSupervisor {
     forcedStopTimeout: TimeInterval = 2,
     forceKill: @escaping ForceKill = { Darwin.kill($0, SIGKILL) },
     fileManager: FileManager = .default,
-    environment: [String: String] = ProcessInfo.processInfo.environment
+    environment: [String: String] = ProcessInfo.processInfo.environment,
+    githubTokenProvider: GitHubTokenProvider? = nil,
+    githubTokenInvalidator: GitHubTokenInvalidator? = nil
   ) {
     self.executableURL = executableURL
     self.codexExecutableURL = codexExecutableURL
@@ -74,6 +83,8 @@ public actor NamespaceDaemonSupervisor {
     self.forceKill = forceKill
     self.fileManager = fileManager
     self.environment = environment
+    self.githubTokenProvider = githubTokenProvider
+    self.githubTokenInvalidator = githubTokenInvalidator
   }
 
   public func events() -> AsyncStream<NamespaceDaemonEvent> {
@@ -86,6 +97,13 @@ public actor NamespaceDaemonSupervisor {
         }
       }
     }
+  }
+
+  public func configure(
+    namespaceID: Namespace.ID,
+    tracker: NamespaceDaemonTrackerConfiguration
+  ) async {
+    trackerConfigurations[namespaceID] = tracker
   }
 
   public func start(namespaceID: Namespace.ID, namespaceDirectory: URL) async {
@@ -104,7 +122,20 @@ public actor NamespaceDaemonSupervisor {
 
     do {
       let executableURL = try requireExecutable()
-      let layout = try prepareRuntime(in: namespaceDirectory)
+      let githubToken: String?
+      if trackerConfigurations[namespaceID]?.kind == .github {
+        guard let githubTokenProvider else { throw NamespaceDaemonError.githubCredentialsUnavailable }
+        githubToken = try await githubTokenProvider(namespaceID)
+      } else {
+        githubToken = nil
+      }
+      guard generations[namespaceID] == generation else {
+        return
+      }
+      let layout = try prepareRuntime(
+        in: namespaceDirectory,
+        tracker: trackerConfigurations[namespaceID] ?? .memory
+      )
       let port = try reservePort(for: namespaceID, generation: generation)
       let endpoint = URL(string: "http://127.0.0.1:\(port)")!
       let runtime = try launch(
@@ -113,8 +144,16 @@ public actor NamespaceDaemonSupervisor {
         endpoint: endpoint,
         port: port,
         namespaceID: namespaceID,
-        generation: generation
+        generation: generation,
+        githubToken: githubToken,
+        namespaceDirectory: namespaceDirectory
       )
+      guard generations[namespaceID] == generation else {
+        try? await terminate(runtime.process)
+        close(runtime)
+        releasePort(for: namespaceID, generation: generation)
+        return
+      }
       runtimes[namespaceID] = runtime
 
       guard await waitUntilReady(runtime, namespaceID: namespaceID) else {
@@ -200,6 +239,79 @@ public actor NamespaceDaemonSupervisor {
     states[namespaceID] ?? .stopped
   }
 
+  public func issueRuns(namespaceID: Namespace.ID) async throws -> [NamespaceIssueRun] {
+    guard let runtime = runtimes[namespaceID] else { throw NamespaceDaemonError.endpointUnavailable }
+    var request = URLRequest(url: runtime.endpoint.appendingPathComponent("api/v1/state"))
+    request.httpMethod = "GET"
+    request.timeoutInterval = 5
+    let (data, response) = try await URLSession.shared.data(for: request)
+    guard let http = response as? HTTPURLResponse else {
+      throw NamespaceDaemonError.endpointUnavailable
+    }
+    if http.statusCode == 401 {
+      try await refreshGitHubRuntime(namespaceID: namespaceID, runtime: runtime)
+      throw NamespaceDaemonError.githubCredentialsUnavailable
+    }
+    guard http.statusCode == 200 else { throw NamespaceDaemonError.endpointUnavailable }
+    let decoder = JSONDecoder()
+    decoder.keyDecodingStrategy = .convertFromSnakeCase
+    let payload = try decoder.decode(NamespaceIssueStatePayload.self, from: data)
+    if payload.trackerError?.code == "tracker_auth_expired" {
+      recoveryIssueRuns[namespaceID] = payload.runs.map {
+        guard $0.status != "completed" && $0.status != "stopped" else { return $0 }
+        return NamespaceIssueRun(
+          issueIdentifier: $0.issueIdentifier,
+          issueURL: $0.issueURL,
+          status: "recovering",
+          error: "Reconnecting the issue run after refreshing GitHub credentials.",
+          workspacePath: $0.workspacePath
+        )
+      }
+      try await refreshGitHubRuntime(namespaceID: namespaceID, runtime: runtime)
+      throw NamespaceDaemonError.githubCredentialsUnavailable
+    }
+    let recovered = recoveryIssueRuns.removeValue(forKey: namespaceID) ?? []
+    let visibleIdentifiers = Set(payload.runs.map(\.issueIdentifier))
+    return payload.runs + recovered.filter { !visibleIdentifiers.contains($0.issueIdentifier) }
+  }
+
+  public func issueAction(
+    namespaceID: Namespace.ID,
+    issueIdentifier: String,
+    action: NamespaceIssueAction
+  ) async throws -> NamespaceIssueActionResult {
+    guard let runtime = runtimes[namespaceID] else { throw NamespaceDaemonError.endpointUnavailable }
+    var request = URLRequest(
+      url: runtime.endpoint
+        .appendingPathComponent("api/v1")
+        .appendingPathComponent(issueIdentifier)
+        .appendingPathComponent(action.rawValue)
+    )
+    request.httpMethod = "POST"
+    request.timeoutInterval = 5
+    let (data, response) = try await URLSession.shared.data(for: request)
+    guard let http = response as? HTTPURLResponse else {
+      throw NamespaceDaemonError.endpointUnavailable
+    }
+    if http.statusCode == 401 {
+      try await refreshGitHubRuntime(namespaceID: namespaceID, runtime: runtime)
+      throw NamespaceDaemonError.githubCredentialsUnavailable
+    }
+    guard http.statusCode == 202 else {
+      throw NamespaceIssueActionError(statusCode: http.statusCode, body: data)
+    }
+    let decoder = JSONDecoder()
+    decoder.keyDecodingStrategy = .convertFromSnakeCase
+    return try decoder.decode(NamespaceIssueActionResult.self, from: data)
+  }
+
+  private func refreshGitHubRuntime(namespaceID: Namespace.ID, runtime: Runtime) async throws {
+    guard trackerConfigurations[namespaceID]?.kind == .github else { return }
+    try? await githubTokenInvalidator?(namespaceID)
+    try await stop(namespaceID: namespaceID)
+    await start(namespaceID: namespaceID, namespaceDirectory: runtime.namespaceDirectory)
+  }
+
   private func isActive(_ namespaceID: Namespace.ID) -> Bool {
     switch states[namespaceID] ?? .stopped {
     case .starting, .running:
@@ -240,7 +352,10 @@ public actor NamespaceDaemonSupervisor {
     portReservations.removeValue(forKey: namespaceID)
   }
 
-  private func prepareRuntime(in namespaceDirectory: URL) throws -> RuntimeLayout {
+  private func prepareRuntime(
+    in namespaceDirectory: URL,
+    tracker: NamespaceDaemonTrackerConfiguration
+  ) throws -> RuntimeLayout {
     let runtimeDirectory = namespaceDirectory.appendingPathComponent("Runtime", isDirectory: true)
     let workspaceDirectory = namespaceDirectory.appendingPathComponent(
       "Workspaces",
@@ -265,7 +380,8 @@ public actor NamespaceDaemonSupervisor {
       try workflow(
         workspaceDirectory: workspaceDirectory,
         codexHomeDirectory: codexHomeDirectory,
-        codexExecutableURL: codexExecutableURL
+        codexExecutableURL: codexExecutableURL,
+        tracker: tracker
       ).write(
         to: workflowURL,
         atomically: true,
@@ -285,15 +401,33 @@ public actor NamespaceDaemonSupervisor {
   private func workflow(
     workspaceDirectory: URL,
     codexHomeDirectory: URL,
-    codexExecutableURL: URL
+    codexExecutableURL: URL,
+    tracker: NamespaceDaemonTrackerConfiguration
   ) -> String {
     let escapedWorkspacePath = yamlSingleQuoted(workspaceDirectory.path)
     let escapedCodexHomePath = shellSingleQuoted(codexHomeDirectory.path)
     let escapedCodexExecutablePath = shellSingleQuoted(codexExecutableURL.path)
+    let trackerBlock: String
+    if tracker.kind == .github, let repository = tracker.repository {
+      trackerBlock = """
+        kind: github
+        active_states: [open]
+        terminal_states: [closed]
+        provider:
+          repo: '\(yamlSingleQuoted(repository))'
+          token: \"$GITHUB_TOKEN\"
+      """
+    } else {
+      trackerBlock = "kind: memory"
+    }
+    let indentedTrackerBlock = trackerBlock
+      .split(separator: "\n", omittingEmptySubsequences: false)
+      .map { "  \($0)" }
+      .joined(separator: "\n")
     return """
       ---
       tracker:
-        kind: memory
+        \(indentedTrackerBlock)
       workspace:
         root: '\(escapedWorkspacePath)'
       codex:
@@ -328,7 +462,9 @@ public actor NamespaceDaemonSupervisor {
     endpoint: URL,
     port: UInt16,
     namespaceID: Namespace.ID,
-    generation: UUID
+    generation: UUID,
+    githubToken: String?,
+    namespaceDirectory: URL
   ) throws -> Runtime {
     for logURL in [layout.standardOutputURL, layout.standardErrorURL] {
       if !fileManager.fileExists(atPath: logURL.path) {
@@ -370,7 +506,11 @@ public actor NamespaceDaemonSupervisor {
         layout.workflowURL.path,
       ]
     process.currentDirectoryURL = workingDirectoryURL
-    process.environment = NamespaceProcessEnvironment.sanitized(environment)
+    var processEnvironment = NamespaceProcessEnvironment.sanitized(environment)
+    if let githubToken {
+      processEnvironment["GITHUB_TOKEN"] = githubToken
+    }
+    process.environment = processEnvironment
     process.standardOutput = output
     process.standardError = errorOutput
     let terminationDelivery = self.terminationDelivery
@@ -398,7 +538,8 @@ public actor NamespaceDaemonSupervisor {
       process: process,
       endpoint: endpoint,
       output: output,
-      errorOutput: errorOutput
+      errorOutput: errorOutput,
+      namespaceDirectory: namespaceDirectory
     )
   }
 
@@ -571,6 +712,106 @@ public actor NamespaceDaemonSupervisor {
   }
 }
 
+public enum NamespaceIssueAction: String, Codable, Equatable, Sendable {
+  case start
+  case stop
+  case retry
+}
+
+public struct NamespaceIssueRun: Codable, Equatable, Identifiable, Sendable {
+  public let id: String
+  public let issueIdentifier: String
+  public let issueURL: URL?
+  public let status: String
+  public let error: String?
+  public let workspacePath: String?
+
+  public init(
+    issueIdentifier: String,
+    issueURL: URL? = nil,
+    status: String,
+    error: String? = nil,
+    workspacePath: String? = nil
+  ) {
+    id = issueIdentifier
+    self.issueIdentifier = issueIdentifier
+    self.issueURL = issueURL
+    self.status = status
+    self.error = error
+    self.workspacePath = workspacePath
+  }
+}
+
+public struct NamespaceIssueActionResult: Codable, Equatable, Sendable {
+  public let issueIdentifier: String
+  public let status: String
+}
+
+public struct NamespaceIssueActionError: LocalizedError, Sendable {
+  public let statusCode: Int
+  public let body: Data
+
+  public var errorDescription: String? {
+    "The issue action was rejected by the namespace daemon (HTTP \(statusCode))."
+  }
+}
+
+private struct NamespaceIssueStatePayload: Decodable {
+  private let running: [Entry]
+  private let retrying: [Entry]
+  private let blocked: [Entry]
+  private let completed: [Entry]
+  let trackerError: TrackerError?
+
+  var runs: [NamespaceIssueRun] {
+    [
+      (running, "running"),
+      (retrying, "retrying"),
+      (blocked, "blocked"),
+      (completed, "completed"),
+    ].flatMap { entries, status in
+      entries.map {
+        NamespaceIssueRun(
+          issueIdentifier: $0.issueIdentifier,
+          issueURL: $0.issueURL,
+          status: status,
+          error: $0.error,
+          workspacePath: $0.workspacePath
+        )
+      }
+    }
+  }
+
+  private struct Entry: Decodable {
+    let issueIdentifier: String
+    let issueURL: URL?
+    let error: String?
+    let workspacePath: String?
+  }
+
+  struct TrackerError: Decodable {
+    let code: String
+    let message: String
+  }
+
+  private enum CodingKeys: String, CodingKey {
+    case running
+    case retrying
+    case blocked
+    case completed
+    case trackerError
+  }
+
+  init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    running = try container.decodeIfPresent([Entry].self, forKey: .running) ?? []
+    retrying = try container.decodeIfPresent([Entry].self, forKey: .retrying) ?? []
+    blocked = try container.decodeIfPresent([Entry].self, forKey: .blocked) ?? []
+    completed = try container.decodeIfPresent([Entry].self, forKey: .completed) ?? []
+    trackerError = try container.decodeIfPresent(TrackerError.self, forKey: .trackerError)
+  }
+}
+
 public struct NamespaceDaemonStopAllError: LocalizedError, Sendable {
   public let failures: [Namespace.ID: String]
 
@@ -584,6 +825,7 @@ public enum NamespaceDaemonError: LocalizedError, Sendable {
   case executableNotExecutable(URL)
   case codexExecutableNotFound
   case codexExecutableNotExecutable(URL)
+  case githubCredentialsUnavailable
   case runtimePreparationFailed
   case endpointUnavailable
   case launchFailed
@@ -600,6 +842,8 @@ public enum NamespaceDaemonError: LocalizedError, Sendable {
       "The Codex CLI could not be found. Install Codex and try again."
     case .codexExecutableNotExecutable(let url):
       "The Codex CLI at \(url.path) is not executable. Reinstall Codex and try again."
+    case .githubCredentialsUnavailable:
+      "GitHub credentials are unavailable for this namespace. Unlock the namespace and try again."
     case .runtimePreparationFailed:
       "The namespace runtime could not be prepared. Check disk space and permissions, then try again."
     case .endpointUnavailable:

@@ -19,19 +19,25 @@ struct SymphonyDesktopApp: App {
   init() {
     let command = SymphonyExecutableLocator().locate()
     let codexExecutableURL = CodexExecutableLocator().locate()
-    let supervisor = NamespaceDaemonSupervisor(
-      executableURL: command?.executableURL,
-      codexExecutableURL: codexExecutableURL,
-      argumentPrefix: command?.argumentPrefix ?? [],
-      workingDirectoryURL: command?.workingDirectoryURL
-    )
-    let authenticationManager = CodexAuthenticationManager(
-      executor: CodexCLICommandExecutor(executableURL: codexExecutableURL)
-    )
     let credentialBroker = NamespaceCredentialBroker(
       launcher: CredentialBrokerProcessLauncher(
         executableURL: CredentialBrokerExecutableLocator().locate()
       )
+    )
+    let supervisor = NamespaceDaemonSupervisor(
+      executableURL: command?.executableURL,
+      codexExecutableURL: codexExecutableURL,
+      argumentPrefix: command?.argumentPrefix ?? [],
+      workingDirectoryURL: command?.workingDirectoryURL,
+      githubTokenProvider: { namespaceID in
+        try await credentialBroker.githubInstallationToken(namespaceID: namespaceID)
+      },
+      githubTokenInvalidator: { namespaceID in
+        try await credentialBroker.invalidateGitHubInstallationToken(namespaceID: namespaceID)
+      }
+    )
+    let authenticationManager = CodexAuthenticationManager(
+      executor: CodexCLICommandExecutor(executableURL: codexExecutableURL)
     )
     let namespaceLockController = NamespaceLockController(
       broker: credentialBroker,

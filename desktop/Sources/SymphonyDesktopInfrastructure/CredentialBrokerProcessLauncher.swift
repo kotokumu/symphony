@@ -22,12 +22,24 @@ public protocol GitHubCredentialBrokerConfigurationSessionHandle: Sendable {
 }
 
 public protocol GitHubRepositoryCapabilitySessionHandle: Sendable {
+  func githubInstallationToken() async throws -> String
+  func invalidateGitHubInstallationToken() async throws
   func performGitHubIssueRequest(
     _ request: GitHubIssueCapabilityRequest
   ) async throws -> GitHubIssueCapabilityResponse
   func performGitHubGitOperation(
     _ request: GitRepositoryCapabilityRequest
   ) async throws -> GitRepositoryCapabilityResult
+}
+
+public extension GitHubRepositoryCapabilitySessionHandle {
+  func githubInstallationToken() async throws -> String {
+    throw CredentialBrokerProcessError.capabilityUnavailable
+  }
+
+  func invalidateGitHubInstallationToken() async throws {
+    throw CredentialBrokerProcessError.capabilityUnavailable
+  }
 }
 
 public protocol NamespaceCredentialBrokerSessionHandle:
@@ -288,6 +300,44 @@ public actor CredentialBrokerProcessLauncher: CredentialBrokerSessionLaunching {
       return response
     case .githubCapabilityFailed(let failure):
       throw GitHubCapabilityError(failure)
+    case .failed(let message):
+      throw CredentialBrokerProcessError.capabilityFailed(message)
+    default:
+      throw CredentialBrokerProcessError.invalidCapabilityResponse
+    }
+  }
+
+  fileprivate func githubInstallationToken(
+    namespaceID: Namespace.ID,
+    generation: UUID
+  ) async throws -> String {
+    switch try await perform(
+      .githubInstallationToken,
+      namespaceID: namespaceID,
+      generation: generation
+    ) {
+    case .githubInstallationToken(let token):
+      return token
+    case .githubCapabilityFailed(let failure):
+      throw GitHubCapabilityError(failure)
+    case .failed(let message):
+      throw CredentialBrokerProcessError.capabilityFailed(message)
+    default:
+      throw CredentialBrokerProcessError.invalidCapabilityResponse
+    }
+  }
+
+  fileprivate func invalidateGitHubInstallationToken(
+    namespaceID: Namespace.ID,
+    generation: UUID
+  ) async throws {
+    switch try await perform(
+      .invalidateGitHubInstallationToken,
+      namespaceID: namespaceID,
+      generation: generation
+    ) {
+    case .githubInstallationTokenInvalidated:
+      return
     case .failed(let message):
       throw CredentialBrokerProcessError.capabilityFailed(message)
     default:
@@ -683,6 +733,17 @@ private struct ProcessCredentialBrokerSession: NamespaceCredentialBrokerSessionH
   ) async throws -> GitHubIssueCapabilityResponse {
     try await launcher.performGitHubIssueRequest(
       request,
+      namespaceID: namespaceID,
+      generation: generation
+    )
+  }
+
+  func githubInstallationToken() async throws -> String {
+    try await launcher.githubInstallationToken(namespaceID: namespaceID, generation: generation)
+  }
+
+  func invalidateGitHubInstallationToken() async throws {
+    try await launcher.invalidateGitHubInstallationToken(
       namespaceID: namespaceID,
       generation: generation
     )

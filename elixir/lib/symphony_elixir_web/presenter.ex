@@ -16,11 +16,14 @@ defmodule SymphonyElixirWeb.Presenter do
           counts: %{
             running: length(snapshot.running),
             retrying: length(snapshot.retrying),
-            blocked: length(Map.get(snapshot, :blocked, []))
+            blocked: length(Map.get(snapshot, :blocked, [])),
+            completed: length(Map.get(snapshot, :completed, []))
           },
           running: Enum.map(snapshot.running, &running_entry_payload/1),
           retrying: Enum.map(snapshot.retrying, &retry_entry_payload/1),
           blocked: Enum.map(Map.get(snapshot, :blocked, []), &blocked_entry_payload/1),
+          completed: Map.get(snapshot, :completed, []),
+          tracker_error: Map.get(snapshot, :tracker_error),
           codex_totals: snapshot.codex_totals,
           rate_limits: snapshot.rate_limits
         }

@@ -3,6 +3,7 @@ import XCTest
 
 @testable import SymphonyDesktop
 @testable import SymphonyDesktopCore
+@testable import SymphonyDesktopInfrastructure
 
 @MainActor
 final class NamespaceDaemonControllerTests: XCTestCase {
@@ -157,6 +158,109 @@ final class NamespaceDaemonControllerTests: XCTestCase {
     await second.value
   }
 
+  func testRefreshIssueRunsReadsOnlyRunningNamespacesAndKeepsTheirStateSeparate() async throws {
+    let first = try makeNamespace(named: "Research")
+    let second = try makeNamespace(named: "Operations")
+    let supervisor = TestDaemonSupervisor()
+    let controller = NamespaceDaemonController(
+      supervisor: supervisor,
+      directoryURL: { id in URL(fileURLWithPath: "/namespaces/\(id.uuidString)") }
+    )
+    await controller.startObserving()
+
+    let firstRun = NamespaceIssueRun(
+      issueIdentifier: "GH-11",
+      issueURL: URL(string: "https://github.com/acme/research/issues/11"),
+      status: "running",
+      workspacePath: "/namespaces/\(first.id)/Workspaces/GH-11"
+    )
+    let secondRun = NamespaceIssueRun(
+      issueIdentifier: "GH-22",
+      issueURL: URL(string: "https://github.com/acme/operations/issues/22"),
+      status: "blocked",
+      error: "Codex requires operator input",
+      workspacePath: "/namespaces/\(second.id)/Workspaces/GH-22"
+    )
+    await supervisor.setIssueRuns([firstRun], for: first.id)
+    await supervisor.setIssueRuns([secondRun], for: second.id)
+    await supervisor.emit(.init(namespaceID: first.id, state: .running(endpoint: endpoint(43101))))
+    await supervisor.emit(.init(namespaceID: second.id, state: .failed(message: "Daemon exited.")))
+
+    await eventually {
+      controller.state(for: first.id) == .running(endpoint: self.endpoint(43101))
+        && controller.state(for: second.id) == .failed(message: "Daemon exited.")
+    }
+    await supervisor.resetIssueOperations()
+
+    await controller.refreshIssueRuns()
+
+    let issueRunRequests = await supervisor.issueRunRequests
+    XCTAssertEqual(controller.issueRuns[first.id], [firstRun])
+    XCTAssertNil(controller.issueRuns[second.id])
+    XCTAssertFalse(issueRunRequests.isEmpty)
+    XCTAssertTrue(issueRunRequests.allSatisfy { $0 == first.id })
+  }
+
+  func testIssueActionsUseTheRequestedNamespaceAndRefreshOnlyThatNamespace() async throws {
+    let first = try makeNamespace(named: "Research")
+    let second = try makeNamespace(named: "Operations")
+    let supervisor = TestDaemonSupervisor()
+    let controller = NamespaceDaemonController(
+      supervisor: supervisor,
+      directoryURL: { id in URL(fileURLWithPath: "/namespaces/\(id.uuidString)") }
+    )
+    await controller.startObserving()
+    await supervisor.emit(.init(namespaceID: first.id, state: .running(endpoint: endpoint(43201))))
+    await supervisor.emit(.init(namespaceID: second.id, state: .running(endpoint: endpoint(43202))))
+    await eventually {
+      controller.state(for: first.id) == .running(endpoint: self.endpoint(43201))
+        && controller.state(for: second.id) == .running(endpoint: self.endpoint(43202))
+    }
+    await supervisor.resetIssueOperations()
+
+    try await controller.startIssue("GH-11", in: first.id)
+    try await controller.stopIssue("GH-22", in: second.id)
+    try await controller.retryIssue("GH-33", in: first.id)
+
+    let actionRequests = await supervisor.issueActionRequests
+    XCTAssertEqual(
+      actionRequests,
+      [
+        .init(namespaceID: first.id, issueIdentifier: "GH-11", action: .start),
+        .init(namespaceID: second.id, issueIdentifier: "GH-22", action: .stop),
+        .init(namespaceID: first.id, issueIdentifier: "GH-33", action: .retry),
+      ]
+    )
+    let issueRunRequests = await supervisor.issueRunRequests
+    XCTAssertGreaterThanOrEqual(issueRunRequests.filter { $0 == first.id }.count, 3)
+    XCTAssertGreaterThanOrEqual(issueRunRequests.filter { $0 == second.id }.count, 3)
+    XCTAssertEqual(controller.issueRuns[second.id]?.map(\.status), ["stopped"])
+  }
+
+  func testDaemonStopPreservesTerminalIssueRunHistory() async throws {
+    let namespace = try makeNamespace(named: "Research")
+    let supervisor = TestDaemonSupervisor()
+    let controller = NamespaceDaemonController(
+      supervisor: supervisor,
+      directoryURL: { _ in URL(fileURLWithPath: "/namespaces/research") }
+    )
+    await controller.startObserving()
+    await supervisor.setIssueRuns([
+      NamespaceIssueRun(issueIdentifier: "GH-1", status: "running"),
+      NamespaceIssueRun(issueIdentifier: "GH-2", status: "completed"),
+    ], for: namespace.id)
+    await supervisor.emit(.init(namespaceID: namespace.id, state: .running(endpoint: endpoint(43301))))
+    await eventually { controller.state(for: namespace.id) == .running(endpoint: self.endpoint(43301)) }
+    await controller.refreshIssueRuns()
+
+    await supervisor.emit(.init(namespaceID: namespace.id, state: .stopped))
+    await eventually {
+      let statuses = controller.issueRuns[namespace.id, default: []]
+        .reduce(into: [:]) { $0[$1.issueIdentifier] = $1.status }
+      return statuses["GH-1"] == "stopped" && statuses["GH-2"] == "completed"
+    }
+  }
+
   private func makeNamespace(named name: String) throws -> DesktopNamespace {
     DesktopNamespace(id: UUID(), name: try NamespaceName(validating: name))
   }
@@ -205,7 +309,22 @@ private actor TestDaemonSupervisor: NamespaceDaemonSupervising {
     case stop(Namespace.ID)
   }
 
+  struct IssueActionRequest: Equatable {
+    let namespaceID: Namespace.ID
+    let issueIdentifier: String
+    let action: NamespaceIssueAction
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+      lhs.namespaceID == rhs.namespaceID
+        && lhs.issueIdentifier == rhs.issueIdentifier
+        && lhs.action.rawValue == rhs.action.rawValue
+    }
+  }
+
   private(set) var operations: [Operation] = []
+  private(set) var issueRunRequests: [Namespace.ID] = []
+  private(set) var issueActionRequests: [IssueActionRequest] = []
+  private var configuredIssueRuns: [Namespace.ID: [NamespaceIssueRun]] = [:]
   private(set) var eventSubscriptionCount = 0
   private var continuation: AsyncStream<NamespaceDaemonEvent>.Continuation?
   private var shouldSuspendEventSubscription: Bool
@@ -227,6 +346,8 @@ private actor TestDaemonSupervisor: NamespaceDaemonSupervising {
     }
   }
 
+  func configure(namespaceID: Namespace.ID, tracker: NamespaceDaemonTrackerConfiguration) async {}
+
   func start(namespaceID: Namespace.ID, namespaceDirectory: URL) {
     operations.append(.start(namespaceID, namespaceDirectory))
     continuation?.yield(.init(namespaceID: namespaceID, state: .starting))
@@ -238,6 +359,34 @@ private actor TestDaemonSupervisor: NamespaceDaemonSupervising {
   }
 
   func stopAll() throws {}
+
+  func issueRuns(namespaceID: Namespace.ID) async throws -> [NamespaceIssueRun] {
+    issueRunRequests.append(namespaceID)
+    return configuredIssueRuns[namespaceID] ?? []
+  }
+
+  func issueAction(
+    namespaceID: Namespace.ID,
+    issueIdentifier: String,
+    action: NamespaceIssueAction
+  ) async throws -> NamespaceIssueActionResult {
+    issueActionRequests.append(.init(
+      namespaceID: namespaceID,
+      issueIdentifier: issueIdentifier,
+      action: action
+    ))
+    let status = action == .stop ? "stopped" : "running"
+    return NamespaceIssueActionResult(issueIdentifier: issueIdentifier, status: status)
+  }
+
+  func setIssueRuns(_ runs: [NamespaceIssueRun], for namespaceID: Namespace.ID) {
+    configuredIssueRuns[namespaceID] = runs
+  }
+
+  func resetIssueOperations() {
+    issueRunRequests.removeAll()
+    issueActionRequests.removeAll()
+  }
 
   func emit(_ event: NamespaceDaemonEvent) {
     continuation?.yield(event)

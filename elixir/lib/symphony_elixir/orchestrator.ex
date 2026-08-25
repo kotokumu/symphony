@@ -36,6 +36,8 @@ defmodule SymphonyElixir.Orchestrator do
       task_supervisor: SymphonyElixir.TaskSupervisor,
       running: %{},
       completed: MapSet.new(),
+      completed_metadata: %{},
+      tracker_error: nil,
       claimed: MapSet.new(),
       blocked: %{},
       retry_attempts: %{},
@@ -212,7 +214,6 @@ defmodule SymphonyElixir.Orchestrator do
       Logger.info("Agent task completed for issue_id=#{issue_id} session_id=#{session_id}; scheduling active-state continuation check")
 
       state
-      |> complete_issue(issue_id)
       |> schedule_issue_retry(issue_id, 1, %{
         identifier: running_entry.identifier,
         issue_url: running_entry.issue.url,
@@ -262,45 +263,46 @@ defmodule SymphonyElixir.Orchestrator do
     with :ok <- Config.validate!(),
          {:ok, issues} <- Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states),
          true <- available_slots(state) > 0 do
+      state = clear_tracker_error(state)
       choose_issues(issues, state)
     else
       {:error, :missing_linear_api_token} ->
         Logger.error("Tracker API token missing in WORKFLOW.md")
-        state
+        mark_tracker_error(state, :tracker_unavailable)
 
       {:error, :missing_linear_project_slug} ->
         Logger.error("Tracker project scope missing in WORKFLOW.md")
-        state
+        mark_tracker_error(state, :tracker_unavailable)
 
       {:error, :missing_tracker_kind} ->
         Logger.error("Tracker kind missing in WORKFLOW.md")
 
-        state
+        mark_tracker_error(state, :tracker_unavailable)
 
       {:error, {:unsupported_tracker_kind, kind}} ->
         Logger.error("Unsupported tracker kind in WORKFLOW.md: #{inspect(kind)}")
 
-        state
+        mark_tracker_error(state, :tracker_unavailable)
 
       {:error, {:invalid_workflow_config, message}} ->
         Logger.error("Invalid WORKFLOW.md config: #{message}")
-        state
+        mark_tracker_error(state, :tracker_unavailable)
 
       {:error, {:missing_workflow_file, path, reason}} ->
         Logger.error("Missing WORKFLOW.md at #{path}: #{inspect(reason)}")
-        state
+        mark_tracker_error(state, :tracker_unavailable)
 
       {:error, :workflow_front_matter_not_a_map} ->
         Logger.error("Failed to parse WORKFLOW.md: workflow front matter must decode to a map")
-        state
+        mark_tracker_error(state, :tracker_unavailable)
 
       {:error, {:workflow_parse_error, reason}} ->
         Logger.error("Failed to parse WORKFLOW.md: #{inspect(reason)}")
-        state
+        mark_tracker_error(state, :tracker_unavailable)
 
       {:error, reason} ->
         Logger.error("Failed to fetch from issue tracker: #{inspect(reason)}")
-        state
+        mark_tracker_error(state, reason)
 
       false ->
         state
@@ -423,7 +425,9 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; stopping active agent")
 
-        terminate_running_issue(state, issue.id, true)
+        state
+        |> complete_running_issue(issue)
+        |> terminate_running_issue(issue.id, true)
 
       !issue_routable?(issue) ->
         Logger.info("Issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; stopping active agent")
@@ -458,7 +462,10 @@ defmodule SymphonyElixir.Orchestrator do
       terminal_issue_state?(issue.state, terminal_states) ->
         Logger.info("Blocked issue moved to terminal state: #{issue_context(issue)} state=#{issue.state}; releasing block")
         cleanup_issue_workspace(issue, Map.get(state.blocked, issue.id, %{}))
-        release_issue_claim(state, issue.id)
+
+        state
+        |> complete_blocked_issue(issue)
+        |> release_issue_claim(issue.id)
 
       !issue_routable?(issue) ->
         Logger.info("Blocked issue no longer routed to this worker: #{issue_context(issue)} assignee=#{inspect(issue.assignee_id)}; releasing block")
@@ -1023,13 +1030,50 @@ defmodule SymphonyElixir.Orchestrator do
 
   defp revalidate_issue_for_dispatch(issue, _issue_fetcher, _terminal_states), do: {:ok, issue}
 
-  defp complete_issue(%State{} = state, issue_id) do
+  defp complete_issue(%State{} = state, issue_id, metadata) do
+    completed_entry = %{
+      issue_id: issue_id,
+      issue_identifier: metadata.identifier,
+      issue_url: metadata.issue.url,
+      workspace_path: Map.get(metadata, :workspace_path),
+      status: "completed"
+    }
+
     %{
       state
       | completed: MapSet.put(state.completed, issue_id),
+        completed_metadata: Map.put(state.completed_metadata, issue_id, completed_entry),
         retry_attempts: Map.delete(state.retry_attempts, issue_id)
     }
   end
+
+  defp complete_running_issue(%State{} = state, %Issue{} = issue) do
+    case Map.get(state.running, issue.id) do
+      metadata when is_map(metadata) -> complete_issue(state, issue.id, Map.put(metadata, :issue, issue))
+      _ -> state
+    end
+  end
+
+  defp complete_blocked_issue(%State{} = state, %Issue{} = issue) do
+    case Map.get(state.blocked, issue.id) do
+      metadata when is_map(metadata) -> complete_issue(state, issue.id, Map.put(metadata, :issue, issue))
+      _ -> state
+    end
+  end
+
+  defp clear_tracker_error(%State{} = state), do: %{state | tracker_error: nil}
+
+  defp mark_tracker_error(%State{} = state, reason) do
+    code = if tracker_auth_expired?(reason), do: "tracker_auth_expired", else: "tracker_unavailable"
+    %{state | tracker_error: %{code: code, message: tracker_error_message(code)}}
+  end
+
+  defp tracker_auth_expired?({:github_api_status, status}) when status in [401, 403], do: true
+  defp tracker_auth_expired?(:missing_github_token), do: true
+  defp tracker_auth_expired?(_reason), do: false
+
+  defp tracker_error_message("tracker_auth_expired"), do: "Issue tracker credentials expired"
+  defp tracker_error_message("tracker_unavailable"), do: "Issue tracker is unavailable"
 
   defp schedule_issue_retry(%State{} = state, issue_id, attempt, metadata)
        when is_binary(issue_id) and is_map(metadata) do
@@ -1118,7 +1162,13 @@ defmodule SymphonyElixir.Orchestrator do
         Logger.info("Issue state is terminal: issue_id=#{issue_id} issue_identifier=#{issue.identifier} state=#{issue.state}; removing associated workspace")
 
         cleanup_issue_workspace(issue, metadata)
-        {:noreply, release_issue_claim(state, issue_id)}
+
+        completed_state =
+          state
+          |> complete_issue(issue_id, Map.merge(metadata, %{issue: issue, identifier: issue.identifier}))
+          |> release_issue_claim(issue_id)
+
+        {:noreply, completed_state}
 
       retry_candidate_issue?(issue, terminal_states) ->
         handle_active_retry(state, issue, attempt, metadata)
@@ -1388,6 +1438,17 @@ defmodule SymphonyElixir.Orchestrator do
     end
   end
 
+  @spec request_issue_action(GenServer.server(), atom(), String.t()) ::
+          {:ok, map()} | {:error, atom()} | :unavailable
+  def request_issue_action(server, action, identifier)
+      when action in [:start, :stop, :retry] and is_binary(identifier) do
+    if Process.whereis(server) do
+      GenServer.call(server, {:issue_action, action, identifier})
+    else
+      :unavailable
+    end
+  end
+
   @spec snapshot() :: map() | :timeout | :unavailable
   def snapshot, do: snapshot(__MODULE__, 15_000)
 
@@ -1474,6 +1535,17 @@ defmodule SymphonyElixir.Orchestrator do
        running: running,
        retrying: retrying,
        blocked: blocked,
+       completed:
+         state.completed
+         |> MapSet.to_list()
+         |> Enum.map(fn issue_id ->
+           Map.get(state.completed_metadata, issue_id, %{
+             issue_id: issue_id,
+             issue_identifier: issue_id,
+             status: "completed"
+           })
+         end),
+       tracker_error: state.tracker_error,
        codex_totals: state.codex_totals,
        rate_limits: Map.get(state, :codex_rate_limits),
        polling: %{
@@ -1497,6 +1569,124 @@ defmodule SymphonyElixir.Orchestrator do
        requested_at: DateTime.utc_now(),
        operations: ["poll", "reconcile"]
      }, state}
+  end
+
+  def handle_call({:issue_action, action, identifier}, _from, state) do
+    {reply, state} = handle_issue_action(state, action, identifier)
+    notify_dashboard()
+    {:reply, reply, state}
+  end
+
+  defp handle_issue_action(%State{} = state, :start, identifier) do
+    if issue_identifier_present?(state, identifier) do
+      {{:error, :already_started}, state}
+    else
+      start_issue_action(state, identifier)
+    end
+  end
+
+  defp handle_issue_action(%State{} = state, :stop, identifier) do
+    case find_running_by_identifier(state.running, identifier) do
+      {issue_id, _entry} ->
+        {{:ok, %{issue_identifier: identifier, status: "stopped"}}, terminate_running_issue(state, issue_id, false)}
+
+      nil ->
+        {{:error, :not_running}, state}
+    end
+  end
+
+  defp handle_issue_action(%State{} = state, :retry, identifier) do
+    case find_retry_by_identifier(state.retry_attempts, identifier) do
+      {issue_id, retry} ->
+        retry_issue_action(state, issue_id, retry, identifier)
+
+      nil ->
+        case find_blocked_by_identifier(state.blocked, identifier) do
+          {issue_id, blocked} ->
+            retry_issue_action(state, issue_id, blocked, identifier)
+
+          nil ->
+            {{:error, :not_found}, state}
+        end
+    end
+  end
+
+  defp start_issue_action(state, identifier) do
+    case Tracker.fetch_issues_by_states(Config.settings!().tracker.active_states) do
+      {:ok, issues} ->
+        dispatch_start_issue(state, Enum.find(issues, &(&1.identifier == identifier)), identifier)
+
+      {:error, reason} ->
+        {{:error, tracker_action_error(reason)}, state}
+    end
+  end
+
+  defp dispatch_start_issue(state, %Issue{} = issue, identifier) do
+    next_state = dispatch_issue(state, issue)
+
+    if MapSet.member?(next_state.claimed, issue.id) do
+      {{:ok, %{issue_identifier: identifier, status: "running"}}, next_state}
+    else
+      {{:error, :not_dispatchable}, next_state}
+    end
+  end
+
+  defp dispatch_start_issue(state, nil, _identifier), do: {{:error, :not_found}, state}
+
+  defp retry_issue_action(state, issue_id, metadata, identifier) do
+    case Tracker.fetch_issues_by_ids([issue_id]) do
+      {:ok, [%Issue{} = issue | _]} ->
+        dispatch_state = %{
+          state
+          | retry_attempts: Map.delete(state.retry_attempts, issue_id),
+            blocked: Map.delete(state.blocked, issue_id),
+            claimed: MapSet.delete(state.claimed, issue_id)
+        }
+
+        next_state =
+          dispatch_issue(
+            dispatch_state,
+            issue,
+            Map.get(metadata, :attempt),
+            Map.get(metadata, :worker_host)
+          )
+
+        if MapSet.member?(next_state.claimed, issue_id) do
+          {{:ok, %{issue_identifier: identifier, status: "running"}}, next_state}
+        else
+          {{:error, :not_dispatchable}, state}
+        end
+
+      {:ok, []} ->
+        {{:error, :not_found}, state}
+
+      {:error, reason} ->
+        {{:error, tracker_action_error(reason)}, state}
+    end
+  end
+
+  defp issue_identifier_present?(state, identifier) do
+    find_running_by_identifier(state.running, identifier) != nil or
+      find_retry_by_identifier(state.retry_attempts, identifier) != nil or
+      find_blocked_by_identifier(state.blocked, identifier) != nil
+  end
+
+  defp tracker_action_error({:github_api_status, status}) when status in [401, 403],
+    do: :tracker_auth_expired
+
+  defp tracker_action_error(:missing_github_token), do: :tracker_auth_expired
+  defp tracker_action_error(_reason), do: :tracker_unavailable
+
+  defp find_running_by_identifier(running, identifier) do
+    Enum.find(running, fn {_id, entry} -> entry.identifier == identifier end)
+  end
+
+  defp find_retry_by_identifier(retries, identifier) do
+    Enum.find(retries, fn {_id, entry} -> Map.get(entry, :identifier) == identifier end)
+  end
+
+  defp find_blocked_by_identifier(blocked, identifier) do
+    Enum.find(blocked, fn {_id, entry} -> Map.get(entry, :identifier) == identifier end)
   end
 
   defp blocked_issue_state(%{issue: %Issue{state: state}}), do: state

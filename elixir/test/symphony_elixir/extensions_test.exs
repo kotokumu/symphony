@@ -57,6 +57,16 @@ defmodule SymphonyElixir.ExtensionsTest do
     def handle_call(:request_refresh, _from, state) do
       {:reply, Keyword.get(state, :refresh, :unavailable), state}
     end
+
+    def handle_call({:issue_action, action, identifier}, _from, state) do
+      actions = Keyword.get(state, :actions, []) ++ [{action, identifier}]
+
+      {:reply, {:ok, %{issue_identifier: identifier, status: Atom.to_string(action)}}, Keyword.put(state, :actions, actions)}
+    end
+
+    def handle_call(:actions, _from, state) do
+      {:reply, Keyword.get(state, :actions, []), state}
+    end
   end
 
   setup do
@@ -262,7 +272,7 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert state_payload == %{
              "generated_at" => state_payload["generated_at"],
-             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1},
+             "counts" => %{"running" => 1, "retrying" => 1, "blocked" => 1, "completed" => 0},
              "running" => [
                %{
                  "issue_id" => "issue-http",
@@ -308,6 +318,8 @@ defmodule SymphonyElixir.ExtensionsTest do
                  "last_event_at" => state_payload["blocked"] |> List.first() |> Map.fetch!("last_event_at")
                }
              ],
+             "completed" => [],
+             "tracker_error" => nil,
              "codex_totals" => %{
                "input_tokens" => 4,
                "output_tokens" => 8,
@@ -376,6 +388,77 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     assert %{"queued" => true, "coalesced" => false, "operations" => ["poll", "reconcile"]} =
              json_response(conn, 202)
+  end
+
+  test "issue actions are routed to the namespace orchestrator" do
+    orchestrator = Module.concat(__MODULE__, :IssueActionOrchestrator)
+    start_test_endpoint(orchestrator: orchestrator, snapshot_timeout_ms: 50)
+    start_supervised!({StaticOrchestrator, name: orchestrator, snapshot: static_snapshot(), actions: []})
+
+    assert json_response(post(build_conn(), "/api/v1/MT-HTTP/start", %{}), 202) == %{
+             "issue_identifier" => "MT-HTTP",
+             "status" => "start"
+           }
+
+    assert json_response(post(build_conn(), "/api/v1/MT-HTTP/stop", %{}), 202) == %{
+             "issue_identifier" => "MT-HTTP",
+             "status" => "stop"
+           }
+
+    assert json_response(post(build_conn(), "/api/v1/MT-HTTP/retry", %{}), 202) == %{
+             "issue_identifier" => "MT-HTTP",
+             "status" => "retry"
+           }
+
+    assert GenServer.call(orchestrator, :actions) == [
+             {:start, "MT-HTTP"},
+             {:stop, "MT-HTTP"},
+             {:retry, "MT-HTTP"}
+           ]
+
+    assert json_response(post(build_conn(), "/api/v1/MT-HTTP/unknown", %{}), 400) == %{
+             "error" => %{"code" => "invalid_action", "message" => "Unsupported issue action"}
+           }
+  end
+
+  test "state exposes completed issue metadata and tracker authentication errors" do
+    orchestrator = Module.concat(__MODULE__, :CompletedStateOrchestrator)
+
+    snapshot =
+      static_snapshot()
+      |> Map.put(:completed, [
+        %{
+          issue_id: "issue-completed",
+          issue_identifier: "GH-42",
+          issue_url: "https://github.com/acme/research/issues/42",
+          workspace_path: "/workspaces/GH-42",
+          status: "completed"
+        }
+      ])
+      |> Map.put(:tracker_error, %{
+        code: "tracker_auth_expired",
+        message: "Issue tracker credentials expired"
+      })
+
+    start_test_endpoint(orchestrator: orchestrator, snapshot_timeout_ms: 50)
+    start_supervised!({StaticOrchestrator, name: orchestrator, snapshot: snapshot})
+
+    payload = json_response(get(build_conn(), "/api/v1/state"), 200)
+
+    assert payload["tracker_error"] == %{
+             "code" => "tracker_auth_expired",
+             "message" => "Issue tracker credentials expired"
+           }
+
+    assert payload["completed"] == [
+             %{
+               "issue_id" => "issue-completed",
+               "issue_identifier" => "GH-42",
+               "issue_url" => "https://github.com/acme/research/issues/42",
+               "workspace_path" => "/workspaces/GH-42",
+               "status" => "completed"
+             }
+           ]
   end
 
   test "phoenix observability api preserves 405, 404, and unavailable behavior" do
@@ -610,7 +693,13 @@ defmodule SymphonyElixir.ExtensionsTest do
 
     response = Req.get!("http://127.0.0.1:#{port}/api/v1/state")
     assert response.status == 200
-    assert response.body["counts"] == %{"running" => 1, "retrying" => 1, "blocked" => 1}
+
+    assert response.body["counts"] == %{
+             "running" => 1,
+             "retrying" => 1,
+             "blocked" => 1,
+             "completed" => 0
+           }
 
     dashboard_css = Req.get!("http://127.0.0.1:#{port}/dashboard.css")
     assert dashboard_css.status == 200

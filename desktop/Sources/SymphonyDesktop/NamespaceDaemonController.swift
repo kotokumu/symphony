@@ -1,17 +1,27 @@
 import Combine
 import Foundation
 import SymphonyDesktopCore
+import SymphonyDesktopInfrastructure
 
 protocol NamespaceDaemonSupervising: Sendable {
   func events() async -> AsyncStream<NamespaceDaemonEvent>
+  func configure(namespaceID: Namespace.ID, tracker: NamespaceDaemonTrackerConfiguration) async
   func start(namespaceID: Namespace.ID, namespaceDirectory: URL) async
   func stop(namespaceID: Namespace.ID) async throws
   func stopAll() async throws
+  func issueRuns(namespaceID: Namespace.ID) async throws -> [NamespaceIssueRun]
+  func issueAction(
+    namespaceID: Namespace.ID,
+    issueIdentifier: String,
+    action: NamespaceIssueAction
+  ) async throws -> NamespaceIssueActionResult
 }
 
 @MainActor
 final class NamespaceDaemonController: ObservableObject {
   @Published private(set) var states: [Namespace.ID: NamespaceDaemonState] = [:]
+  @Published private(set) var issueRuns: [Namespace.ID: [NamespaceIssueRun]] = [:]
+  @Published private(set) var issueRunErrors: [Namespace.ID: String] = [:]
 
   private let supervisor: any NamespaceDaemonSupervising
   private let directoryURL: @Sendable (Namespace.ID) -> URL
@@ -19,6 +29,7 @@ final class NamespaceDaemonController: ObservableObject {
   private let afterStopAll: @Sendable () async throws -> Void
   private var eventStreamTask: Task<AsyncStream<NamespaceDaemonEvent>, Never>?
   private var observationTask: Task<Void, Never>?
+  private var issuePollingTask: Task<Void, Never>?
 
   init(
     supervisor: any NamespaceDaemonSupervising,
@@ -35,6 +46,7 @@ final class NamespaceDaemonController: ObservableObject {
   deinit {
     eventStreamTask?.cancel()
     observationTask?.cancel()
+    issuePollingTask?.cancel()
   }
 
   func startObserving() async {
@@ -59,7 +71,13 @@ final class NamespaceDaemonController: ObservableObject {
           return
         }
         self?.states[event.namespaceID] = event.state
-        if case .failed = event.state {
+        if case .stopped = event.state {
+          self?.markIssueRuns(event.namespaceID, status: "stopped")
+          self?.issueRunErrors.removeValue(forKey: event.namespaceID)
+        }
+        if case .failed(let message) = event.state {
+          self?.markIssueRuns(event.namespaceID, status: "failed", error: message)
+          self?.issueRunErrors[event.namespaceID] = message
           try? await self?.afterStop(event.namespaceID)
         }
       }
@@ -72,10 +90,44 @@ final class NamespaceDaemonController: ObservableObject {
 
   func start(_ namespace: DesktopNamespace) async {
     await startObserving()
+    let tracker: NamespaceDaemonTrackerConfiguration
+    if case .github(let connection) = namespace.platformConnection {
+      tracker = .github(repository: connection.repositoryFullName)
+    } else {
+      tracker = .memory
+    }
+    await supervisor.configure(namespaceID: namespace.id, tracker: tracker)
     await supervisor.start(
       namespaceID: namespace.id,
       namespaceDirectory: directoryURL(namespace.id)
     )
+    startIssuePolling()
+  }
+
+  private func startIssuePolling() {
+    guard issuePollingTask == nil else { return }
+    issuePollingTask = Task { [weak self] in
+      while !Task.isCancelled {
+        await self?.refreshIssueRuns()
+        try? await Task.sleep(for: .seconds(2))
+      }
+    }
+  }
+
+  private func markIssueRuns(_ namespaceID: Namespace.ID, status: String, error: String? = nil) {
+    guard let runs = issueRuns[namespaceID], !runs.isEmpty else { return }
+    issueRuns[namespaceID] = runs.map {
+      guard $0.status == "running" || $0.status == "retrying" || $0.status == "blocked" else {
+        return $0
+      }
+      return NamespaceIssueRun(
+        issueIdentifier: $0.issueIdentifier,
+        issueURL: $0.issueURL,
+        status: status,
+        error: error ?? $0.error,
+        workspacePath: $0.workspacePath
+      )
+    }
   }
 
   func stop(_ namespaceID: Namespace.ID) async throws {
@@ -91,5 +143,52 @@ final class NamespaceDaemonController: ObservableObject {
   func stopAll() async throws {
     try await supervisor.stopAll()
     try await afterStopAll()
+  }
+
+  func refreshIssueRuns() async {
+    for namespaceID in states.keys {
+      guard case .running = states[namespaceID] else { continue }
+      do {
+        let runs = try await supervisor.issueRuns(namespaceID: namespaceID)
+        let stopped = issueRuns[namespaceID, default: []].filter { $0.status == "stopped" }
+        issueRuns[namespaceID] = runs + stopped
+        issueRunErrors.removeValue(forKey: namespaceID)
+      } catch {
+        issueRunErrors[namespaceID] = error.localizedDescription
+      }
+    }
+  }
+
+  func startIssue(_ identifier: String, in namespaceID: Namespace.ID) async throws {
+    _ = try await supervisor.issueAction(
+      namespaceID: namespaceID,
+      issueIdentifier: identifier,
+      action: .start
+    )
+    issueRuns[namespaceID]?.removeAll { $0.issueIdentifier == identifier }
+    await refreshIssueRuns()
+  }
+
+  func stopIssue(_ identifier: String, in namespaceID: Namespace.ID) async throws {
+    let result = try await supervisor.issueAction(
+      namespaceID: namespaceID,
+      issueIdentifier: identifier,
+      action: .stop
+    )
+    await refreshIssueRuns()
+    issueRuns[namespaceID, default: []].removeAll { $0.issueIdentifier == identifier }
+    issueRuns[namespaceID, default: []].append(
+      NamespaceIssueRun(issueIdentifier: result.issueIdentifier, status: result.status)
+    )
+  }
+
+  func retryIssue(_ identifier: String, in namespaceID: Namespace.ID) async throws {
+    _ = try await supervisor.issueAction(
+      namespaceID: namespaceID,
+      issueIdentifier: identifier,
+      action: .retry
+    )
+    issueRuns[namespaceID]?.removeAll { $0.issueIdentifier == identifier }
+    await refreshIssueRuns()
   }
 }
